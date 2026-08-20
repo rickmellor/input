@@ -26,7 +26,8 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       directly vs discovered from ~/.claude.json) and /mcp add <name> <url> adds one.
       Memory: an MCP client wires MemoryOS (network memory service) as an ambient layer —
       relevant memories are recalled before each turn and each exchange stored after;
-      /memory toggles/configures (user_id, url in settings.json).
+      /memory toggles/configures (user_id, url in settings.json); /memory browse [query]
+      inspects the stored profile, recent history, knowledge, and pages.
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request, urllib.parse
@@ -946,6 +947,44 @@ def mem_store(user_input, agent_response):
         pass
 
 
+def memory_browse(query):
+    """Inspect MemoryOS contents: profile + recent history + knowledge + pages for a query."""
+    if not _MEM:
+        print(f"{DIM}memory off — /memory on to connect{RESET}")
+        return
+    cfg = mem_config()
+    try:
+        prof = json.loads(_MEM.call("get_user_profile", {"user_id": cfg["user"]}))
+        d = json.loads(_MEM.call("retrieve_memory", {"user_id": cfg["user"], "query": query}))
+    except Exception as e:
+        print(f"{DIM}memory query failed: {e}{RESET}")
+        return
+    profile = prof.get("user_profile") if isinstance(prof, dict) else None
+    print(f"{BOLD}{ULINE}MemoryOS · {cfg['user']}{RESET}  {DIM}(query: {query}){RESET}")
+    print(f"{DIM}profile:{RESET} " + (profile if profile and profile != "None"
+                                      else f"{DIM}(none yet — builds as extraction runs){RESET}"))
+    hist = d.get("short_term_history") or []
+    if hist:
+        print(f"\n{DIM}recent ({len(hist)}):{RESET}")
+        for e in hist[-8:]:
+            ts = (e.get("timestamp") or "")[:16].replace("T", " ")
+            print(f"  {DIM}{ts}{RESET} {e.get('user_input','')[:78]}")
+            resp = (e.get("agent_response") or "")[:78]
+            if resp:
+                print(f"  {DIM}{' ' * 16} → {resp}{RESET}")
+    for label, key in (("user knowledge", "retrieved_user_knowledge"),
+                       ("assistant knowledge", "retrieved_assistant_knowledge"),
+                       ("pages", "retrieved_pages")):
+        items = d.get(key) or []
+        if items:
+            print(f"\n{DIM}{label} ({len(items)}):{RESET}")
+            for it in items[:8]:
+                print(f"  {DIM}·{RESET} {_mem_item(it)[:120]}")
+    if not hist and not any(d.get(k) for k in
+                            ("retrieved_user_knowledge", "retrieved_assistant_knowledge", "retrieved_pages")):
+        print(f"{DIM}(no matching memories){RESET}")
+
+
 # --- session stats + status line ------------------------------------------------
 _CTX_CACHE = {}   # (model, base) -> context window (max_model_len) or None
 
@@ -1599,12 +1638,15 @@ def repl():
             elif arg.startswith("user "):
                 st["memory_user"] = arg.split(None, 1)[1].strip(); save_settings(st)
                 print(f"{DIM}{mem_connect()}{RESET}")
+            elif arg == "browse" or arg.startswith("browse "):
+                memory_browse(arg[len("browse"):].strip() or "recent conversation and preferences")
             else:
                 cfg = mem_config()
                 tools_n = len(_MEM.tools) if _MEM else 0
                 prof = f"{len(_MEM_PROFILE)} chars" if _MEM_PROFILE else "none yet"
                 print(f"{DIM}memory {'on' if _MEM else 'off'} · user {cfg['user']} · {cfg['url']} · "
-                      f"{tools_n} tools · profile {prof}  (/memory on|off · /memory user <id>){RESET}")
+                      f"{tools_n} tools · profile {prof}\n  /memory on|off · /memory user <id> · "
+                      f"/memory browse [query]{RESET}")
             continue
         if user == "/system" or user.startswith("/system "):
             arg = user[len("/system"):].strip()
