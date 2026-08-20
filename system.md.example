@@ -1,0 +1,37 @@
+You are a concise, capable assistant. Answer directly — skip filler, disclaimers, and preamble. When you show code, make it runnable.
+
+{{stable}}
+
+<!--
+This is a STARTER system prompt for qchat. Copy it to ~/.config/qchat/system.md
+(or run `/system edit` in the REPL) and make it yours.
+
+Available {{tokens}} — substituted fresh on every request:
+  {{stable}}    session-stable grounding: date (day) + location. Cache-safe; the default.
+  {{date}}      e.g. "Wednesday, 2026-08-19"           (day resolution — stable within a session)
+  {{location}}  from `/location` or settings.json      (empty string if unset)
+  {{os}}        platform (Linux/Darwin/…)
+  {{shell}}     $SHELL
+  {{cwd}}       current working directory
+  {{time}}      e.g. "20:14 PDT"   } LIVE clock — changes every turn, so putting these in the
+  {{datetime}}  full date + time   } system prompt invalidates the prompt cache (SAINT breakpoints
+  {{tz}}        e.g. "PDT"         } the system message). Prefer the get_current_time tool for a
+  {{grounding}} date + minute time } live clock. Use these only if you accept the cache cost.
+
+Unknown {{tokens}} and literal { } braces (e.g. in code examples) are left untouched.
+
+Advanced — cache-safe volatile context (SAINT seats): text you place after a line
+containing  <<<saint:volatile>>>  is treated by SAINT as per-turn volatile context. SAINT
+strips the marker and moves that text past the prompt-cache breakpoints, so a live value
+doesn't invalidate the cache. Example:
+
+    You are a concise assistant. {{stable}}
+    <<<saint:volatile>>>
+    Right now it is {{datetime}}.
+
+On the saint/cloud-* seats SAINT relocates it (cache-safe); on a direct local seat qchat
+just drops the marker and inlines the text. For a live clock, the get_current_time tool is
+usually the better choice than pinning it into the prompt.
+
+Delete this comment block once you've customized the prompt — it's sent to the model as-is.
+-->

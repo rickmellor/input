@@ -2,7 +2,7 @@
 """qchat — chat REPL, NL shell-command generator, and shell goal-agent for local seats.
 
 Chat REPL:  qchat [seat|model [base_url]]        thinking streams dimmed
-            /models toggle seat · /clear · /quit
+            /models seat · /system [edit] · /location [city] · /think · /clear · /quit
 Command:    qchat -e <task>   propose → execute|revise|describe|copy|quit
             qchat -x <task>   propose → execute immediately
             qchat --gen <buf> print one command to stdout (Ctrl-G binding)
@@ -12,11 +12,13 @@ Bare -e/-x/--goal/--auto with no words prompts for the task (no shell quoting).
 
 Seats: gemma (chat default) | coder (command/goal default) | qwen38 (on-demand).
 REPL: reasoning streams live then collapses to one line (/think re-expands);
-      code blocks render boxed + line-numbered; ^C copies the last reply's code
-      blocks (^D or /quit to exit); /models switches seat.
+      code blocks stream plain then redraw boxed + line-numbered; ^C copies the last
+      reply's code blocks (^D or /quit to exit); /models switches seat. Every request
+      is grounded with the current date/time (+ location if /location or settings set).
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
+from datetime import datetime
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
 ITAL, ULINE, CODE_FG = "\033[3m", "\033[4m", "\033[36m"
@@ -55,6 +57,10 @@ SEATS = {
     "cloud-small": ("saint-cloud-small",  "http://127.0.0.1:4000/v1"),  # force cloud (Haiku tier) via SAINT
 }
 MAX_AUTO_STEPS = 8
+# SAINT extracts volatile per-turn context placed after this marker in the system prompt
+# and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
+# for a direct local seat qchat strips the marker and inlines the text (see stream()).
+SAINT_SENTINEL = "<<<saint:volatile>>>"
 _DEFAULT_CFG = os.path.expanduser("~/.config/qchat/default-seat")
 
 
@@ -73,6 +79,95 @@ def save_default_seat(name):
         return True
     except Exception:
         return False
+
+
+# --- settings + always-on grounding context -------------------------------------
+# settings.json is the shared config store (location now; tool prefs later). Grounding
+# is injected into the system context on EVERY request so the model always knows the
+# current time — cheaper and more reliable than a get_current_time tool it must decide
+# to call. Location rides along when set (settings 'location' or $QCHAT_LOCATION).
+_SETTINGS = os.path.expanduser("~/.config/qchat/settings.json")
+
+
+def load_settings():
+    try:
+        return json.load(open(_SETTINGS))
+    except Exception:
+        return {}
+
+
+def save_settings(d):
+    try:
+        os.makedirs(os.path.dirname(_SETTINGS), exist_ok=True)
+        json.dump(d, open(_SETTINGS, "w"), indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def ground_text():
+    now = datetime.now().astimezone()
+    s = "Current date and time: " + now.strftime("%A, %Y-%m-%d %H:%M %Z (%z)") + "."
+    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location")
+    if loc:
+        s += f" User location: {loc}."
+    return s
+
+
+# The chat system prompt is a user-editable template at ~/.config/qchat/system.md.
+# {{tokens}} substitute fresh at send time; unknown {{tokens}} and literal braces in the
+# body are left untouched. Absent/empty file → "{{stable}}".
+#
+# CACHING: SAINT breakpoints the FIRST system message (saint/backends.py); a system
+# prefix that changes every turn invalidates the whole cached prefix (system + history)
+# once a chat crosses cache.prompt_cache_min_chars — and also defeats local prefix reuse
+# (vLLM APC / llama.cpp). So the default {{stable}} carries only session-stable grounding
+# (date at day resolution + location) — no minute clock. {{time}}/{{datetime}} are
+# available for users who want a live clock in the prompt, at that cache cost. Live
+# minute-time on demand is a job for the get_current_time tool (v2.1), not the prefix.
+# Shell/goal modes keep the full-resolution ground_text() (single-shot, no cache to protect).
+_SYSTEM_TMPL = os.path.expanduser("~/.config/qchat/system.md")
+
+
+def stable_context():
+    """Session-stable grounding for the system prefix — no minute clock, so SAINT's
+    system breakpoint and local prefix reuse stay warm across turns."""
+    s = "Today is " + datetime.now().astimezone().strftime("%A, %Y-%m-%d") + "."
+    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location")
+    if loc:
+        s += f" You are assisting a user located in {loc}."
+    return s
+
+
+def _tokens():
+    now = datetime.now().astimezone()
+    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location") or ""
+    return {"stable": stable_context(), "grounding": ground_text(),
+            "datetime": now.strftime("%A, %Y-%m-%d %H:%M %Z (%z)"),
+            "date": now.strftime("%A, %Y-%m-%d"), "time": now.strftime("%H:%M %Z"),
+            "tz": now.strftime("%Z"), "location": loc,
+            "cwd": os.getcwd(), "os": platform.system(), "shell": SHELL}
+
+
+def load_system_template():
+    try:
+        t = open(_SYSTEM_TMPL).read()
+        return t if t.strip() else "{{stable}}"
+    except Exception:
+        return "{{stable}}"
+
+
+def system_prompt():
+    """Render the template: substitute known {{tokens}}, leave the rest verbatim."""
+    toks = _tokens()
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: toks.get(m.group(1), m.group(0)),
+                  load_system_template()).strip()
+
+
+def chat_system():
+    """Fresh chat system message from the template, or None if it renders empty."""
+    s = system_prompt()
+    return {"role": "system", "content": s} if s else None
 
 # --- catastrophic-command denylist: hard-blocked even in --auto, no LLM involved.
 _DENY = [
@@ -113,6 +208,10 @@ def seat_alive(base):
         return True
     except Exception:
         return False
+
+
+def _is_saint(base):
+    return base == SEATS["saint"][1]   # saint/cloud-* seats share the one SAINT base (:4000)
 
 
 def clean_cmd(text):
@@ -165,7 +264,8 @@ def copy_clip(text):
 def _cmd_sys():
     ctx = os.environ.get("QCHAT_CTX", "").strip()
     ctx = f" Recent shell history:\n{ctx}\n" if ctx else ""
-    return (f"You generate shell commands for {platform.system()} / {SHELL} / cwd {os.getcwd()}.{ctx}"
+    return (f"You generate shell commands for {platform.system()} / {SHELL} / cwd {os.getcwd()}. "
+            f"{ground_text()}{ctx}"
             "Output ONLY the command — no markdown, no backticks, no explanation.")
 
 
@@ -213,6 +313,7 @@ def shell_mode(task, auto=False):
 # --- goal agent (! / !!) --------------------------------------------------------
 def goal_mode(task, auto=False):
     goal_sys = (f"Accomplish a shell goal step by step on {platform.system()} / {SHELL} / cwd {os.getcwd()}. "
+                f"{ground_text()} "
                 "Each turn output EITHER the single next command (no markdown/explanation) "
                 "OR a line 'DONE: <summary>' when the goal is met. Commands must be non-interactive. "
                 "You are shown each command's exit code and output.")
@@ -372,7 +473,12 @@ def _collapse_think(think_buf, t0):
 
 def stream(messages, think_store, model=None, base=None):
     model, base = model or MODEL, base or BASE
-    body = json.dumps({"model": model, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
+    sysmsg = chat_system()            # user template (date/location tokens), fresh, not stored
+    if sysmsg and SAINT_SENTINEL in sysmsg["content"] and not _is_saint(base):
+        # only SAINT relocates the volatile section; on a direct seat, inline it (drop marker)
+        sysmsg = {**sysmsg, "content": sysmsg["content"].replace(SAINT_SENTINEL, "").strip()}
+    msgs = ([sysmsg] if sysmsg else []) + messages
+    body = json.dumps({"model": model, "messages": msgs, "max_tokens": 8192, "stream": True}).encode()
     headers = {"Content-Type": "application/json"}
     if SESSION:
         headers["x-session-id"] = SESSION
@@ -660,7 +766,7 @@ def repl():
     history, thinks = [], []
     SESSION = "qchat-" + os.urandom(6).hex()
     print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
-          f"/models /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /system /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     while True:
         print()  # blank line before each prompt
         try:
@@ -698,6 +804,38 @@ def repl():
             models_menu(); continue
         if user in ("/think", "/expand"):
             print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
+            continue
+        if user == "/system" or user.startswith("/system "):
+            arg = user[len("/system"):].strip()
+            if arg == "edit":
+                if not os.path.exists(_SYSTEM_TMPL):
+                    os.makedirs(os.path.dirname(_SYSTEM_TMPL), exist_ok=True)
+                    open(_SYSTEM_TMPL, "w").write("{{stable}}\n")
+                subprocess.run([os.environ.get("EDITOR", "vi"), _SYSTEM_TMPL])
+                print(f"{DIM}(saved {_SYSTEM_TMPL}){RESET}")
+            else:
+                exists = os.path.exists(_SYSTEM_TMPL)
+                print(f"{DIM}template: {_SYSTEM_TMPL}"
+                      f"{'' if exists else '  (default — no file; /system edit to create)'}{RESET}")
+                print(f"{DIM}tokens: " + ", ".join("{{" + k + "}}" for k in _tokens()) + RESET)
+                print(f"{DIM}── resolved (sent as the chat system prompt) ──{RESET}")
+                print(system_prompt() or f"{DIM}(empty){RESET}")
+            continue
+        if user == "/location" or user.startswith("/location "):
+            arg = user[len("/location"):].strip()
+            st = load_settings()
+            if arg:
+                if arg.lower() in ("clear", "none", "-"):
+                    st.pop("location", None); save_settings(st)
+                    print("(location cleared)")
+                else:
+                    st["location"] = arg; save_settings(st)
+                    print(f"(location set: {arg})")
+            else:
+                cur = os.environ.get("QCHAT_LOCATION") or st.get("location")
+                env = " (from $QCHAT_LOCATION)" if os.environ.get("QCHAT_LOCATION") else ""
+                print(f"location: {cur}{env}" if cur else
+                      "(no location set — /location <city, state zip>, or /location clear)")
             continue
         if user == "/clear":
             history.clear(); thinks.clear()
