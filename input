@@ -30,7 +30,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       inspects the stored profile, recent history, knowledge, and pages.
 Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
-import json, math, os, platform, re, shutil, subprocess, sys, threading, time, urllib.request, urllib.parse
+import json, math, os, platform, re, shlex, shutil, subprocess, sys, threading, time, urllib.request, urllib.parse
 from datetime import datetime
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
@@ -1668,13 +1668,19 @@ def _status_line(stats):
     return f"{DIM}" + "  ·  ".join(parts) + RESET
 
 
-def stream(messages, think_store, model=None, base=None, tools=None, volatile=None):
-    """Stream one assistant response. Returns (text, tool_calls) — tool_calls is the
+def stream(messages, think_store, model=None, base=None, tools=None, volatile=None,
+           system=None, quiet=False, session=None):
+    """Stream one assistant response. Returns (text, tool_calls, usage) — tool_calls is the
     OpenAI-shaped list (possibly empty) accumulated from the stream's deltas. `volatile`
-    is per-turn context (e.g. recalled memory) placed after the cache breakpoint."""
+    is per-turn context (e.g. recalled memory) placed after the cache breakpoint.
+    `system` overrides the rendered system prompt (threads with their own cwd/brief);
+    `quiet` suppresses all terminal output (background threads, sub-agents, jobs)."""
     model, base = model or MODEL, base or BASE
-    sm = chat_system()                        # user template (date/location tokens), fresh
-    content = sm["content"] if sm else ""
+    if system is not None:
+        content = system
+    else:
+        sm = chat_system()                    # user template (date/location tokens), fresh
+        content = sm["content"] if sm else ""
     if _MEM_PROFILE:                          # stable → part of the cached prefix
         content = (content + "\n\n" if content else "") + "User profile: " + _MEM_PROFILE
     if volatile:                              # per-turn → after the sentinel (cache-safe)
@@ -1689,14 +1695,14 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
         payload["tools"] = tools
     body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
-    if SESSION:
-        headers["x-session-id"] = SESSION
+    if session or SESSION:
+        headers["x-session-id"] = session or SESSION
     req = urllib.request.Request(f"{base}/chat/completions", body, headers)
     reply, think_buf, phase, t0, tool_acc = [], [], "start", None, {}
     usage, t_first = None, None
     md = MDRender()
     import select as _sel
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    interactive = (not quiet) and sys.stdin.isatty() and sys.stdout.isatty()
     fd, old_tty = sys.stdin.fileno(), None
     try:
         if interactive:
@@ -1727,7 +1733,8 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
                 if not banner_done:  # first chunk carries the actually-served model name
                     served = chunk.get("model", "")
                     arrow = f" >> {served}" if served and served != saint_b else ""
-                    print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
+                    if not quiet:
+                        print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
                     banner_done = True
                 delta = chunk["choices"][0].get("delta") or {}
                 if t_first is None and (delta.get("reasoning_content") or delta.get("reasoning")
@@ -1736,15 +1743,20 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     if phase != "thinking":
-                        sys.stdout.write(f"{DIM}[think] "); phase, t0 = "thinking", time.monotonic()
-                    sys.stdout.write(rc); sys.stdout.flush()
+                        if not quiet:
+                            sys.stdout.write(f"{DIM}[think] ")
+                        phase, t0 = "thinking", time.monotonic()
+                    if not quiet:
+                        sys.stdout.write(rc); sys.stdout.flush()
                     think_buf.append(rc)
                 c = delta.get("content")
                 if c:
-                    if phase == "thinking":
+                    if phase == "thinking" and not quiet:
                         _collapse_think(think_buf, t0)
                     phase = "content"
-                    reply.append(c); md.feed(c)
+                    reply.append(c)
+                    if not quiet:
+                        md.feed(c)
                 for tc in delta.get("tool_calls") or []:   # deltas: id/name once, args in pieces
                     acc = tool_acc.setdefault(tc.get("index", 0),
                                               {"id": None, "name": "", "arguments": ""})
@@ -1759,12 +1771,13 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
         if old_tty is not None:
             import termios
             termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
-    if phase == "thinking":      # round ended in thinking (e.g. thinking→tool_call): collapse now
+    if phase == "thinking" and not quiet:   # round ended in thinking (e.g. →tool_call): collapse
         _collapse_think(think_buf, t0)
-    md.finalize()
-    sys.stdout.write(RESET)
-    print()
-    if think_buf:
+    if not quiet:
+        md.finalize()
+        sys.stdout.write(RESET)
+        print()
+    if think_buf and think_store is not None:
         think_store.append("".join(think_buf))
     tool_calls = [
         {"id": a["id"] or f"call_{i}", "type": "function",
@@ -2169,49 +2182,283 @@ def _fmt_result(out):
     return f"{flat[:80]}… · {n} line{'' if n == 1 else 's'}, {len(out)} chars"
 
 
+# --- agent engine: Sandbox + run_thread -------------------------------------------
+# run_thread() is THE agent loop: send messages (+tools) → execute tool calls → loop until
+# a plain answer (or the termination hook / round cap / token budget stops it). The
+# interactive REPL turn (_turn), sub-agents, /goal, and background jobs all call it; they
+# differ only in context (history/system/cwd), tools, termination, and whether output is
+# printed. Spawned threads get a Sandbox instead of the human-gated run_command.
+
+# Allowlisted argv prefixes (no shell → `;`, `&&`, `|`, `$()` are inert literals).
+SANDBOX_READONLY = (
+    "git status", "git log", "git diff", "git show", "git blame", "git rev-parse",
+    "git ls-files", "git ls-tree", "git cat-file", "git merge-base", "git describe", "git shortlog",
+    "ls", "cat", "head", "tail", "wc", "stat", "file", "tree", "du", "basename", "dirname",
+    "realpath", "readlink", "grep", "rg", "diff", "cmp", "sort", "uniq", "cut", "tr", "nl", "find",
+    "which", "env", "pwd", "date", "echo",
+)
+# + build/test/edit tooling for jobs and sub-agents that are allowed to change things.
+SANDBOX_DEV = SANDBOX_READONLY + (
+    "python3", "python", "pip", "pip3", "pytest", "uv", "npm", "npx", "node", "pnpm", "yarn",
+    "make", "cargo", "go", "rustc", "gcc", "cc", "clang", "ruff", "black", "mypy", "tsc",
+    "git add", "git commit", "git checkout", "git switch", "git branch", "git stash", "git restore",
+    "git fetch", "git pull", "git push", "git rm", "git mv", "git init", "git tag",
+    "mkdir", "cp", "mv", "touch", "rm", "rmdir", "sed", "awk", "tar", "gzip", "curl", "wget",
+    "chmod", "ln", "sh -c", "bash -c",
+)
+
+
+class Sandbox:
+    """Bounded execution surface for one spawned thread (port of aco's Sandbox). `bash`
+    runs WITHOUT a shell, argv-split, only if the argv prefix matches the allowlist, and
+    never if it matches the catastrophic denylist; read/write/edit are confined to `root`.
+    `unsafe_shell=True` is the explicit opt-out (full shell; denylist still applies)."""
+
+    def __init__(self, root=None, allow=None, unsafe_shell=False, timeout_s=120, max_output=20000):
+        self.root = os.path.realpath(root or os.getcwd())
+        self.allow = list(allow if allow is not None else SANDBOX_READONLY)
+        self.unsafe_shell, self.timeout_s, self.max_output = bool(unsafe_shell), timeout_s, max_output
+
+    def _allowed(self, argv):
+        for entry in self.allow:
+            pre = entry.split()
+            if argv[:len(pre)] == pre:
+                return True
+        return False
+
+    def _clip(self, text):
+        return text if len(text) <= self.max_output else text[:self.max_output] + "\n…[output truncated]"
+
+    def _resolve(self, path):
+        p = path if os.path.isabs(path) else os.path.join(self.root, path)
+        p = os.path.realpath(p)
+        return p if (p == self.root or p.startswith(self.root + os.sep)) else None
+
+    def bash(self, command, cwd=None):
+        command = (command or "").strip()
+        if not command:
+            return "exit=-1\n(bash refused: empty command)"
+        if danger(command):
+            return "exit=-1\n(bash refused: matches the catastrophic denylist)"
+        workdir = self._resolve(cwd) if cwd else self.root
+        if workdir is None:
+            return "exit=-1\n(bash refused: cwd escapes the sandbox root)"
+        if self.unsafe_shell:
+            return self._spawn(command, workdir, True)
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return f"exit=-1\n(bash refused: unparsable command: {e})"
+        if not argv or not self._allowed(argv):
+            return ("exit=-1\n(bash refused: not on the sandbox allowlist)\n"
+                    f"requested: {command}\nallowed prefixes include: {', '.join(self.allow[:10])} …\n"
+                    "Report what you would have run and why; do not claim you ran it.")
+        return self._spawn(argv, workdir, False)
+
+    def _spawn(self, cmd, workdir, shell):
+        try:
+            p = subprocess.run(cmd, shell=shell, cwd=workdir, capture_output=True, text=True,
+                               timeout=self.timeout_s, executable=SHELL if shell else None)
+            out = ((p.stdout or "") + (p.stderr or "")).strip() or "(no output)"
+            return f"exit={p.returncode}\n{self._clip(out)}"
+        except subprocess.TimeoutExpired:
+            return f"exit=-1\n(bash timed out after {self.timeout_s}s)"
+        except FileNotFoundError:
+            return "exit=-1\n(bash error: command not found)"
+        except Exception as e:
+            return f"exit=-1\n(bash error: {e})"
+
+    def read(self, path):
+        p = self._resolve(path)
+        if p is None:
+            return "(read refused: path escapes the sandbox root)"
+        if not os.path.isfile(p):
+            return f"(read error: not a file: {path})"
+        try:
+            return self._clip(open(p, encoding="utf-8", errors="replace").read())
+        except Exception as e:
+            return f"(read error: {e})"
+
+    def write(self, path, content):
+        p = self._resolve(path)
+        if p is None:
+            return "(write refused: path escapes the sandbox root)"
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w", encoding="utf-8").write(content or "")
+            return f"wrote {len(content or '')} chars to {os.path.relpath(p, self.root)}"
+        except Exception as e:
+            return f"(write error: {e})"
+
+    def edit(self, path, old, new, replace_all=False):
+        p = self._resolve(path)
+        if p is None:
+            return "(edit refused: path escapes the sandbox root)"
+        try:
+            s = open(p, encoding="utf-8").read()
+        except Exception as e:
+            return f"(edit error: {e})"
+        n = s.count(old or "")
+        if not old or n == 0:
+            return "(edit error: old_string not found — read the file and match exactly)"
+        if n > 1 and not replace_all:
+            return f"(edit error: old_string matches {n} places; pass replace_all or a longer unique string)"
+        s = s.replace(old, new) if replace_all else s.replace(old, new, 1)
+        open(p, "w", encoding="utf-8").write(s)
+        return f"edited {os.path.relpath(p, self.root)} ({n if replace_all else 1} replacement)"
+
+    def ls(self, path="."):
+        p = self._resolve(path or ".")
+        if p is None:
+            return "(ls refused: path escapes the sandbox root)"
+        try:
+            return "\n".join(sorted(os.listdir(p))) or "(empty)"
+        except Exception as e:
+            return f"(ls error: {e})"
+
+
+def sandbox_tools(sb, write=True):
+    """Thread-local Tool objects bound to a Sandbox (NOT registered globally). The sandbox
+    is the gate, so confirm='never'. write=False → read-only surface."""
+    ts = [
+        Tool("bash", "Run a command (no shell; allowlisted argv) inside the sandbox root. "
+             "Returns exit code + combined output.",
+             {"type": "object", "properties": {"command": {"type": "string"},
+                                               "cwd": {"type": "string", "description": "subdir of the sandbox root"}},
+              "required": ["command"]},
+             lambda a: sb.bash(a.get("command", ""), a.get("cwd"))),
+        Tool("read_file", "Read a file inside the sandbox root.",
+             {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+             lambda a: sb.read(a.get("path", ""))),
+        Tool("list_dir", "List a directory inside the sandbox root.",
+             {"type": "object", "properties": {"path": {"type": "string"}}, "required": []},
+             lambda a: sb.ls(a.get("path", "."))),
+    ]
+    if write:
+        ts += [
+            Tool("write_file", "Create or overwrite a file inside the sandbox root.",
+                 {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                  "required": ["path", "content"]},
+                 lambda a: sb.write(a.get("path", ""), a.get("content", ""))),
+            Tool("edit_file", "Replace an exact string in a file (must match once unless replace_all).",
+                 {"type": "object", "properties": {"path": {"type": "string"}, "old_string": {"type": "string"},
+                                                   "new_string": {"type": "string"}, "replace_all": {"type": "boolean"}},
+                  "required": ["path", "old_string", "new_string"]},
+                 lambda a: sb.edit(a.get("path", ""), a.get("old_string", ""), a.get("new_string", ""),
+                                   bool(a.get("replace_all")))),
+        ]
+    return ts
+
+
+def run_thread(task, *, history=None, system=None, model=None, base=None, tools=None,
+               max_rounds=MAX_TOOL_ROUNDS, quiet=True, stats=None, thinks=None, volatile=None,
+               terminate=None, budget_tokens=None, on_tool=None, session=None, gate=True):
+    """Run one agent thread. `task` is appended as the user message to `history` (a list,
+    mutated in place; new list if None). `tools` = list of Tool objects (thread-local).
+    `system` overrides the system prompt (e.g. system_prompt(cwd) + a brief). `terminate`
+    = fn(text, res) -> (done, nudge): called when the model stops calling tools; if not done
+    the nudge is sent as the next user message (goal-directed loops). `budget_tokens` caps
+    total tokens. Returns a dict: text, history, rounds, tool_calls, tokens_in/out, stopped
+    ∈ done|rounds|budget|error, error. Raises KeyboardInterrupt (after rolling back)."""
+    messages = history if history is not None else []
+    base_len = len(messages)
+    messages.append({"role": "user", "content": task})
+    toolmap = {t.name: t for t in (tools or [])}
+    schemas = [t.schema() for t in toolmap.values()] or None
+    res = {"text": "", "history": messages, "rounds": 0, "tool_calls": 0,
+           "tokens_in": 0, "tokens_out": 0, "stopped": "done", "error": None}
+    try:
+        for _ in range(max_rounds):
+            text, tcs, usage = stream(messages, thinks, model=model, base=base, tools=schemas,
+                                      volatile=volatile, system=system, quiet=quiet, session=session)
+            res["rounds"] += 1
+            res["tokens_in"] += usage["prompt"] or 0; res["tokens_out"] += usage["completion"] or 0
+            if stats is not None:
+                stats.record(usage["prompt"], usage["completion"], usage["rate"])
+            res["text"] = text or res["text"]
+            msg = {"role": "assistant", "content": text}
+            if tcs:
+                msg["tool_calls"] = tcs
+            messages.append(msg)
+            if budget_tokens and res["tokens_in"] + res["tokens_out"] > budget_tokens:
+                res["stopped"] = "budget"; break
+            if not tcs:                            # plain answer → done, unless the goal says otherwise
+                if terminate is not None:
+                    done, nudge = terminate(text, res)
+                    if not done and nudge:
+                        messages.append({"role": "user", "content": nudge}); continue
+                break
+            for tc in tcs:                         # run each call, feed results back
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {}
+                res["tool_calls"] += 1
+                if on_tool:
+                    on_tool("call", tc, None)
+                tool = toolmap.get(name)
+                if tool is None:
+                    out = f"Error: no such tool {name!r}"
+                else:
+                    cmd = args.get("command") if isinstance(args, dict) else None
+                    if gate and not quiet and getattr(tool, "confirm", "never") != "never" \
+                            and not _gate(tool.confirm, cmd):
+                        out = "Declined by the user; not run."
+                    else:
+                        try:
+                            out = str(tool.run(args))
+                        except Exception as e:
+                            out = f"Error running {name}: {e}"
+                _note_saved(tc, out)
+                shown = on_tool("result", tc, out) if on_tool else None
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": shown if shown is not None else out})
+        else:
+            res["stopped"] = "rounds"
+    except KeyboardInterrupt:
+        del messages[base_len:]; raise
+    except Exception as e:
+        del messages[base_len:]
+        res["stopped"], res["error"] = "error", f"{type(e).__name__}: {e}"
+    return res
+
+
 def _turn(history, thinks, user, stats, model=None, base=None):
-    base_len = len(history)                       # roll back the whole turn on abort/error
-    history.append({"role": "user", "content": user})
+    """One interactive REPL turn = run_thread with printing, memory recall/store, gating."""
     stats.turns += 1
     recalled = mem_recall(user)                    # ambient memory for this turn (best-effort)
     if recalled:
         n = sum(1 for l in recalled.splitlines() if l.startswith("- "))
         print(f"{DIM}⟐ memory: {n} recalled{RESET}")
-    final_text = ""
-    try:
-        tools = active_tools()
-        for _ in range(MAX_TOOL_ROUNDS):
-            text, tcs, usage = stream(history, thinks, model=model, base=base,
-                                      tools=tools, volatile=recalled)
-            stats.record(usage["prompt"], usage["completion"], usage["rate"])
-            final_text = text or final_text
-            msg = {"role": "assistant", "content": text}
-            if tcs:
-                msg["tool_calls"] = tcs
-            history.append(msg)
-            if not tcs:                            # plain answer → turn is done
-                break
-            for tc in tcs:                         # run each call, feed results back
-                fn = tc.get("function") or {}
-                print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}")
-                out = execute_tool(tc)             # gates per the tool's confirm policy
-                tool = TOOLS.get(fn.get("name"))
-                full = bool(out) and getattr(tool, "display", "compact") == "full"
-                if full:
-                    _print_full_result(out)        # e.g. list_files: show the whole ls -l
-                else:
-                    print(f"{DIM}  → {_fmt_result(out)}{RESET}")
-                # model gets the full text either way; for full-display tools, tell it the
-                # user already saw it so it doesn't re-list the same content back
-                history.append({"role": "tool", "tool_call_id": tc["id"],
-                                "content": out + _SHOWN_NOTE if full else out})
+
+    def on_tool(ev, tc, out):
+        fn = tc.get("function") or {}
+        if ev == "call":
+            print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}"); return None
+        tool = TOOLS.get(fn.get("name"))
+        full = bool(out) and getattr(tool, "display", "compact") == "full"
+        if full:
+            _print_full_result(out)                # e.g. list_files: show the whole ls -l
         else:
-            print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
-        mem_store(user, final_text)                # normal completion → persist the exchange
+            print(f"{DIM}  → {_fmt_result(out)}{RESET}")
+        # model gets the full text either way; for full-display tools, tell it the user
+        # already saw it so it doesn't re-list the same content back
+        return out + _SHOWN_NOTE if full else out
+
+    tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
+    try:
+        res = run_thread(user, history=history, tools=tools, model=model, base=base, quiet=False,
+                         stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True)
     except KeyboardInterrupt:
-        print(f"{RESET}\n(interrupted)"); del history[base_len:]
-    except Exception as e:
-        print(f"[error: {e}]"); del history[base_len:]
+        print(f"{RESET}\n(interrupted)"); return
+    if res["stopped"] == "rounds":
+        print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
+    if res["error"]:
+        print(f"[error: {res['error']}]")
+    else:
+        mem_store(user, res["text"])               # normal completion → persist the exchange
 
 
 def repl():
@@ -2654,11 +2901,16 @@ def _task():
         sys.exit(130)
 
 
-if MODE == "--gen":
-    sys.stdout.write(generate(_task()))
-elif MODE in ("-e", "-x"):
-    sys.exit(shell_mode(_task(), auto=(MODE == "-x")))
-elif MODE in ("--goal", "--auto"):
-    sys.exit(goal_mode(_task(), auto=(MODE == "--auto")))
-else:
-    repl()
+def _main():
+    if MODE == "--gen":
+        sys.stdout.write(generate(_task()))
+    elif MODE in ("-e", "-x"):
+        sys.exit(shell_mode(_task(), auto=(MODE == "-x")))
+    elif MODE in ("--goal", "--auto"):
+        sys.exit(goal_mode(_task(), auto=(MODE == "--auto")))
+    else:
+        repl()
+
+
+if __name__ == "__main__":   # importable as a module (engine/sandbox reuse) without starting the REPL
+    _main()
