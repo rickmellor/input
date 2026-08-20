@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""qchat — zero-overhead chat REPL + shell-command generator for OpenAI-compatible seats.
+
+Chat REPL:   qchat [model] [base_url]           thinking streams dimmed
+Shell mode:  qchat [model] [base_url] -e task…  thinking OFF, aichat-style menu
+Seats: gemma (chat default) | coder (-e/-x default) | qwen38 (on-demand). Or [model] [base_url].
+REPL commands: /models (toggle seat), /clear, /quit, Ctrl-D.
+"""
+import json, os, platform, shutil, subprocess, sys, urllib.request
+
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+
+argv = sys.argv[1:]
+task_words, auto_exec = None, False
+for flag in ("-e", "-x"):
+    if flag in argv:
+        i = argv.index(flag)
+        task_words, argv = argv[i + 1:], argv[:i]
+        auto_exec = flag == "-x"
+        break
+SEATS = {  # short names for the daily fleet (+ the on-demand experiment seat)
+    "gemma": ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
+    "coder": ("qwen-27b-coder", "http://127.0.0.1:8003/v1"),
+    "qwen38": ("Qwen3.8-27B-AWQ-INT4", "http://127.0.0.1:8004/v1"),
+}
+if argv and argv[0] in SEATS:
+    MODEL, BASE = SEATS[argv[0]]
+elif argv:
+    MODEL = argv[0]
+    BASE = argv[1] if len(argv) > 1 else "http://127.0.0.1:8002/v1"
+elif task_words is not None:
+    MODEL, BASE = SEATS["coder"]   # shell-command generation -> the coder seat
+else:
+    MODEL, BASE = SEATS["gemma"]   # chat -> the fast general seat
+
+
+def complete(messages, think, max_tokens=8192):
+    body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens}
+    if not think:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    req = urllib.request.Request(f"{BASE}/chat/completions", json.dumps(body).encode(),
+                                 {"Content-Type": "application/json"})
+    d = json.load(urllib.request.urlopen(req, timeout=600))
+    return (d["choices"][0]["message"].get("content") or "").strip()
+
+
+def seat_alive(base):
+    try:
+        with urllib.request.urlopen(f"{base}/models", timeout=1.5) as r:
+            json.load(r)
+        return True
+    except Exception:
+        return False
+
+
+def models_menu():
+    global MODEL, BASE
+    names = list(SEATS)
+    print("seats:")
+    for i, n in enumerate(names, 1):
+        m, b = SEATS[n]
+        mark = "*" if (m, b) == (MODEL, BASE) else " "
+        status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
+        print(f" {mark}{i}. {n:<8} {m}  [{status}]")
+    try:
+        pick = input("switch to (name/number, blank=keep): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not pick:
+        return
+    if pick.isdigit() and 1 <= int(pick) <= len(names):
+        pick = names[int(pick) - 1]
+    if pick in SEATS:
+        MODEL, BASE = SEATS[pick]
+        print(f"→ {MODEL} @ {BASE}  (history carries over)")
+    else:
+        print(f"(unknown seat {pick!r})")
+
+
+def stream(messages):
+    body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
+    req = urllib.request.Request(f"{BASE}/chat/completions", body, {"Content-Type": "application/json"})
+    reply, thinking = [], False
+    with urllib.request.urlopen(req, timeout=600) as r:
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            delta = json.loads(line[6:])["choices"][0].get("delta") or {}
+            rc = delta.get("reasoning_content") or delta.get("reasoning")
+            if rc:
+                if not thinking:
+                    sys.stdout.write(f"{DIM}[think] "); thinking = True
+                sys.stdout.write(rc); sys.stdout.flush()
+            c = delta.get("content")
+            if c:
+                if thinking:
+                    sys.stdout.write(f"{RESET}\n"); thinking = False
+                sys.stdout.write(c); sys.stdout.flush(); reply.append(c)
+    if thinking:
+        sys.stdout.write(RESET)
+    print()
+    return "".join(reply)
+
+
+def copy_to_clipboard(text):
+    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, input=text.encode(), check=False)
+            return True
+    return False
+
+
+def _clean_cmd(text):
+    lines = [l for l in text.strip().splitlines() if not l.strip().startswith("```")]
+    return "\n".join(lines).strip()
+
+
+def _run(cmd):
+    return subprocess.run(cmd, shell=True, executable=os.environ.get("SHELL", "/bin/bash")).returncode
+
+
+def shell_mode(task, auto=False):
+    sysmsg = (f"You generate a single shell command for: {platform.system()} / "
+              f"{os.environ.get('SHELL', 'bash')} / cwd {os.getcwd()}. "
+              "Output ONLY the command — no markdown, no backticks, no explanation.")
+    messages = [{"role": "system", "content": sysmsg}, {"role": "user", "content": task}]
+    cmd = _clean_cmd(complete(messages, think=False, max_tokens=1024))
+    messages.append({"role": "assistant", "content": cmd})
+    if auto:
+        print(f"{BOLD}{cmd}{RESET}", file=sys.stderr)
+        return _run(cmd)
+    while True:
+        print(f"{BOLD}{cmd}{RESET}")
+        try:
+            choice = input("> execute | revise | describe | copy | quit: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return 130
+        if choice in ("e", "execute"):
+            return _run(cmd)
+        if choice in ("r", "revise"):
+            fb = input("revision: ").strip()
+            messages.append({"role": "user", "content": f"Revise the command: {fb}. Output only the revised command."})
+            cmd = _clean_cmd(complete(messages, think=False, max_tokens=1024))
+            messages.append({"role": "assistant", "content": cmd})
+        elif choice in ("d", "describe"):
+            print(DIM + complete(messages + [{"role": "user",
+                  "content": "Briefly explain what this command does, plain text."}], think=False, max_tokens=1024) + RESET)
+        elif choice in ("c", "copy"):
+            print("(copied)" if copy_to_clipboard(cmd) else "(no clipboard tool found — select above)")
+        elif choice in ("q", "quit"):
+            return 0
+
+
+if task_words is not None:
+    task = " ".join(task_words)
+    if not task:
+        # Bare -e/-x: read the task interactively — no shell parsing, apostrophes welcome.
+        try:
+            task = input("task: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(130)
+        if not task:
+            sys.exit("usage: qchat [model] [base_url] -e|-x [task words]")
+    sys.exit(shell_mode(task, auto=auto_exec))
+
+history = []
+print(f"qchat → {MODEL} @ {BASE}  (/models, /clear, /quit)")
+while True:
+    try:
+        user = input("\n> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        break
+    if not user or user == "/quit":
+        break
+    if user == "/clear":
+        history.clear(); print("(history cleared)"); continue
+    if user in ("/models", "/model"):
+        models_menu(); continue
+    history.append({"role": "user", "content": user})
+    try:
+        history.append({"role": "assistant", "content": stream(history)})
+    except Exception as e:
+        print(f"[error: {e}]"); history.pop()
