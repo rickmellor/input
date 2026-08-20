@@ -147,6 +147,24 @@ def seat_hotkeys():
     hk = _default_hotkeys()
     hk.update(load_settings().get("seat_hotkeys") or {})
     return {k.lower(): v for k, v in hk.items()}
+
+
+def _seat_short(n):
+    """Short label for a seat in the routing hint: cloud tiers show their alias
+    (haiku/sonnet/opus/fable); local/router keep their friendly name (coder/chat/saint)."""
+    meta = SEAT_META.get(n, {})
+    if meta.get("kind") == "cloud":
+        al = meta.get("aliases") or []
+        return al[0] if al else n
+    return n
+
+
+def _route_hint_lines():
+    """Two dim lines reminding you how to route the staged text (Ctrl+G peek)."""
+    hk = sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:]))
+    fn = "   ".join(f"{k.upper()} {_seat_short(v)}" for k, v in hk)
+    return [f"{DIM}  ↵ send  ·  Ctrl+↵ seat picker  ·  Fn = one-shot this text to a seat:{RESET}",
+            f"{DIM}  {fn}{RESET}"]
 MAX_AUTO_STEPS = 8
 # SAINT extracts volatile per-turn context placed after this marker in the system prompt
 # and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
@@ -1751,6 +1769,13 @@ def read_line(prompt):
                 del buf[:pos]; pos = 0; redraw()
             elif ch == b"\x0b":                        # Ctrl-K kill to end
                 del buf[pos:]; redraw()
+            elif ch == b"\x07":                        # Ctrl+G → peek routing shortcuts
+                if buf:                                # only when there's staged text to route
+                    sys.stdout.write("\r\n")
+                    for ln in _route_hint_lines():
+                        sys.stdout.write(ln + "\r\n")
+                    crow = 0
+                    redraw()
             elif ch == b"\x1b":                        # escape sequences
                 if select.select([fd], [], [], 0.05)[0]:
                     intro = os.read(fd, 1)             # '[' (CSI) or 'O' (SS3)
@@ -1939,7 +1964,7 @@ def repl():
             _enter_build(pid)
 
     SESSION = "input-" + os.urandom(6).hex()
-    print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · Shift+Tab cycles mode · "
+    print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^G routing hint · Shift+Tab cycles mode · "
           f"/models /seats /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
