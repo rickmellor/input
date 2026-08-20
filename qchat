@@ -364,8 +364,9 @@ register(Tool(
     "list_files",
     "List a directory's contents in long format (like `ls -l`: permissions, size, date, "
     "name). This is THE way to list files or directories — use it whenever the user wants "
-    "to see what's in a directory; do not use run_command/ls for that. Path defaults to "
-    "the current directory; ~ is allowed.",
+    "to see what's in a directory; do not use run_command/ls for that. The listing is "
+    "shown to the user directly, so after calling this do not re-list or summarize the "
+    "entries. Path defaults to the current directory; ~ is allowed.",
     {"type": "object",
      "properties": {
          "path": {"type": "string", "description": "Directory to list; defaults to the cwd"}},
@@ -1050,6 +1051,14 @@ def _fmt_args(s):
         return s or "{}"
 
 
+# Appended to the MODEL's copy of a display="full" result (not shown to the user) so it
+# doesn't reproduce output the user already sees verbatim.
+_SHOWN_NOTE = ("\n\n[This output has already been displayed to the user verbatim. Do NOT "
+               "repeat, re-list, reformat, or summarize it. End your turn without further "
+               "text unless you have something genuinely new to add, then keep it to one "
+               "short sentence.]")
+
+
 def _print_full_result(out, cap=200):
     """Print a tool result verbatim (for display='full' tools like list_files), under a
     dim gutter so it reads as tool output; capped so a huge dir can't flood the screen."""
@@ -1093,11 +1102,15 @@ def _turn(history, thinks, user, model=None, base=None):
                 print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}")
                 out = execute_tool(tc)             # gates per the tool's confirm policy
                 tool = TOOLS.get(fn.get("name"))
-                if out and getattr(tool, "display", "compact") == "full":
+                full = bool(out) and getattr(tool, "display", "compact") == "full"
+                if full:
                     _print_full_result(out)        # e.g. list_files: show the whole ls -l
                 else:
                     print(f"{DIM}  → {_fmt_result(out)}{RESET}")
-                history.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
+                # model gets the full text either way; for full-display tools, tell it the
+                # user already saw it so it doesn't re-list the same content back
+                history.append({"role": "tool", "tool_call_id": tc["id"],
+                                "content": out + _SHOWN_NOTE if full else out})
         print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
     except KeyboardInterrupt:
         print(f"{RESET}\n(interrupted)"); del history[base_len:]
