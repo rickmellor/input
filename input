@@ -1003,6 +1003,25 @@ def plan_browse(_arg=""):
         print(f"{DIM}  {mark} {p['id']:<34} {p.get('status', ''):<8} {pct}  {p.get('title', '')}{RESET}")
 
 
+def plan_pick(verb="select"):
+    """Show the plan list and arrow-select one. Returns the chosen plan id, or None
+    (empty store / cancel / error). Off-TTY, falls back to _pick's numbered prompt."""
+    rows = megaplan_call("list")
+    if isinstance(rows, dict) and "error" in rows:
+        print(f"{DIM}megaplan: {rows['error']}{RESET}"); return None
+    if not rows:
+        print(f"{DIM}no plans yet — /plan <goal> to start one{RESET}"); return None
+    labels = []
+    for p in rows:
+        pr = p.get("progress") or {}
+        pct = f"{pr.get('pct', 0):>3}%" if pr.get("total") else "  —"
+        mark = _PRIO_MARK.get(p.get("priority"), "·")
+        labels.append(f"{mark} {p.get('status', ''):<8} {pct}  {p.get('title', '')}"
+                      f"  {DIM}[{p['id']}]{RESET}")
+    res = _pick(labels, 0, hint=f"↑/↓ or j/k · enter {verb} · q cancel")
+    return rows[res[0]]["id"] if res else None
+
+
 def plan_render(p):
     """A readable view of one plan (from a `get`/`review` result)."""
     if isinstance(p, dict) and "plan" in p:              # a review payload
@@ -1301,11 +1320,12 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
     return "".join(reply), tool_calls, {"prompt": prompt, "completion": completion, "rate": rate}
 
 
-def _pick(labels, start):
+def _pick(labels, start, hint=None):
     """Selector; returns (index, make_default) or None. Falls back to numbers off-TTY.
 
     enter → use for the session; ctrl+enter (terminals that send LF) or 'd' → also
-    persist as the launch default; q / bare-Esc → cancel.
+    persist as the launch default; q / bare-Esc → cancel. `hint` overrides the help line
+    (e.g. for pickers where 'set default' doesn't apply).
     """
     if not sys.stdin.isatty():
         for i, lab in enumerate(labels, 1):
@@ -1321,7 +1341,7 @@ def _pick(labels, start):
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     sel = start
-    print(f"{DIM}↑/↓ or j/k · enter use · ctrl+enter or d set default · q cancel{RESET}")
+    print(f"{DIM}{hint or '↑/↓ or j/k · enter use · ctrl+enter or d set default · q cancel'}{RESET}")
 
     def draw(first=False):
         if not first:
@@ -1868,31 +1888,30 @@ def repl():
                 print(f"{DIM}plan mode {on}{loaded}\n"
                       f"  /plan <goal>              start a new plan (ground → discuss → save)\n"
                       f"  /plan browse              list all plans\n"
-                      f"  /plan load <id>           open a plan to continue it\n"
-                      f"  /plan show [id]           print a plan (default: the loaded one)\n"
+                      f"  /plan load [id]           open a plan to continue it (picker if no id)\n"
+                      f"  /plan show [id]           print a plan (picker if no id)\n"
                       f"  /plan save                persist the current plan now\n"
                       f"  /plan close               leave plan mode\n"
-                      f"  /plan rename <id> <title> rename a plan (id unchanged)\n"
-                      f"  /plan remove <id>         archive a plan (soft delete, history kept){RESET}")
+                      f"  /plan rename [id] [title] rename a plan (picker + prompt if omitted)\n"
+                      f"  /plan remove [id]         archive a plan (picker if no id){RESET}")
             elif sub in ("browse", "list"):
                 plan_browse(rest)
             elif sub in ("show", "view"):
-                pid = rest or PLAN_ID
-                if not pid:
-                    print(f"{DIM}usage: /plan show <id>  (or /plan load one first){RESET}")
-                else:
+                pid = rest or plan_pick("show")           # no id → arrow-pick from the list
+                if pid:
                     plan_render(megaplan_call("get", id=pid))
             elif sub in ("load", "open"):
-                if not rest:
-                    print(f"{DIM}usage: /plan load <id>{RESET}"); continue
-                p = megaplan_call("get", id=rest)
+                pid = rest or plan_pick("load")           # no id → arrow-pick from the list
+                if not pid:
+                    continue
+                p = megaplan_call("get", id=pid)
                 if isinstance(p, dict) and "error" in p:
                     print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
                 plan_render(p)
-                PLAN_MODE, PLAN_GOAL, PLAN_ID = True, p.get("title", ""), rest
-                seed = (f"We're continuing an existing MegaPlan (id: {rest}). Current state:\n\n"
+                PLAN_MODE, PLAN_GOAL, PLAN_ID = True, p.get("title", ""), pid
+                seed = (f"We're continuing an existing MegaPlan (id: {pid}). Current state:\n\n"
                         f"{p.get('body', '')}\n\nReview where it stands and propose next steps; "
-                        f"when we change it, persist with megaplan(action=\"save\", id=\"{rest}\", …).")
+                        f"when we change it, persist with megaplan(action=\"save\", id=\"{pid}\", …).")
                 _turn(history, thinks, seed, stats)
                 print(_status_line(stats))
             elif sub == "save":
@@ -1909,20 +1928,31 @@ def repl():
                 PLAN_MODE, PLAN_GOAL, PLAN_ID = False, "", ""
                 print(f"{DIM}plan mode off{RESET}")
             elif sub in ("remove", "rm", "delete"):
-                if not rest:
-                    print(f"{DIM}usage: /plan remove <id>{RESET}"); continue
-                r = megaplan_call("archive", id=rest)
-                if PLAN_ID == rest:
+                pid = rest or plan_pick("archive")        # no id → arrow-pick from the list
+                if not pid:
+                    continue
+                r = megaplan_call("archive", id=pid)
+                if PLAN_ID == pid:
                     PLAN_ID = ""
                 err = isinstance(r, dict) and "error" in r
-                print(f"{DIM}{'megaplan: ' + r['error'] if err else 'archived ' + rest + ' (soft delete; git history kept)'}{RESET}")
+                print(f"{DIM}{'megaplan: ' + r['error'] if err else 'archived ' + pid + ' (soft delete; git history kept)'}{RESET}")
             elif sub == "rename":
                 nid, _, ntitle = rest.partition(" ")
-                if not nid or not ntitle.strip():
-                    print(f"{DIM}usage: /plan rename <id> <new title>{RESET}"); continue
-                r = megaplan_call("update", id=nid, title=ntitle.strip())
+                if not nid:
+                    nid = plan_pick("rename")             # no id → arrow-pick from the list
+                    if not nid:
+                        continue
+                ntitle = ntitle.strip()
+                if not ntitle:                            # id but no title → prompt for one
+                    try:
+                        ntitle = input("new title: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        ntitle = ""
+                if not ntitle:
+                    print(f"{DIM}rename cancelled (no title){RESET}"); continue
+                r = megaplan_call("update", id=nid, title=ntitle)
                 err = isinstance(r, dict) and "error" in r
-                print(f"{DIM}{'megaplan: ' + r['error'] if err else 'renamed ' + nid + ' → ' + ntitle.strip() + ' (id unchanged)'}{RESET}")
+                print(f"{DIM}{'megaplan: ' + r['error'] if err else 'renamed ' + nid + ' → ' + ntitle + ' (id unchanged)'}{RESET}")
             elif sub == "new":
                 if not rest:
                     print(f"{DIM}usage: /plan new <goal>{RESET}"); continue
