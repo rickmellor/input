@@ -1023,6 +1023,21 @@ def _fmt_args(s):
         return s or "{}"
 
 
+def _fmt_result(out):
+    """Compact one-line view of a tool result (the model still gets the full text).
+    Small results show inline (whitespace flattened); large ones collapse to a peek + a
+    size summary, so a big `ls`/`cat` doesn't dump a wall of dim text that reads like
+    stuck thinking."""
+    out = (out or "").strip()
+    if not out:
+        return "(no output)"
+    flat = " ".join(out.split())
+    if len(flat) <= 120:
+        return flat
+    n = len(out.splitlines())
+    return f"{flat[:80]}… · {n} line{'' if n == 1 else 's'}, {len(out)} chars"
+
+
 def _turn(history, thinks, user, model=None, base=None):
     base_len = len(history)                       # roll back the whole turn on abort/error
     history.append({"role": "user", "content": user})
@@ -1040,7 +1055,7 @@ def _turn(history, thinks, user, model=None, base=None):
                 fn = tc.get("function") or {}
                 print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}")
                 out = execute_tool(tc)             # gates per the tool's confirm policy
-                print(f"{DIM}  → {out if len(out) <= 300 else out[:300] + '…'}{RESET}")
+                print(f"{DIM}  → {_fmt_result(out)}{RESET}")
                 history.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
         print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
     except KeyboardInterrupt:
