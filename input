@@ -176,6 +176,7 @@ def load_system_template():
 # prompt (before the volatile sentinel) so it stays cache-safe.
 PLAN_MODE = False
 PLAN_GOAL = ""
+PLAN_ID = ""        # the plan currently loaded into the session (for save/show/close)
 _PLAN_DIRECTIVE = (
     "You are in MegaPlan mode — an interactive planning experience. Co-construct a build "
     "plan WITH the user and persist it to the MegaPlan store (the `megaplan` tool) so it "
@@ -961,6 +962,66 @@ def reload_mcp_tools():
     apply_tools_state()
 
 
+# ---- MegaPlan client: direct tool calls for the /plan management commands --------
+
+def _megaplan_url():
+    for s in mcp_servers():
+        if s.get("name") == "megaplan":
+            return s["url"]
+    return None
+
+
+def megaplan_call(action, **args):
+    """Call the `megaplan` MCP tool directly (deterministic; no model round-trip).
+    Returns the parsed dict/list, or {"error": ...}."""
+    url = _megaplan_url()
+    if not url:
+        return {"error": "no megaplan server configured — /mcp add megaplan <url>"}
+    try:
+        out = mcp_client(url).call(
+            "megaplan", {"action": action, **{k: v for k, v in args.items() if v not in (None, "")}})
+        d = json.loads(out) if isinstance(out, str) and out.strip() else (out or {})
+        return d.get("result", d) if isinstance(d, dict) and set(d) == {"result"} else d
+    except Exception as e:
+        return {"error": str(e)}
+
+
+_PRIO_MARK = {"critical": "‼", "high": "↑", "medium": "·", "low": "↓"}
+
+
+def plan_browse(_arg=""):
+    """Print all plans as a compact table (a direct `list` call)."""
+    rows = megaplan_call("list")
+    if isinstance(rows, dict) and "error" in rows:
+        print(f"{DIM}megaplan: {rows['error']}{RESET}"); return
+    if not rows:
+        print(f"{DIM}no plans yet — /plan <goal> to start one{RESET}"); return
+    for p in rows:
+        pr = p.get("progress") or {}
+        pct = f"{pr.get('pct', 0):>3}%" if pr.get("total") else "  —"
+        mark = _PRIO_MARK.get(p.get("priority"), "·")
+        print(f"{DIM}  {mark} {p['id']:<34} {p.get('status', ''):<8} {pct}  {p.get('title', '')}{RESET}")
+
+
+def plan_render(p):
+    """A readable view of one plan (from a `get`/`review` result)."""
+    if isinstance(p, dict) and "plan" in p:              # a review payload
+        p = p["plan"]
+    if not isinstance(p, dict) or "error" in p:
+        msg = p.get("error", "not found") if isinstance(p, dict) else p
+        print(f"{DIM}megaplan: {msg}{RESET}"); return
+    pr = p.get("progress") or {}
+    print(f"{CODE_FG}{p.get('title', '(untitled)')}{RESET}  {DIM}[{p.get('id')}]{RESET}")
+    deps = f" · deps: {', '.join(p.get('depends_on') or [])}" if p.get("depends_on") else ""
+    print(f"{DIM}  {p.get('status')} · {p.get('priority')} · "
+          f"{pr.get('done', 0)}/{pr.get('total', 0)} tasks{deps}{RESET}")
+    for t in p.get("tasks") or []:
+        box = "x" if t.get("done") else " "
+        est = f" (est {t['est_hours']}h)" if t.get("est_hours") else ""
+        flag = " @blocked" if t.get("blocked") else ""
+        print(f"{DIM}    [{box}] {t.get('text', '')}{est}{flag}{RESET}")
+
+
 _MEM = None            # connected MCPClient for MemoryOS, or None
 _MEM_PROFILE = ""      # cached user profile (stable → system prompt)
 
@@ -1624,7 +1685,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
 
 
 def repl():
-    global SESSION, TOOLS_ON, PLAN_MODE, PLAN_GOAL
+    global SESSION, TOOLS_ON, PLAN_MODE, PLAN_GOAL, PLAN_ID
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
@@ -1789,23 +1850,89 @@ def repl():
             continue
         if user == "/plan" or user.startswith("/plan "):
             arg = user[len("/plan"):].strip()
-            if arg.lower() in ("off", "done", "stop", "exit"):
-                PLAN_MODE, PLAN_GOAL = False, ""
-                print(f"{DIM}plan mode off{RESET}")
-            elif arg:
-                PLAN_MODE, PLAN_GOAL = True, arg
+            sub, _, rest = arg.partition(" ")
+            sub, rest = sub.lower(), rest.strip()
+
+            def _start_plan(goal):                        # enter mode + kick off grounding turn
+                global PLAN_MODE, PLAN_GOAL, PLAN_ID
+                PLAN_MODE, PLAN_GOAL, PLAN_ID = True, goal, ""
                 if not TOOLS_ON or "megaplan" not in TOOLS or not TOOLS["megaplan"].enabled:
                     print(f"{DIM}note: enable the `megaplan` tool (/tools) so the plan can be saved{RESET}")
-                print(f"{DIM}● MegaPlan mode — planning: {arg}   (/plan off to exit){RESET}")
-                _turn(history, thinks, f"Let's plan: {arg}", stats)   # kick off: ground → discuss
+                print(f"{DIM}● MegaPlan mode — planning: {goal}   (/plan off to exit){RESET}")
+                _turn(history, thinks, f"Let's plan: {goal}", stats)
                 print(_status_line(stats))
+
+            if sub in ("", "help") and not rest:
+                on = f"on · {PLAN_GOAL or PLAN_ID}" if PLAN_MODE else "off"
+                loaded = f" · loaded {PLAN_ID}" if PLAN_ID else ""
+                print(f"{DIM}plan mode {on}{loaded}\n"
+                      f"  /plan <goal>              start a new plan (ground → discuss → save)\n"
+                      f"  /plan browse              list all plans\n"
+                      f"  /plan load <id>           open a plan to continue it\n"
+                      f"  /plan show [id]           print a plan (default: the loaded one)\n"
+                      f"  /plan save                persist the current plan now\n"
+                      f"  /plan close               leave plan mode\n"
+                      f"  /plan rename <id> <title> rename a plan (id unchanged)\n"
+                      f"  /plan remove <id>         archive a plan (soft delete, history kept){RESET}")
+            elif sub in ("browse", "list"):
+                plan_browse(rest)
+            elif sub in ("show", "view"):
+                pid = rest or PLAN_ID
+                if not pid:
+                    print(f"{DIM}usage: /plan show <id>  (or /plan load one first){RESET}")
+                else:
+                    plan_render(megaplan_call("get", id=pid))
+            elif sub in ("load", "open"):
+                if not rest:
+                    print(f"{DIM}usage: /plan load <id>{RESET}"); continue
+                p = megaplan_call("get", id=rest)
+                if isinstance(p, dict) and "error" in p:
+                    print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
+                plan_render(p)
+                PLAN_MODE, PLAN_GOAL, PLAN_ID = True, p.get("title", ""), rest
+                seed = (f"We're continuing an existing MegaPlan (id: {rest}). Current state:\n\n"
+                        f"{p.get('body', '')}\n\nReview where it stands and propose next steps; "
+                        f"when we change it, persist with megaplan(action=\"save\", id=\"{rest}\", …).")
+                _turn(history, thinks, seed, stats)
+                print(_status_line(stats))
+            elif sub == "save":
+                if not PLAN_MODE and not PLAN_ID:
+                    print(f"{DIM}nothing to save — /plan <goal> or /plan load <id> first{RESET}")
+                else:
+                    idarg = f', id="{PLAN_ID}"' if PLAN_ID else ""
+                    _turn(history, thinks,
+                          f"Persist the current plan to MegaPlan now with ONE "
+                          f"megaplan(action=\"save\"{idarg}, …) call — the whole plan incl. a "
+                          f"## Tasks checklist in the body — then report the plan id.", stats)
+                    print(_status_line(stats))
+            elif sub in ("close", "off", "done", "stop", "exit"):
+                PLAN_MODE, PLAN_GOAL, PLAN_ID = False, "", ""
+                print(f"{DIM}plan mode off{RESET}")
+            elif sub in ("remove", "rm", "delete"):
+                if not rest:
+                    print(f"{DIM}usage: /plan remove <id>{RESET}"); continue
+                r = megaplan_call("archive", id=rest)
+                if PLAN_ID == rest:
+                    PLAN_ID = ""
+                err = isinstance(r, dict) and "error" in r
+                print(f"{DIM}{'megaplan: ' + r['error'] if err else 'archived ' + rest + ' (soft delete; git history kept)'}{RESET}")
+            elif sub == "rename":
+                nid, _, ntitle = rest.partition(" ")
+                if not nid or not ntitle.strip():
+                    print(f"{DIM}usage: /plan rename <id> <new title>{RESET}"); continue
+                r = megaplan_call("update", id=nid, title=ntitle.strip())
+                err = isinstance(r, dict) and "error" in r
+                print(f"{DIM}{'megaplan: ' + r['error'] if err else 'renamed ' + nid + ' → ' + ntitle.strip() + ' (id unchanged)'}{RESET}")
+            elif sub == "new":
+                if not rest:
+                    print(f"{DIM}usage: /plan new <goal>{RESET}"); continue
+                _start_plan(rest)
             else:
-                print(f"{DIM}plan mode {('on · ' + PLAN_GOAL) if PLAN_MODE else 'off'}  ·  "
-                      f"/plan <goal> to start · /plan off to exit{RESET}")
+                _start_plan(arg)                          # bare "/plan <free text>" → new plan
             continue
         if user == "/clear":
             history.clear(); thinks.clear()
-            PLAN_MODE, PLAN_GOAL = False, ""
+            PLAN_MODE, PLAN_GOAL, PLAN_ID = False, "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
         _turn(history, thinks, user, stats)
