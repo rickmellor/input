@@ -1,82 +1,205 @@
 #!/usr/bin/env python3
-"""qchat — zero-overhead chat REPL + shell-command generator for OpenAI-compatible seats.
+"""qchat — chat REPL, NL shell-command generator, and shell goal-agent for local seats.
 
-Chat REPL:   qchat [model] [base_url]           thinking streams dimmed
-Shell mode:  qchat [model] [base_url] -e task…  thinking OFF, aichat-style menu
-Seats: gemma (chat default) | coder (-e/-x default) | qwen38 (on-demand). Or [model] [base_url].
-REPL commands: /models (toggle seat), /clear, /quit, Ctrl-D.
+Chat REPL:  qchat [seat|model [base_url]]        thinking streams dimmed
+            /models toggle seat · /clear · /quit
+Command:    qchat -e <task>   propose → execute|revise|describe|copy|quit
+            qchat -x <task>   propose → execute immediately
+            qchat --gen <buf> print one command to stdout (Ctrl-G binding)
+Goal agent: qchat --goal <task>   iterate: propose→confirm→run→observe→next
+            qchat --auto <task>   iterate autonomously; denylist + gemma risk gate
+Bare -e/-x/--goal/--auto with no words prompts for the task (no shell quoting).
+
+Seats: gemma (chat default) | coder (command/goal default) | qwen38 (on-demand).
+Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
-import json, os, platform, shutil, subprocess, sys, urllib.request
+import json, os, platform, re, shutil, subprocess, sys, urllib.request
 
-DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
+SHELL = os.environ.get("SHELL", "/bin/bash")
 
-argv = sys.argv[1:]
-task_words, auto_exec = None, False
-for flag in ("-e", "-x"):
-    if flag in argv:
-        i = argv.index(flag)
-        task_words, argv = argv[i + 1:], argv[:i]
-        auto_exec = flag == "-x"
-        break
-SEATS = {  # short names for the daily fleet (+ the on-demand experiment seat)
-    "gemma": ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
-    "coder": ("qwen-27b-coder", "http://127.0.0.1:8003/v1"),
-    "qwen38": ("Qwen3.8-27B-AWQ-INT4", "http://127.0.0.1:8004/v1"),
+SEATS = {
+    "gemma":  ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
+    "coder":  ("qwen-27b-coder",                 "http://127.0.0.1:8003/v1"),
+    "qwen38": ("Qwen3.8-27B-AWQ-INT4",           "http://127.0.0.1:8004/v1"),
 }
-if argv and argv[0] in SEATS:
-    MODEL, BASE = SEATS[argv[0]]
-elif argv:
-    MODEL = argv[0]
-    BASE = argv[1] if len(argv) > 1 else "http://127.0.0.1:8002/v1"
-elif task_words is not None:
-    MODEL, BASE = SEATS["coder"]   # shell-command generation -> the coder seat
-else:
-    MODEL, BASE = SEATS["gemma"]   # chat -> the fast general seat
+MAX_AUTO_STEPS = 8
+
+# --- catastrophic-command denylist: hard-blocked even in --auto, no LLM involved.
+_DENY = [
+    r"\brm\s+(-\w*\s+)*-\w*[rf]\w*\s+(-\w*\s+)*/(\s|$)",   # rm -rf /
+    r"\brm\s+(-\w*\s+)*-\w*[rf].*\s/\*",                    # rm -rf /*
+    r"\bdd\b.*\bof=/dev/",                                   # dd of=/dev/sdX
+    r"\bmkfs\b", r":\(\)\s*\{.*\|.*&.*\}", r"\bshutdown\b", r"\breboot\b",
+    r">\s*/dev/sd", r"\bchmod\s+-R\s+0*\s+/", r"\bchown\s+-R\s+\S+\s+/(\s|$)",
+    r"\bcurl\b[^|]*\|\s*(sudo\s+)?(ba)?sh", r"\bwget\b[^|]*\|\s*(sudo\s+)?(ba)?sh",
+    r"\bgit\b.*\bpush\b.*--force", r"\bmv\s+.*\s+/dev/null",
+]
 
 
-def complete(messages, think, max_tokens=8192):
-    body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens}
+def danger(cmd):
+    for pat in _DENY:
+        if re.search(pat, cmd):
+            return pat
+    return None
+
+
+def _post(model, base, messages, think, max_tokens):
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens}
     if not think:
         body["chat_template_kwargs"] = {"enable_thinking": False}
-    req = urllib.request.Request(f"{BASE}/chat/completions", json.dumps(body).encode(),
+    req = urllib.request.Request(f"{base}/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     d = json.load(urllib.request.urlopen(req, timeout=600))
     return (d["choices"][0]["message"].get("content") or "").strip()
 
 
+def complete(messages, think=False, max_tokens=8192):
+    return _post(MODEL, BASE, messages, think, max_tokens)
+
+
 def seat_alive(base):
     try:
-        with urllib.request.urlopen(f"{base}/models", timeout=1.5) as r:
-            json.load(r)
+        urllib.request.urlopen(f"{base}/models", timeout=1.5).read()
         return True
     except Exception:
         return False
 
 
-def models_menu():
-    global MODEL, BASE
-    names = list(SEATS)
-    print("seats:")
-    for i, n in enumerate(names, 1):
-        m, b = SEATS[n]
-        mark = "*" if (m, b) == (MODEL, BASE) else " "
-        status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
-        print(f" {mark}{i}. {n:<8} {m}  [{status}]")
+def clean_cmd(text):
+    lines = [l for l in text.strip().splitlines() if not l.strip().startswith("```")]
+    return "\n".join(lines).strip()
+
+
+def review(cmd):
+    """Ask gemma to risk-rate a command. Returns (risk, reason) or None if unavailable."""
+    model, base = SEATS["gemma"]
+    sysmsg = ("You are a shell-command safety reviewer. Rate the RISK of running the command. "
+              'Reply ONLY compact JSON: {"risk":"none|low|medium|high|critical","reason":"short"}. '
+              "high/critical = data loss, overwrite, exfiltration, system damage, irreversible.")
     try:
-        pick = input("switch to (name/number, blank=keep): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return
-    if not pick:
-        return
-    if pick.isdigit() and 1 <= int(pick) <= len(names):
-        pick = names[int(pick) - 1]
-    if pick in SEATS:
-        MODEL, BASE = SEATS[pick]
-        print(f"→ {MODEL} @ {BASE}  (history carries over)")
-    else:
-        print(f"(unknown seat {pick!r})")
+        raw = _post(model, base, [{"role": "system", "content": sysmsg},
+                                  {"role": "user", "content": cmd}], think=False, max_tokens=200)
+        m = re.search(r"\{.*\}", raw, re.S)
+        v = json.loads(m.group(0))
+        return v.get("risk", "unknown"), v.get("reason", "")
+    except Exception:
+        return None
 
 
+def run(cmd, capture=False):
+    if not capture:
+        return subprocess.run(cmd, shell=True, executable=SHELL).returncode, ""
+    p = subprocess.run(cmd, shell=True, executable=SHELL, capture_output=True, text=True)
+    out = (p.stdout or "") + (p.stderr or "")
+    sys.stdout.write(out)
+    sys.stdout.flush()
+    return p.returncode, out
+
+
+def copy_clip(text):
+    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, input=text.encode(), check=False)
+            return True
+    return False
+
+
+def _cmd_sys():
+    ctx = os.environ.get("QCHAT_CTX", "").strip()
+    ctx = f" Recent shell history:\n{ctx}\n" if ctx else ""
+    return (f"You generate shell commands for {platform.system()} / {SHELL} / cwd {os.getcwd()}.{ctx}"
+            "Output ONLY the command — no markdown, no backticks, no explanation.")
+
+
+def generate(task):
+    return clean_cmd(complete([{"role": "system", "content": _cmd_sys()},
+                               {"role": "user", "content": task}], max_tokens=1024))
+
+
+# --- one-shot command mode (-e / -x) --------------------------------------------
+def shell_mode(task, auto=False):
+    messages = [{"role": "system", "content": _cmd_sys()}, {"role": "user", "content": task}]
+    cmd = clean_cmd(complete(messages, max_tokens=1024))
+    messages.append({"role": "assistant", "content": cmd})
+    if auto:
+        d = danger(cmd)
+        print(f"{BOLD}{cmd}{RESET}", file=sys.stderr)
+        if d:
+            print(f"{RED}BLOCKED: catastrophic pattern — refusing to auto-run.{RESET}", file=sys.stderr)
+            return 1
+        return run(cmd)[0]
+    while True:
+        print(f"{BOLD}{cmd}{RESET}")
+        if danger(cmd):
+            print(f"{RED}⚠ matches a catastrophic pattern — review carefully.{RESET}")
+        try:
+            choice = input("> execute | revise | describe | copy | quit: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return 130
+        if choice in ("e", "execute"):
+            return run(cmd)[0]
+        if choice in ("r", "revise"):
+            fb = input("revision: ").strip()
+            messages.append({"role": "user", "content": f"Revise: {fb}. Output only the command."})
+            cmd = clean_cmd(complete(messages, max_tokens=1024))
+            messages.append({"role": "assistant", "content": cmd})
+        elif choice in ("d", "describe"):
+            print(DIM + complete(messages + [{"role": "user", "content":
+                  "Explain what this does, plain text, brief."}], max_tokens=512) + RESET)
+        elif choice in ("c", "copy"):
+            print("(copied)" if copy_clip(cmd) else "(no clipboard tool)")
+        elif choice in ("q", "quit"):
+            return 0
+
+
+# --- goal agent (! / !!) --------------------------------------------------------
+def goal_mode(task, auto=False):
+    goal_sys = (f"Accomplish a shell goal step by step on {platform.system()} / {SHELL} / cwd {os.getcwd()}. "
+                "Each turn output EITHER the single next command (no markdown/explanation) "
+                "OR a line 'DONE: <summary>' when the goal is met. Commands must be non-interactive. "
+                "You are shown each command's exit code and output.")
+    ctx = os.environ.get("QCHAT_CTX", "").strip()
+    first = f"Goal: {task}" + (f"\n\nRecent shell history:\n{ctx}" if ctx else "")
+    messages = [{"role": "system", "content": goal_sys}, {"role": "user", "content": first}]
+    for step in range(1, MAX_AUTO_STEPS + 1):
+        out = clean_cmd(complete(messages, max_tokens=1024))
+        if out.upper().startswith("DONE"):
+            print(f"{DIM}✓ {out[4:].lstrip(': ').strip() or 'done'}{RESET}")
+            return 0
+        cmd = out
+        messages.append({"role": "assistant", "content": cmd})
+        print(f"{BOLD}[{step}/{MAX_AUTO_STEPS}] {cmd}{RESET}")
+        d = danger(cmd)
+        proceed = False
+        if d:
+            print(f"{RED}⚠ catastrophic pattern — manual confirmation required.{RESET}")
+        elif auto:
+            v = review(cmd)
+            if v and v[0] in ("none", "low"):
+                print(f"{DIM}gemma: {v[0]} risk — auto-proceeding{RESET}")
+                proceed = True
+            elif v:
+                print(f"{YEL}gemma: {v[0]} risk — {v[1]}{RESET}")
+            else:
+                print(f"{YEL}gemma review unavailable — confirm manually{RESET}")
+        if not proceed:
+            try:
+                ans = input("> run this? [y]es/[s]kip/[q]uit: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return 130
+            if ans in ("q", "quit"):
+                return 0
+            if ans in ("s", "skip", "n", "no"):
+                messages.append({"role": "user", "content": "Skipped by user. Propose an alternative or DONE."})
+                continue
+        rc, o = run(cmd, capture=True)
+        messages.append({"role": "user", "content": f"exit={rc}\noutput:\n{o[:1500]}"})
+    print(f"{YEL}reached {MAX_AUTO_STEPS}-step cap.{RESET}")
+    return 0
+
+
+# --- chat REPL ------------------------------------------------------------------
 def stream(messages):
     body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
     req = urllib.request.Request(f"{BASE}/chat/completions", body, {"Content-Type": "application/json"})
@@ -103,82 +226,87 @@ def stream(messages):
     return "".join(reply)
 
 
-def copy_to_clipboard(text):
-    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
-        if shutil.which(tool[0]):
-            subprocess.run(tool, input=text.encode(), check=False)
-            return True
-    return False
-
-
-def _clean_cmd(text):
-    lines = [l for l in text.strip().splitlines() if not l.strip().startswith("```")]
-    return "\n".join(lines).strip()
-
-
-def _run(cmd):
-    return subprocess.run(cmd, shell=True, executable=os.environ.get("SHELL", "/bin/bash")).returncode
-
-
-def shell_mode(task, auto=False):
-    sysmsg = (f"You generate a single shell command for: {platform.system()} / "
-              f"{os.environ.get('SHELL', 'bash')} / cwd {os.getcwd()}. "
-              "Output ONLY the command — no markdown, no backticks, no explanation.")
-    messages = [{"role": "system", "content": sysmsg}, {"role": "user", "content": task}]
-    cmd = _clean_cmd(complete(messages, think=False, max_tokens=1024))
-    messages.append({"role": "assistant", "content": cmd})
-    if auto:
-        print(f"{BOLD}{cmd}{RESET}", file=sys.stderr)
-        return _run(cmd)
-    while True:
-        print(f"{BOLD}{cmd}{RESET}")
-        try:
-            choice = input("> execute | revise | describe | copy | quit: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return 130
-        if choice in ("e", "execute"):
-            return _run(cmd)
-        if choice in ("r", "revise"):
-            fb = input("revision: ").strip()
-            messages.append({"role": "user", "content": f"Revise the command: {fb}. Output only the revised command."})
-            cmd = _clean_cmd(complete(messages, think=False, max_tokens=1024))
-            messages.append({"role": "assistant", "content": cmd})
-        elif choice in ("d", "describe"):
-            print(DIM + complete(messages + [{"role": "user",
-                  "content": "Briefly explain what this command does, plain text."}], think=False, max_tokens=1024) + RESET)
-        elif choice in ("c", "copy"):
-            print("(copied)" if copy_to_clipboard(cmd) else "(no clipboard tool found — select above)")
-        elif choice in ("q", "quit"):
-            return 0
-
-
-if task_words is not None:
-    task = " ".join(task_words)
-    if not task:
-        # Bare -e/-x: read the task interactively — no shell parsing, apostrophes welcome.
-        try:
-            task = input("task: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(130)
-        if not task:
-            sys.exit("usage: qchat [model] [base_url] -e|-x [task words]")
-    sys.exit(shell_mode(task, auto=auto_exec))
-
-history = []
-print(f"qchat → {MODEL} @ {BASE}  (/models, /clear, /quit)")
-while True:
+def models_menu():
+    global MODEL, BASE
+    names = list(SEATS)
+    print("seats:")
+    for i, n in enumerate(names, 1):
+        m, b = SEATS[n]
+        mark = "*" if (m, b) == (MODEL, BASE) else " "
+        status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
+        print(f" {mark}{i}. {n:<8} {m}  [{status}]")
     try:
-        user = input("\n> ").strip()
+        pick = input("switch to (name/number, blank=keep): ").strip()
     except (EOFError, KeyboardInterrupt):
+        return
+    if not pick:
+        return
+    if pick.isdigit() and 1 <= int(pick) <= len(names):
+        pick = names[int(pick) - 1]
+    if pick in SEATS:
+        MODEL, BASE = SEATS[pick]
+        print(f"→ {MODEL} @ {BASE}  (history carries over)")
+    else:
+        print(f"(unknown seat {pick!r})")
+
+
+def repl():
+    history = []
+    print(f"qchat → {MODEL} @ {BASE}  (/models, /clear, /quit)")
+    while True:
+        try:
+            user = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not user or user == "/quit":
+            break
+        if user in ("/models", "/model"):
+            models_menu(); continue
+        if user == "/clear":
+            history.clear(); print("(history cleared)"); continue
+        history.append({"role": "user", "content": user})
+        try:
+            history.append({"role": "assistant", "content": stream(history)})
+        except Exception as e:
+            print(f"[error: {e}]"); history.pop()
+
+
+# --- arg parsing ----------------------------------------------------------------
+argv = sys.argv[1:]
+MODE, task_words = None, None
+for flag in ("-e", "-x", "--goal", "--auto", "--gen"):
+    if flag in argv:
+        i = argv.index(flag)
+        MODE, task_words, argv = flag, argv[i + 1:], argv[:i]
         break
-    if not user or user == "/quit":
-        break
-    if user == "/clear":
-        history.clear(); print("(history cleared)"); continue
-    if user in ("/models", "/model"):
-        models_menu(); continue
-    history.append({"role": "user", "content": user})
+
+if argv and argv[0] in SEATS:
+    MODEL, BASE = SEATS[argv[0]]
+elif argv:
+    MODEL, BASE = argv[0], (argv[1] if len(argv) > 1 else "http://127.0.0.1:8002/v1")
+elif MODE in ("-e", "-x", "--goal", "--auto", "--gen"):
+    MODEL, BASE = SEATS["coder"]     # command/goal work → coder seat
+else:
+    MODEL, BASE = SEATS["gemma"]     # chat → fast general seat
+
+
+def _task():
+    t = " ".join(task_words)
+    if t:
+        return t
+    if MODE == "--gen":
+        sys.exit("usage: qchat --gen <buffer text>")
     try:
-        history.append({"role": "assistant", "content": stream(history)})
-    except Exception as e:
-        print(f"[error: {e}]"); history.pop()
+        return input("task: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.exit(130)
+
+
+if MODE == "--gen":
+    sys.stdout.write(generate(_task()))
+elif MODE in ("-e", "-x"):
+    sys.exit(shell_mode(_task(), auto=(MODE == "-x")))
+elif MODE in ("--goal", "--auto"):
+    sys.exit(goal_mode(_task(), auto=(MODE == "--auto")))
+else:
+    repl()
