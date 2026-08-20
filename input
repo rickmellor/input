@@ -786,6 +786,90 @@ register(Tool(
     _tool_load_skill))
 
 
+def _resolve_seat(name):
+    """(model_id, base_url) for a seat name or a bare saint model id; None if empty."""
+    if not name:
+        return None
+    if name in SEATS:
+        return SEATS[name]
+    return (name, SAINT_BASE)          # treat an unknown name as a saint-* model id
+
+
+def _subagent_system(cwd, skill):
+    """A sub-agent's system prompt: grounding + the cwd's folder context + one skill brief +
+    autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills."""
+    parts = [stable_context()]
+    fc = folder_context(cwd)
+    if fc:
+        parts.append(fc)
+    if skill:
+        body = skill_body(skill)
+        if body:
+            parts.append(f"## Skill: {skill}\n{body}")
+    parts.append(
+        "You are a SUB-AGENT working autonomously toward the task below. Use your tools to do "
+        "the work; do NOT ask the user questions — make reasonable assumptions and note them. "
+        "Your FINAL message is your entire deliverable back to the orchestrator: make it "
+        "complete and self-contained (findings, what you did, any caveats).")
+    return "\n\n".join(p for p in parts if p)
+
+
+def _tool_spawn_agent(args):
+    a = args or {}
+    task = (a.get("task") or a.get("brief") or "").strip()
+    if not task:
+        return "Error: spawn_agent needs a 'task'."
+    skill = (a.get("skill") or "").strip()
+    if skill and skill not in SKILLS:
+        return f"Error: no such skill {skill!r}. Available: {', '.join(SKILLS) or '(none)'}"
+    cwd = os.path.abspath(a.get("cwd") or os.getcwd())
+    write = bool(a.get("write"))
+    budget = int(a.get("budget_tokens") or 200_000)
+    # model: explicit pin > skill's declared seat > saint-auto (SAINT routes by difficulty)
+    model = (a.get("model") or "").strip() or (SKILLS.get(skill, {}).get("seat") or "")
+    m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
+    system = _subagent_system(cwd, skill)
+    sb = Sandbox(root=cwd, allow=(SANDBOX_DEV if write else SANDBOX_READONLY))
+    tools = sandbox_tools(sb, write=write)
+    label = skill or (m.split("-")[-1] if "-" in m else m)
+
+    def on_tool(ev, tc, out):
+        if ev == "call":
+            fn = tc.get("function") or {}
+            print(f"{DIM}    ⟳ {fn.get('name')}({_fmt_args(fn.get('arguments'))[:56]}){RESET}")
+        return None
+
+    print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
+    res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
+                     budget_tokens=budget, on_tool=on_tool, gate=False)
+    tag = "" if res["stopped"] == "done" else f" [{res['stopped']}]"
+    print(f"{DIM}  ⟳ done[{label}] {res['rounds']}r · {res['tool_calls']} tools · "
+          f"{res['tokens_out']} out{tag}{RESET}")
+    if res["error"]:
+        return f"(sub-agent errored: {res['error']})"
+    return res["text"] or f"(sub-agent produced no text; stopped={res['stopped']})"
+
+
+register(Tool(
+    "spawn_agent",
+    "Spawn a sub-agent: a fresh autonomous agent with its own context and a sandboxed toolset "
+    "(read/list/bash by default; write/edit if write=true), working in `cwd`. Use to delegate "
+    "a self-contained unit of work (research a subsystem, review a file, draft a component) — "
+    "especially several in a row to parallelize investigation. It routes via saint-auto unless "
+    "you pin `model` (e.g. 'cloud-flagship'/'cloud-large' for a design or hard-reasoning agent) "
+    "or the chosen `skill` declares a seat. Returns the sub-agent's final deliverable.",
+    {"type": "object",
+     "properties": {
+         "task": {"type": "string", "description": "the sub-agent's brief — what to do and what to return"},
+         "skill": {"type": "string", "description": "optional skill name to load as its playbook"},
+         "model": {"type": "string", "description": "optional seat/model pin (default saint-auto); e.g. cloud-flagship, cloud-large, coder"},
+         "cwd": {"type": "string", "description": "working directory (default: current)"},
+         "write": {"type": "boolean", "description": "grant write/edit + build tools (default: read-only)"},
+         "budget_tokens": {"type": "integer", "description": "token guardrail (default 200000)"}},
+     "required": ["task"]},
+    _tool_spawn_agent))
+
+
 def _tool_run_command(args):
     cmd = ((args or {}).get("command") or "").strip()
     if not cmd:
