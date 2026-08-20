@@ -37,6 +37,7 @@ DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033
 ITAL, ULINE, CODE_FG = "\033[3m", "\033[4m", "\033[36m"
 BLUE_ELECTRIC = "\033[38;2;92;179;255m"    # soft electric blue — plan-mode indicator
 RED_VIVID = "\033[38;2;255;45;45m"         # vivid red — unrestricted-mode indicator
+GREEN_BUILD = "\033[38;2;110;215;130m"     # soft green — build-mode indicator
 SHELL = os.environ.get("SHELL", "/bin/bash")
 SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to this run
                 # (else it keys on a hash of the first message — "hello" collides across chats)
@@ -185,6 +186,17 @@ MODES = ("cautious", "unrestricted", "plan")
 PERM_MODE = "cautious"
 PLAN_GOAL = ""
 PLAN_ID = ""        # the plan currently loaded into the session (for save/show/close)
+BUILD_ID = ""       # the plan currently being BUILT (executed); "" = not building
+_BUILD_DIRECTIVE = (
+    "You are in BUILD mode — executing a MegaPlan to completion. Work the plan, don't "
+    "re-plan it. (1) Track it with megaplan(action=\"get\" or \"review\", id=…) and respect "
+    "dependencies (megaplan action=\"blocked_by\" — skip tasks whose deps aren't done). "
+    "(2) Do the real work for ONE task at a time, smallest shippable step first; say which "
+    "task you're on. (3) As each task is finished, mark it megaplan(action=\"complete\", "
+    "id=…, task_id=\"tN\") and record effort with action=\"log_time\"; add newly-discovered "
+    "work with action=\"add_task\". (4) Stop and ask at genuine blockers or destructive / "
+    "irreversible steps. When every task is done the plan auto-completes — report what shipped."
+)
 
 
 def _mode_hint(m):
@@ -216,6 +228,9 @@ def system_prompt():
     if PERM_MODE == "plan":
         d = _PLAN_DIRECTIVE + (f"\n\nThis session's planning target: {PLAN_GOAL}" if PLAN_GOAL else "")
         s = (s + "\n\n" + d) if s else d
+    if BUILD_ID:                              # building (mutually exclusive with plan mode)
+        b = _BUILD_DIRECTIVE + f"\n\nBuilding MegaPlan: {BUILD_ID}"
+        s = (s + "\n\n" + b) if s else b
     return s
 
 
@@ -1532,7 +1547,8 @@ def _prompt():
     tag = {"cautious": "",
            "unrestricted": f"{RED_VIVID}{BOLD} unrestricted▸{RESET}",
            "plan": f"{BLUE_ELECTRIC} plan▸{RESET}"}.get(PERM_MODE, "")
-    return f"{color}{n}{RESET}{tag} > "
+    build = f"{GREEN_BUILD} build▸{RESET}" if BUILD_ID else ""
+    return f"{color}{n}{RESET}{tag}{build} > "
 
 
 def read_line(prompt):
@@ -1743,7 +1759,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
 
 
 def repl():
-    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID
+    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
@@ -1753,7 +1769,7 @@ def repl():
     stats = Stats()
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · Shift+Tab cycles mode · "
-          f"/models /system /tools /mcp /memory /mode /plan /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     mem_status = mem_connect()
     if mem_status:
@@ -1792,6 +1808,8 @@ def repl():
             continue
         if mode == "cycle":                    # Shift+Tab → next permission mode
             PERM_MODE = MODES[(MODES.index(PERM_MODE) + 1) % len(MODES)]
+            if PERM_MODE == "plan":            # authoring ≠ building; leaving build
+                BUILD_ID = ""
             print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}{RESET}")
             if user and _rl:                   # don't lose text typed before the toggle
                 _safe(lambda: _rl.add_history(user))
@@ -1803,9 +1821,34 @@ def repl():
             arg = user[len("/mode"):].strip().lower()
             if arg in MODES:
                 PERM_MODE = arg
+                if PERM_MODE == "plan":
+                    BUILD_ID = ""
             elif arg:
                 print(f"{DIM}mode ∈ {{{', '.join(MODES)}}} — or Shift+Tab to cycle{RESET}"); continue
             print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab cycles){RESET}")
+            continue
+        if user == "/build" or user.startswith("/build "):
+            arg = user[len("/build"):].strip()
+            if arg.lower() in ("off", "done", "stop", "exit"):
+                BUILD_ID = ""
+                print(f"{DIM}build mode off{RESET}"); continue
+            pid = arg or PLAN_ID or plan_pick("build")   # explicit id, the loaded plan, or pick
+            if not pid:
+                print(f"{DIM}usage: /build <id>  (or /plan load one first){RESET}"); continue
+            p = megaplan_call("get", id=pid)
+            if isinstance(p, dict) and "error" in p:
+                print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
+            if PERM_MODE == "plan":                      # leave authoring; keep gating otherwise
+                PERM_MODE = "cautious"
+            PLAN_GOAL, PLAN_ID, BUILD_ID = "", pid, pid
+            plan_render(p)
+            print(f"{DIM}● BUILD mode — executing {pid}   ({PERM_MODE}; Shift+Tab to change · "
+                  f"/build off to stop){RESET}")
+            seed = (f"Build MegaPlan '{pid}'. Here is the plan:\n\n{p.get('body', '')}\n\n"
+                    f"Start with the first actionable task (dependencies satisfied): do the work, "
+                    f"then mark it complete via megaplan. Proceed.")
+            _turn(history, thinks, seed, stats)
+            print(_status_line(stats))
             continue
         if user in ("/models", "/model"):
             models_menu(); continue
@@ -1928,8 +1971,8 @@ def repl():
             sub, rest = sub.lower(), rest.strip()
 
             def _start_plan(goal):                        # enter plan mode + kick off grounding turn
-                global PERM_MODE, PLAN_GOAL, PLAN_ID
-                PERM_MODE, PLAN_GOAL, PLAN_ID = "plan", goal, ""
+                global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
+                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", goal, "", ""
                 if not TOOLS_ON or "megaplan" not in TOOLS or not TOOLS["megaplan"].enabled:
                     print(f"{DIM}note: enable the `megaplan` tool (/tools) so the plan can be saved{RESET}")
                 print(f"{DIM}● MegaPlan mode — planning: {goal}   (/plan off or Shift+Tab to exit){RESET}")
@@ -1945,6 +1988,7 @@ def repl():
                       f"  /plan load [id]           open a plan to continue it (picker if no id)\n"
                       f"  /plan show [id]           print a plan (picker if no id)\n"
                       f"  /plan save                persist the current plan now\n"
+                      f"  /build [id]               execute a ready plan task-by-task (picker if no id)\n"
                       f"  /plan close               leave plan mode\n"
                       f"  /plan rename [id] [title] rename a plan (picker + prompt if omitted)\n"
                       f"  /plan remove [id]         archive a plan (picker if no id){RESET}")
@@ -1962,7 +2006,7 @@ def repl():
                 if isinstance(p, dict) and "error" in p:
                     print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
                 plan_render(p)
-                PERM_MODE, PLAN_GOAL, PLAN_ID = "plan", p.get("title", ""), pid
+                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", p.get("title", ""), pid, ""
                 seed = (f"We're continuing an existing MegaPlan (id: {pid}). Current state:\n\n"
                         f"{p.get('body', '')}\n\nReview where it stands and propose next steps; "
                         f"when we change it, persist with megaplan(action=\"save\", id=\"{pid}\", …).")
@@ -1979,7 +2023,7 @@ def repl():
                           f"## Tasks checklist in the body — then report the plan id.", stats)
                     print(_status_line(stats))
             elif sub in ("close", "off", "done", "stop", "exit"):
-                PERM_MODE, PLAN_GOAL, PLAN_ID = "cautious", "", ""
+                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
                 print(f"{DIM}plan mode off{RESET}")
             elif sub in ("remove", "rm", "delete"):
                 pid = rest or plan_pick("archive")        # no id → arrow-pick from the list
@@ -2016,7 +2060,7 @@ def repl():
             continue
         if user == "/clear":
             history.clear(); thinks.clear()
-            PERM_MODE, PLAN_GOAL, PLAN_ID = "cautious", "", ""
+            PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
         _turn(history, thinks, user, stats)
