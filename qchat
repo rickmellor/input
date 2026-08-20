@@ -24,6 +24,28 @@ SHELL = os.environ.get("SHELL", "/bin/bash")
 SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to this run
                 # (else it keys on a hash of the first message — "hello" collides across chats)
 
+# readline gives the prompt up/down input-history recall; persist it across sessions.
+try:
+    import readline as _rl
+    _HIST = os.path.expanduser("~/.config/qchat/history")
+    try:
+        os.makedirs(os.path.dirname(_HIST), exist_ok=True)
+        _rl.read_history_file(_HIST)
+    except Exception:
+        pass
+    _rl.set_history_length(2000)
+    import atexit
+    atexit.register(lambda: _safe(lambda: _rl.write_history_file(_HIST)))
+except Exception:
+    _rl = None
+
+
+def _safe(fn):
+    try:
+        fn()
+    except Exception:
+        pass
+
 SEATS = {
     "gemma":  ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
     "coder":  ("qwen-27b-coder",                 "http://127.0.0.1:8003/v1"),
