@@ -340,12 +340,13 @@ def _collapse_think(think_buf, t0):
     sys.stdout.write(f"\r\033[J{summary}\n")   # wipe region, drop the summary
 
 
-def stream(messages, think_store):
-    body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
+def stream(messages, think_store, model=None, base=None):
+    model, base = model or MODEL, base or BASE
+    body = json.dumps({"model": model, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
     headers = {"Content-Type": "application/json"}
     if SESSION:
         headers["x-session-id"] = SESSION
-    req = urllib.request.Request(f"{BASE}/chat/completions", body, headers)
+    req = urllib.request.Request(f"{base}/chat/completions", body, headers)
     reply, think_buf, phase, t0 = [], [], "start", None
     md = MDRender()
     import select as _sel
@@ -484,6 +485,111 @@ def models_menu():
     print(f"→ {MODEL} @ {BASE}{tail}  (history carries over)")
 
 
+def _seat_labels():
+    names, default = list(SEATS), load_default_seat() or "gemma"
+    cur = next((i for i, n in enumerate(names) if SEATS[n] == (MODEL, BASE)), 0)
+    labels = []
+    for n in names:
+        m, b = SEATS[n]
+        status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
+        star = f"{YEL}★{RESET}" if n == default else " "
+        labels.append(f"{star} {n:<8} {m}  [{status}]")
+    return names, labels, cur
+
+
+def choose_seat():
+    """Open the picker, return a seat name for a one-shot (never persists/activates)."""
+    names, labels, cur = _seat_labels()
+    res = _pick(labels, cur)
+    return names[res[0]] if res else None
+
+
+def read_line(prompt):
+    """cbreak line reader: returns (text, mode). mode 'send' on Enter, 'pick' on
+    Ctrl+Enter (terminals that send LF), None text with 'eof' on Ctrl-D. Falls back
+    to input() off-TTY. Up/down walk readline history; basic cursor editing."""
+    if not sys.stdin.isatty():
+        try:
+            return input(prompt), "send"
+        except EOFError:
+            return None, "eof"
+    import select, termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)             # lflag: no line-buffer/echo (ISIG stays)
+    new[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)  # keep CR (Enter) and NL (Ctrl+Enter) distinct
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    buf, pos = [], 0
+    hlen = _rl.get_current_history_length() if _rl else 0
+    hidx, saved = hlen, ""
+
+    def redraw():
+        sys.stdout.write("\r\033[K" + prompt + "".join(buf))
+        back = len(buf) - pos
+        if back:
+            sys.stdout.write(f"\033[{back}D")
+        sys.stdout.flush()
+
+    def load(item):
+        nonlocal buf, pos
+        buf, pos = list(item), len(item); redraw()
+
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        redraw()
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\r":
+                sys.stdout.write("\r\n"); return "".join(buf), "send"
+            if ch == b"\n":
+                sys.stdout.write("\r\n"); return "".join(buf), "pick"
+            if ch == b"\x04":                          # Ctrl-D
+                if not buf:
+                    sys.stdout.write("\r\n"); return None, "eof"
+            elif ch in (b"\x7f", b"\x08"):             # backspace
+                if pos > 0:
+                    del buf[pos - 1]; pos -= 1; redraw()
+            elif ch == b"\x01":                        # Ctrl-A home
+                pos = 0; redraw()
+            elif ch == b"\x05":                        # Ctrl-E end
+                pos = len(buf); redraw()
+            elif ch == b"\x15":                        # Ctrl-U kill to start
+                del buf[:pos]; pos = 0; redraw()
+            elif ch == b"\x0b":                        # Ctrl-K kill to end
+                del buf[pos:]; redraw()
+            elif ch == b"\x1b":                        # escape sequences
+                if select.select([fd], [], [], 0.05)[0]:
+                    seq = os.read(fd, 2)
+                    if seq == b"[A" and _rl and hidx > 0:
+                        if hidx == hlen:
+                            saved = "".join(buf)
+                        hidx -= 1; load(_rl.get_history_item(hidx + 1) or "")
+                    elif seq == b"[B" and _rl and hidx < hlen:
+                        hidx += 1; load(saved if hidx == hlen else (_rl.get_history_item(hidx + 1) or ""))
+                    elif seq == b"[C" and pos < len(buf):
+                        pos += 1; redraw()
+                    elif seq == b"[D" and pos > 0:
+                        pos -= 1; redraw()
+                    elif seq in (b"[H", b"OH"):
+                        pos = 0; redraw()
+                    elif seq in (b"[F", b"OF"):
+                        pos = len(buf); redraw()
+            elif ch >= b"\x20":                        # printable (+ utf-8 continuation)
+                b0 = ch[0]
+                extra = 0 if b0 < 0x80 else (1 if b0 < 0xE0 else (2 if b0 < 0xF0 else 3))
+                if extra:
+                    ch += os.read(fd, extra)
+                try:
+                    for cc in ch.decode():
+                        buf.insert(pos, cc); pos += 1
+                    redraw()
+                except Exception:
+                    pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def code_blocks(text):
     blocks, cur, in_code = [], [], False
     for line in (text or "").split("\n"):
@@ -499,16 +605,26 @@ def code_blocks(text):
     return blocks
 
 
+def _turn(history, thinks, user, model=None, base=None):
+    history.append({"role": "user", "content": user})
+    try:
+        history.append({"role": "assistant", "content": stream(history, thinks, model=model, base=base)})
+    except KeyboardInterrupt:
+        print(f"{RESET}\n(interrupted)"); history.pop()
+    except Exception as e:
+        print(f"[error: {e}]"); history.pop()
+
+
 def repl():
     global SESSION
     history, thinks = [], []
     SESSION = "qchat-" + os.urandom(6).hex()
-    print(f"qchat → {MODEL} @ {BASE}  (/models · /think · /clear · exit or ^D quits · Esc aborts · ^C copies code)")
+    print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
+          f"/models /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     while True:
+        print()  # blank line before each prompt
         try:
-            user = input("\n> ").strip()
-        except EOFError:
-            break
+            user, mode = read_line("> ")
         except KeyboardInterrupt:
             # ^C on the prompt: copy the last reply's code blocks (terminals that copy a
             # mouse selection on ^C never deliver this — so selection-copy still wins).
@@ -521,6 +637,21 @@ def repl():
             else:
                 print("\n(no code blocks — ^D or /quit to exit)")
             continue
+        if user is None:                       # Ctrl-D
+            break
+        user = user.strip()
+        if user and _rl:                       # every submitted line joins input history
+            _safe(lambda: _rl.add_history(user))
+        if mode == "pick":                     # Ctrl+Enter → one-shot to a chosen seat
+            if not user:
+                continue
+            seat = choose_seat()
+            if not seat:
+                print("(cancelled)"); continue
+            m, b = SEATS[seat]
+            _turn(history, thinks, user, model=m, base=b)
+            print(f"{DIM}(one-shot via {seat} · active seat still {MODEL}){RESET}")
+            continue
         if not user or user in ("/quit", "exit"):
             break
         if user in ("/models", "/model"):
@@ -532,13 +663,7 @@ def repl():
             history.clear(); thinks.clear()
             SESSION = "qchat-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
-        history.append({"role": "user", "content": user})
-        try:
-            history.append({"role": "assistant", "content": stream(history, thinks)})
-        except KeyboardInterrupt:
-            print(f"{RESET}\n(interrupted)"); history.pop()
-        except Exception as e:
-            print(f"[error: {e}]"); history.pop()
+        _turn(history, thinks, user)
 
 
 # --- arg parsing ----------------------------------------------------------------
