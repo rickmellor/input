@@ -2993,9 +2993,17 @@ def repl():
                 jid = submit_job("goal", rest[:60], rest, cwd=os.getcwd())
                 _JOBS_SEEN[jid] = "queued"
                 print(f"{DIM}● job {jid} — {rest[:50]} · /jobs show {jid}{RESET}")
+            elif sub == "review" and rest:      # ACO adversarial review as a background job
+                tgt = rest.split()[0]
+                goal = (f"Use the aco_review tool to run an adversarial review of {tgt!r}, then "
+                        "synthesize per the aco-review skill (accepted/refuted findings, verdict, "
+                        "argued-vs-executed). You are done when you have written that synthesis.")
+                jid = submit_job("goal", f"aco review {tgt}", goal, cwd=os.getcwd())
+                _JOBS_SEEN[jid] = "queued"
+                print(f"{DIM}● job {jid} — ACO review of {tgt} in the background · /jobs show {jid}{RESET}")
             else:
                 print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · "
-                      f"build <plan-id> [model] · run <goal…>{RESET}")
+                      f"build <plan-id> [model] · run <goal…> · review <target>{RESET}")
             continue
         if user == "/goal" or user.startswith("/goal "):
             arg = user[len("/goal"):].strip()
@@ -3033,10 +3041,18 @@ def repl():
             if arg.lower() in ("off", "done", "stop", "exit"):
                 BUILD_ID = ""
                 print(f"{DIM}build mode off{RESET}"); continue
+            bg = False
+            if arg.split() and arg.split()[-1].lower() in ("bg", "background"):   # /build <id> bg → detached job
+                bg = True; arg = " ".join(arg.split()[:-1])
             pid = arg or PLAN_ID or plan_pick("build")   # explicit id, the loaded plan, or pick
             if not pid:
-                print(f"{DIM}usage: /build <id>  (or /plan load one first){RESET}"); continue
-            _enter_build(pid)
+                print(f"{DIM}usage: /build <id> [bg]  (or /plan load one first){RESET}"); continue
+            if bg:
+                jid = submit_job("build", f"build {pid}", "", cwd=os.getcwd(), plan_id=pid, model="saint")
+                _JOBS_SEEN[jid] = "queued"
+                print(f"{DIM}● job {jid} — building {pid} in the background · /jobs show {jid}{RESET}")
+            else:
+                _enter_build(pid)
             continue
         if user in ("/models", "/model"):
             models_menu(); continue
