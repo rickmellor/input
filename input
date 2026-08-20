@@ -497,7 +497,7 @@ def reasoning_seat():
     Hard reasoning doesn't belong on weak local models — the goal/task's contract (GOAL MET /
     BLOCKED) and multi-step planning need a strong model; trivial/medium work stays on
     saint-auto (routed cheaply)."""
-    s = load_settings().get("reasoning_seat") or "cloud-medium"   # Sonnet: honors the contract, mid-cost
+    s = load_settings().get("reasoning_seat") or "cloud-large"   # Opus: hard reasoning belongs on the strong seat
     return s if s in SEATS else "saint"
 
 
