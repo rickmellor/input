@@ -19,6 +19,7 @@ Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
+ITAL, ULINE, CODE_FG = "\033[3m", "\033[4m", "\033[36m"
 SHELL = os.environ.get("SHELL", "/bin/bash")
 SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to this run
                 # (else it keys on a hash of the first message — "hello" collides across chats)
@@ -215,8 +216,30 @@ def goal_mode(task, auto=False):
 
 
 # --- chat REPL ------------------------------------------------------------------
+def _inline(s):
+    """Render inline markdown: `code`, **bold**, *italic*, ~~strike~~."""
+    s = re.sub(r"`([^`]+)`", lambda m: f"{CODE_FG}{m.group(1)}{RESET}", s)  # code first (protects)
+    s = re.sub(r"\*\*([^*]+)\*\*|__([^_]+)__",
+               lambda m: f"{BOLD}{m.group(1) or m.group(2)}{RESET}", s)
+    s = re.sub(r"~~([^~]+)~~", lambda m: f"\033[9m{m.group(1)}{RESET}", s)
+    s = re.sub(r"(?<![\*\w])\*([^*\s][^*]*?)\*(?!\w)", lambda m: f"{ITAL}{m.group(1)}{RESET}", s)
+    s = re.sub(r"(?<![_\w])_([^_\s][^_]*?)_(?!\w)", lambda m: f"{ITAL}{m.group(1)}{RESET}", s)
+    return s
+
+
+def _prose(line):
+    """Format one non-code line of markdown for the terminal."""
+    h = re.match(r"^(#{1,6})\s+(.*)", line)
+    if h:
+        return f"{BOLD}{ULINE}{_inline(h.group(2))}{RESET}"
+    b = re.match(r"^(\s*)[-*+]\s+(.*)", line)
+    if b:
+        return f"{b.group(1)}{DIM}•{RESET} {_inline(b.group(2))}"
+    return _inline(line)
+
+
 class MDRender:
-    """Line-buffered streaming renderer: prose as-is, ```fenced``` blocks boxed + numbered."""
+    """Line-buffered streaming renderer: prose formatted, ```fenced``` blocks boxed + numbered."""
     def __init__(self):
         self.tty = sys.stdout.isatty()
         self.buf, self.in_code, self.lang, self.code = "", False, "", []
@@ -236,7 +259,7 @@ class MDRender:
             else:
                 self._flush(); self.in_code = False
             return
-        (self.code.append if self.in_code else print)(line)
+        (self.code.append(line) if self.in_code else print(_prose(line)))
 
     def _flush(self):
         lang = self.lang or "code"
@@ -256,7 +279,7 @@ class MDRender:
             elif self.in_code:
                 self.code.append(self.buf); self.buf = ""
             else:
-                print(self.buf, end=""); self.buf = ""
+                print(_prose(self.buf), end=""); self.buf = ""
         if self.in_code:
             self._flush(); self.in_code = False
 
@@ -285,35 +308,54 @@ def stream(messages, think_store):
     req = urllib.request.Request(f"{BASE}/chat/completions", body, headers)
     reply, think_buf, phase, t0 = [], [], "start", None
     md = MDRender()
-    with urllib.request.urlopen(req, timeout=600) as r:
-        saint_b = r.headers.get("x-saint-backend")  # only SAINT sets x-saint-*
-        dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
-        cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
-        bits = " · ".join(x for x in (f"{dom}/{cx}" if dom else "", cls, state) if x)
-        banner_done = not saint_b
-        for raw in r:
-            line = raw.decode().strip()
-            if not line.startswith("data: ") or line == "data: [DONE]":
-                continue
-            chunk = json.loads(line[6:])
-            if not banner_done:  # first chunk carries the actually-served model name
-                served = chunk.get("model", "")
-                arrow = f" >> {served}" if served and served != saint_b else ""
-                print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
-                banner_done = True
-            delta = chunk["choices"][0].get("delta") or {}
-            rc = delta.get("reasoning_content") or delta.get("reasoning")
-            if rc:
-                if phase != "thinking":
-                    sys.stdout.write(f"{DIM}[think] "); phase, t0 = "thinking", time.monotonic()
-                sys.stdout.write(rc); sys.stdout.flush()
-                think_buf.append(rc)
-            c = delta.get("content")
-            if c:
-                if phase == "thinking":
-                    _collapse_think(think_buf, t0)
-                phase = "content"
-                reply.append(c); md.feed(c)
+    import select as _sel
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    fd, old_tty = sys.stdin.fileno(), None
+    try:
+        if interactive:
+            import termios, tty
+            old_tty = termios.tcgetattr(fd)
+            tty.setcbreak(fd)   # poll stdin for Esc without echo; keeps output CR + SIGINT
+        with urllib.request.urlopen(req, timeout=600) as r:
+            saint_b = r.headers.get("x-saint-backend")  # only SAINT sets x-saint-*
+            dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
+            cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
+            bits = " · ".join(x for x in (f"{dom}/{cx}" if dom else "", cls, state) if x)
+            banner_done = not saint_b
+            for raw in r:
+                if interactive and _sel.select([fd], [], [], 0)[0]:
+                    ch = os.read(fd, 1)
+                    if ch == b"\x1b":                        # Esc: bare = abort, seq = ignore
+                        if _sel.select([fd], [], [], 0.02)[0]:
+                            os.read(fd, 2)                   # drain arrow/escape sequence
+                        else:
+                            raise KeyboardInterrupt          # bare Esc aborts the generation
+                line = raw.decode().strip()
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                chunk = json.loads(line[6:])
+                if not banner_done:  # first chunk carries the actually-served model name
+                    served = chunk.get("model", "")
+                    arrow = f" >> {served}" if served and served != saint_b else ""
+                    print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
+                    banner_done = True
+                delta = chunk["choices"][0].get("delta") or {}
+                rc = delta.get("reasoning_content") or delta.get("reasoning")
+                if rc:
+                    if phase != "thinking":
+                        sys.stdout.write(f"{DIM}[think] "); phase, t0 = "thinking", time.monotonic()
+                    sys.stdout.write(rc); sys.stdout.flush()
+                    think_buf.append(rc)
+                c = delta.get("content")
+                if c:
+                    if phase == "thinking":
+                        _collapse_think(think_buf, t0)
+                    phase = "content"
+                    reply.append(c); md.feed(c)
+    finally:
+        if old_tty is not None:
+            import termios
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
     md.finalize()
     sys.stdout.write(RESET if phase == "thinking" else "")
     print()
@@ -408,7 +450,7 @@ def repl():
     global SESSION
     history, thinks = [], []
     SESSION = "qchat-" + os.urandom(6).hex()
-    print(f"qchat → {MODEL} @ {BASE}  (/models, /think, /clear, /quit · ^C copies code, ^D quits)")
+    print(f"qchat → {MODEL} @ {BASE}  (/models · /think · /clear · exit or ^D quits · Esc aborts · ^C copies code)")
     while True:
         try:
             user = input("\n> ").strip()
@@ -426,7 +468,7 @@ def repl():
             else:
                 print("\n(no code blocks — ^D or /quit to exit)")
             continue
-        if not user or user == "/quit":
+        if not user or user in ("/quit", "exit"):
             break
         if user in ("/models", "/model"):
             models_menu(); continue
