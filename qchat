@@ -504,6 +504,16 @@ def choose_seat():
     return names[res[0]] if res else None
 
 
+def active_name():
+    return next((n for n, (m, b) in SEATS.items() if (m, b) == (MODEL, BASE)), MODEL)
+
+
+def _prompt():
+    n = active_name()
+    color = YEL if n in ("saint", "cloud") else CODE_FG   # highlight the routed/cloud seats
+    return f"{color}{n}{RESET} > "
+
+
 def read_line(prompt):
     """cbreak line reader: returns (text, mode). mode 'send' on Enter, 'pick' on
     Ctrl+Enter (terminals that send LF), None text with 'eof' on Ctrl-D. Falls back
@@ -624,7 +634,7 @@ def repl():
     while True:
         print()  # blank line before each prompt
         try:
-            user, mode = read_line("> ")
+            user, mode = read_line(_prompt())
         except KeyboardInterrupt:
             # ^C on the prompt: copy the last reply's code blocks (terminals that copy a
             # mouse selection on ^C never deliver this — so selection-copy still wins).
