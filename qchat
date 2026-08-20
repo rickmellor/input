@@ -20,6 +20,8 @@ import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.reque
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
 SHELL = os.environ.get("SHELL", "/bin/bash")
+SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to this run
+                # (else it keys on a hash of the first message — "hello" collides across chats)
 
 SEATS = {
     "gemma":  ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
@@ -277,7 +279,10 @@ def _collapse_think(think_buf, t0):
 
 def stream(messages, think_store):
     body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
-    req = urllib.request.Request(f"{BASE}/chat/completions", body, {"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if SESSION:
+        headers["x-session-id"] = SESSION
+    req = urllib.request.Request(f"{BASE}/chat/completions", body, headers)
     reply, think_buf, phase, t0 = [], [], "start", None
     md = MDRender()
     with urllib.request.urlopen(req, timeout=600) as r:
@@ -400,7 +405,9 @@ def code_blocks(text):
 
 
 def repl():
+    global SESSION
     history, thinks = [], []
+    SESSION = "qchat-" + os.urandom(6).hex()
     print(f"qchat → {MODEL} @ {BASE}  (/models, /think, /clear, /quit · ^C copies code, ^D quits)")
     while True:
         try:
@@ -427,7 +434,9 @@ def repl():
             print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
             continue
         if user == "/clear":
-            history.clear(); thinks.clear(); print("(history cleared)"); continue
+            history.clear(); thinks.clear()
+            SESSION = "qchat-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
+            print("(history cleared)"); continue
         history.append({"role": "user", "content": user})
         try:
             history.append({"role": "assistant", "content": stream(history, thinks)})
