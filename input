@@ -170,11 +170,38 @@ def load_system_template():
         return "{{stable}}"
 
 
+# --- /plan (MegaPlan) mode -------------------------------------------------------
+# An interactive planning experience: research → discuss → refine → persist to the
+# MegaPlan store (the `megaplan` tool). When on, the directive rides the STABLE system
+# prompt (before the volatile sentinel) so it stays cache-safe.
+PLAN_MODE = False
+PLAN_GOAL = ""
+_PLAN_DIRECTIVE = (
+    "You are in MegaPlan mode — an interactive planning experience. Co-construct a build "
+    "plan WITH the user and persist it to the MegaPlan store (the `megaplan` tool) so it "
+    "outlives this session and informs future plans. Loop: (1) GROUND — call "
+    "megaplan(action=\"context\", goal=…) FIRST and summarize the related prior plans + "
+    "memory it returns; flag any plan this one might depend on. (2) RESEARCH read-only "
+    "(list_files, read-only run_command) as needed. (3) DISCUSS and refine WITH the user — "
+    "ask clarifying questions, surface trade-offs; persist NOTHING yet. (4) On the user's "
+    "approval, SAVE the whole plan in ONE call: megaplan(action=\"save\", title=…, "
+    "body=\"…markdown incl. a '## Tasks' checklist of '- [ ] task (est: 2h)' lines…\", "
+    "priority=low|medium|high|critical, tags=[…], depends_on=[related plan ids]). (5) Report "
+    "the saved plan id. The conversation IS the planning; the tool only grounds and persists "
+    "it. Prefer one rich save over many task calls."
+)
+
+
 def system_prompt():
-    """Render the template: substitute known {{tokens}}, leave the rest verbatim."""
+    """Render the template: substitute known {{tokens}}, leave the rest verbatim.
+    In /plan mode, append the MegaPlan-mode directive (stable prefix → cache-safe)."""
     toks = _tokens()
-    return re.sub(r"\{\{(\w+)\}\}", lambda m: toks.get(m.group(1), m.group(0)),
-                  load_system_template()).strip()
+    s = re.sub(r"\{\{(\w+)\}\}", lambda m: toks.get(m.group(1), m.group(0)),
+               load_system_template()).strip()
+    if PLAN_MODE:
+        d = _PLAN_DIRECTIVE + (f"\n\nThis session's planning target: {PLAN_GOAL}" if PLAN_GOAL else "")
+        s = (s + "\n\n" + d) if s else d
+    return s
 
 
 def chat_system():
@@ -1387,7 +1414,8 @@ def active_name():
 def _prompt():
     n = active_name()
     color = YEL if n == "saint" or n.startswith("cloud") else CODE_FG   # highlight routed/cloud seats
-    return f"{color}{n}{RESET} > "
+    plan = f"{DIM} plan▸{RESET}" if PLAN_MODE else ""
+    return f"{color}{n}{RESET}{plan} > "
 
 
 def read_line(prompt):
@@ -1596,7 +1624,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
 
 
 def repl():
-    global SESSION, TOOLS_ON
+    global SESSION, TOOLS_ON, PLAN_MODE, PLAN_GOAL
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
@@ -1606,7 +1634,7 @@ def repl():
     stats = Stats()
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
-          f"/models /system /tools /mcp /memory /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /system /tools /mcp /memory /plan /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     mem_status = mem_connect()
     if mem_status:
         print(f"{DIM}{mem_status}{RESET}")
@@ -1759,8 +1787,25 @@ def repl():
                 print(f"location: {cur}{env}" if cur else
                       "(no location set — /location <city, state zip>, or /location clear)")
             continue
+        if user == "/plan" or user.startswith("/plan "):
+            arg = user[len("/plan"):].strip()
+            if arg.lower() in ("off", "done", "stop", "exit"):
+                PLAN_MODE, PLAN_GOAL = False, ""
+                print(f"{DIM}plan mode off{RESET}")
+            elif arg:
+                PLAN_MODE, PLAN_GOAL = True, arg
+                if not TOOLS_ON or "megaplan" not in TOOLS or not TOOLS["megaplan"].enabled:
+                    print(f"{DIM}note: enable the `megaplan` tool (/tools) so the plan can be saved{RESET}")
+                print(f"{DIM}● MegaPlan mode — planning: {arg}   (/plan off to exit){RESET}")
+                _turn(history, thinks, f"Let's plan: {arg}", stats)   # kick off: ground → discuss
+                print(_status_line(stats))
+            else:
+                print(f"{DIM}plan mode {('on · ' + PLAN_GOAL) if PLAN_MODE else 'off'}  ·  "
+                      f"/plan <goal> to start · /plan off to exit{RESET}")
+            continue
         if user == "/clear":
             history.clear(); thinks.clear()
+            PLAN_MODE, PLAN_GOAL = False, ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
         _turn(history, thinks, user, stats)
