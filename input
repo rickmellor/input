@@ -821,6 +821,36 @@ class MCPClient:
 _MCP_CLIENTS = {}      # url -> connected MCPClient (shared pool)
 
 
+def _norm_url(u):
+    return (u or "").rstrip("/")
+
+
+def mcp_claims():
+    """MCP servers consumed directly by an input subsystem, so their tools must NOT be
+    re-exposed to the model. Maps normalized url -> owner label. Extend as subsystems grow;
+    today the ambient memory layer claims the MemoryOS server."""
+    claims = {}
+    cfg = mem_config()
+    if cfg["enabled"]:
+        claims[_norm_url(cfg["url"])] = "ambient memory"
+    return claims
+
+
+def mcp_suppression(s, tool=None):
+    """Why this MCP server (or one server:tool) is kept out of the model tool set, or ''.
+    Whole-server: claimed by a subsystem, or excluded by name/url via `mcp_exclude`.
+    Per-tool: excluded via a `server:tool` entry. Matchers in `mcp_exclude` are any of
+    '<server>', '<url>', or '<server>:<tool>'."""
+    claim = mcp_claims().get(_norm_url(s["url"]))
+    if claim:
+        return f"claimed by {claim}"
+    ex = load_settings().get("mcp_exclude") or []
+    keys = {s["name"], _norm_url(s["url"])}
+    if tool is not None:
+        keys.add(f"{s['name']}:{tool}")
+    return "excluded" if keys & set(ex) else ""
+
+
 def mcp_servers():
     """Configured MCP servers as {name, url, source}. source 'added' = input settings.json
     (mcp_servers); 'discovered' = scanned from ~/.claude.json. HTTP servers only (the
@@ -852,16 +882,21 @@ def mcp_client(url, timeout=5):
 
 
 def register_mcp_server(s):
-    """Connect one server and register its tools DISABLED by default. Returns tool count."""
+    """Connect one server and register its non-suppressed tools DISABLED by default.
+    Returns the count registered (0 if the whole server is claimed/excluded). Individual
+    tools matched by an `mcp_exclude` `server:tool` entry are skipped."""
+    if mcp_suppression(s):                         # whole server claimed or excluded
+        return 0
     client = mcp_client(s["url"])
     n = 0
     for tdef in client.tools:
         tname = tdef["name"]
-        if tname in TOOLS:                        # avoid clobbering a built-in / other server
-            tname = f"{s['name']}_{tname}"
-        def _run(args, _c=client, _t=tdef["name"]):
+        if mcp_suppression(s, tname):              # per-tool exclusion
+            continue
+        rname = f"{s['name']}_{tname}" if tname in TOOLS else tname   # avoid clobbering
+        def _run(args, _c=client, _t=tname):
             return _c.call(_t, args)
-        register(Tool(tname, tdef.get("description", ""),
+        register(Tool(rname, tdef.get("description", ""),
                       tdef.get("inputSchema") or {"type": "object", "properties": {}},
                       _run, source=f"mcp:{s['name']}·{s['source']}", default_enabled=False))
         n += 1
@@ -869,12 +904,34 @@ def register_mcp_server(s):
 
 
 def load_mcp_tools():
-    """Auto-register tools from every configured MCP server (disabled by default)."""
+    """Auto-register tools from every configured MCP server (disabled by default). Servers
+    claimed by a subsystem, or hidden via `mcp_exclude`, are skipped (see `mcp_suppression`;
+    `/mcp` shows the reason)."""
     for s in mcp_servers():
+        if mcp_suppression(s):
+            continue
         try:
             register_mcp_server(s)
         except Exception as e:
             print(f"{DIM}(mcp {s['name']} unreachable: {e}){RESET}")
+
+
+def apply_tools_state():
+    """Set each tool's enabled flag from settings `tools_state` (else its default)."""
+    st = load_settings()
+    state = dict(st.get("tools_state", {}))
+    for n in st.get("tools_disabled", []):        # migrate legacy list → state
+        state.setdefault(n, False)
+    for n, t in TOOLS.items():
+        t.enabled = state.get(n, t.default_enabled)
+
+
+def reload_mcp_tools():
+    """Rebuild the MCP-sourced tool set after a claim / `mcp_exclude` change."""
+    for n in [n for n, t in list(TOOLS.items()) if t.source.startswith("mcp:")]:
+        del TOOLS[n]
+    load_mcp_tools()
+    apply_tools_state()
 
 
 _MEM = None            # connected MCPClient for MemoryOS, or None
@@ -1544,11 +1601,7 @@ def repl():
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
     load_mcp_tools()                                  # MCP server tools (disabled by default)
-    _state = dict(_st.get("tools_state", {}))         # explicit on/off overrides
-    for _n in _st.get("tools_disabled", []):          # migrate legacy list → state
-        _state.setdefault(_n, False)
-    for _n, _t in TOOLS.items():
-        _t.enabled = _state.get(_n, _t.default_enabled)
+    apply_tools_state()                               # restore per-tool on/off from settings
     history, thinks = [], []
     stats = Stats()
     SESSION = "input-" + os.urandom(6).hex()
@@ -1615,19 +1668,45 @@ def repl():
                     print("(usage: /mcp add <name> <url>)"); continue
                 st = load_settings(); st.setdefault("mcp_servers", []).append({"name": name, "url": url})
                 save_settings(st)
-                try:
-                    n = register_mcp_server({"name": name, "url": url, "source": "added"})
-                    print(f"{DIM}added mcp {name}: {n} tools registered (disabled — /tools to enable){RESET}")
-                except Exception as e:
-                    print(f"{DIM}added mcp {name}, but unreachable: {e}{RESET}")
+                why = mcp_suppression({"name": name, "url": url})
+                if why:
+                    print(f"{DIM}added mcp {name} — tools not exposed ({why}); /mcp show {name} to expose{RESET}")
+                else:
+                    try:
+                        n = register_mcp_server({"name": name, "url": url, "source": "added"})
+                        print(f"{DIM}added mcp {name}: {n} tools registered (disabled — /tools to enable){RESET}")
+                    except Exception as e:
+                        print(f"{DIM}added mcp {name}, but unreachable: {e}{RESET}")
+            elif arg.startswith("hide ") or arg.startswith("show "):
+                op, m = arg[:4], arg[5:].strip()
+                if not m:
+                    print("(usage: /mcp hide|show <server | server:tool | url>)"); continue
+                st = load_settings(); ex = st.setdefault("mcp_exclude", [])
+                if op == "hide":
+                    if m not in ex:
+                        ex.append(m)
+                    save_settings(st); reload_mcp_tools()
+                    print(f"{DIM}hidden: {m}  (its tools are no longer offered to the model){RESET}")
+                else:
+                    st["mcp_exclude"] = [x for x in ex if x != m]
+                    save_settings(st); reload_mcp_tools()
+                    print(f"{DIM}shown: {m}  (re-registered disabled — /tools to enable){RESET}")
             else:
                 servers = mcp_servers()
                 if not servers:
                     print(f"{DIM}no MCP servers · /mcp add <name> <url>{RESET}")
                 for s in servers:
-                    c = _MCP_CLIENTS.get(s["url"])
-                    n = len(c.tools) if c else "?"
-                    print(f"{DIM}  {s['name']:<14} {s['source']:<10} {n} tools  {s['url']}{RESET}")
+                    why = mcp_suppression(s)
+                    if why:
+                        status = why
+                    else:
+                        c = _MCP_CLIENTS.get(s["url"])
+                        status = f"{len(c.tools)} tools" if c else "? tools"
+                    print(f"{DIM}  {s['name']:<14} {s['source']:<10} {status:<18} {s['url']}{RESET}")
+                ex = load_settings().get("mcp_exclude") or []
+                if ex:
+                    print(f"{DIM}  excluded: {', '.join(ex)}{RESET}")
+                print(f"{DIM}  /mcp add <name> <url> · /mcp hide|show <server[:tool]>{RESET}")
             continue
         if user == "/memory" or user.startswith("/memory "):
             arg = user[len("/memory"):].strip()
