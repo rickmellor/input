@@ -207,17 +207,22 @@ def stream(messages):
     req = urllib.request.Request(f"{BASE}/chat/completions", body, {"Content-Type": "application/json"})
     reply, thinking = [], False
     with urllib.request.urlopen(req, timeout=600) as r:
-        b = r.headers.get("x-saint-backend")
-        if b:  # only SAINT sets these — show its routing decision
-            dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
-            cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
-            bits = " · ".join(x for x in (f"{dom}/{cx}" if dom else "", cls, state) if x)
-            print(f"{DIM}⟿ saint → {b}" + (f" · {bits}" if bits else "") + RESET)
+        saint_b = r.headers.get("x-saint-backend")  # only SAINT sets x-saint-*
+        dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
+        cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
+        bits = " · ".join(x for x in (f"{dom}/{cx}" if dom else "", cls, state) if x)
+        banner_done = not saint_b
         for raw in r:
             line = raw.decode().strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
-            delta = json.loads(line[6:])["choices"][0].get("delta") or {}
+            chunk = json.loads(line[6:])
+            if not banner_done:  # first chunk carries the actually-served model name
+                served = chunk.get("model", "")
+                arrow = f" >> {served}" if served and served != saint_b else ""
+                print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
+                banner_done = True
+            delta = chunk["choices"][0].get("delta") or {}
             rc = delta.get("reasoning_content") or delta.get("reasoning")
             if rc:
                 if not thinking:
