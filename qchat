@@ -32,6 +32,24 @@ SEATS = {
     "cloud":  ("saint-cloud-large",              "http://127.0.0.1:4000/v1"),  # force the cloud tier via SAINT
 }
 MAX_AUTO_STEPS = 8
+_DEFAULT_CFG = os.path.expanduser("~/.config/qchat/default-seat")
+
+
+def load_default_seat():
+    try:
+        n = open(_DEFAULT_CFG).read().strip()
+        return n if n in SEATS else None
+    except Exception:
+        return None
+
+
+def save_default_seat(name):
+    try:
+        os.makedirs(os.path.dirname(_DEFAULT_CFG), exist_ok=True)
+        open(_DEFAULT_CFG, "w").write(name)
+        return True
+    except Exception:
+        return False
 
 # --- catastrophic-command denylist: hard-blocked even in --auto, no LLM involved.
 _DENY = [
@@ -365,21 +383,26 @@ def stream(messages, think_store):
 
 
 def _pick(labels, start):
-    """Arrow/enter selector; returns chosen index or None. Falls back to numbers off-TTY."""
+    """Selector; returns (index, make_default) or None. Falls back to numbers off-TTY.
+
+    enter → use for the session; ctrl+enter (terminals that send LF) or 'd' → also
+    persist as the launch default; q / bare-Esc → cancel.
+    """
     if not sys.stdin.isatty():
         for i, lab in enumerate(labels, 1):
             print(f" {i}. {lab}")
         try:
-            s = input("switch to (number, blank=keep): ").strip()
+            s = input("switch to (number, or Nd for default, blank=keep): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return None
-        return int(s) - 1 if s.isdigit() and 1 <= int(s) <= len(labels) else None
+        mk = s.endswith("d"); s = s[:-1] if mk else s
+        return (int(s) - 1, mk) if s.isdigit() and 1 <= int(s) <= len(labels) else None
 
     import select, termios, tty
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     sel = start
-    print(f"{DIM}↑/↓ or j/k · enter select · q cancel{RESET}")
+    print(f"{DIM}↑/↓ or j/k · enter use · ctrl+enter or d set default · q cancel{RESET}")
 
     def draw(first=False):
         if not first:
@@ -394,8 +417,10 @@ def _pick(labels, start):
         draw(first=True)
         while True:
             ch = os.read(fd, 1)              # read the fd directly, not buffered stdin
-            if ch in (b"\r", b"\n"):
-                return sel
+            if ch == b"\r":                  # Enter → session only
+                return (sel, False)
+            if ch in (b"\n", b"d", b"D"):    # Ctrl+Enter (LF) or 'd' → set as default
+                return (sel, True)
             if ch in (b"q", b"\x03"):        # q / Ctrl-C
                 return None
             if ch == b"\x1b":                # ESC: arrow burst (ESC [ A/B) or bare ESC
@@ -418,17 +443,23 @@ def _pick(labels, start):
 def models_menu():
     global MODEL, BASE
     names = list(SEATS)
+    default = load_default_seat() or "gemma"
     cur = next((i for i, n in enumerate(names) if SEATS[n] == (MODEL, BASE)), 0)
     labels = []
     for n in names:
         m, b = SEATS[n]
         status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
-        labels.append(f"{n:<8} {m}  [{status}]")
-    idx = _pick(labels, cur)
-    if idx is None:
+        star = f"{YEL}★{RESET}" if n == default else " "
+        labels.append(f"{star} {n:<8} {m}  [{status}]")
+    res = _pick(labels, cur)
+    if res is None:
         return
+    idx, make_default = res
     MODEL, BASE = SEATS[names[idx]]
-    print(f"→ {MODEL} @ {BASE}  (history carries over)")
+    tail = ""
+    if make_default:
+        tail = "  (saved as default)" if save_default_seat(names[idx]) else "  (default save failed)"
+    print(f"→ {MODEL} @ {BASE}{tail}  (history carries over)")
 
 
 def code_blocks(text):
@@ -504,7 +535,7 @@ elif argv:
 elif MODE in ("-e", "-x", "--goal", "--auto", "--gen"):
     MODEL, BASE = SEATS["coder"]     # command/goal work → coder seat
 else:
-    MODEL, BASE = SEATS["gemma"]     # chat → fast general seat
+    MODEL, BASE = SEATS[load_default_seat() or "gemma"]   # chat → saved default (else gemma)
 
 
 def _task():
