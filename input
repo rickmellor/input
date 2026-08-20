@@ -105,7 +105,8 @@ def discover_seats(timeout=2.5):
         name = _seat_name(c)
         seats[name] = (c.get("id"), SAINT_BASE)     # route every seat through SAINT
         meta[name] = {k: c.get(k) for k in
-                      ("kind", "context", "price_in", "price_out", "rank", "state", "aliases")}
+                      ("kind", "context", "price_in", "price_out", "rank", "state",
+                       "aliases", "elec_per_mtok", "tok_s")}
     if not seats:
         return False
     SEATS.clear(); SEATS.update(seats)
@@ -1548,7 +1549,8 @@ def _seat_extra(n):
     if ctx:
         bits.append(f"{ctx // 1000}k ctx")
     if meta.get("kind") == "local":
-        bits.append("free")
+        elec = meta.get("elec_per_mtok")
+        bits.append(f"FREE · ~${elec}/Mtok elec" if elec else "FREE")
     elif meta.get("price_in"):
         bits.append(f"${meta['price_in']}/${meta.get('price_out')}")
     return f"  {DIM}· {' · '.join(bits)}{RESET}" if bits else ""
