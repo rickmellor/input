@@ -234,32 +234,6 @@ def stream(messages):
     return "".join(reply)
 
 
-def _read_key():
-    """One keypress in raw mode: 'up'/'down'/'enter'/'cancel'/char."""
-    import select, termios, tty
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch in ("\r", "\n"):
-            return "enter"
-        if ch in ("q", "\x03"):       # q / Ctrl-C
-            return "cancel"
-        if ch == "\x1b":              # ESC — arrow seq or bare ESC
-            if select.select([fd], [], [], 0.05)[0] and sys.stdin.read(1) == "[":
-                a = sys.stdin.read(1)
-                return {"A": "up", "B": "down"}.get(a, "other")
-            return "cancel"
-        if ch == "k":
-            return "up"
-        if ch == "j":
-            return "down"
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
 def _pick(labels, start):
     """Arrow/enter selector; returns chosen index or None. Falls back to numbers off-TTY."""
     if not sys.stdin.isatty():
@@ -270,6 +244,10 @@ def _pick(labels, start):
         except (EOFError, KeyboardInterrupt):
             return None
         return int(s) - 1 if s.isdigit() and 1 <= int(s) <= len(labels) else None
+
+    import select, termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
     sel = start
     print(f"{DIM}↑/↓ or j/k · enter select · q cancel{RESET}")
 
@@ -281,17 +259,30 @@ def _pick(labels, start):
             sys.stdout.write(f"\r\033[K{cur}{lab}{RESET}\r\n")
         sys.stdout.flush()
 
-    draw(first=True)
-    while True:
-        k = _read_key()
-        if k == "enter":
-            return sel
-        if k == "cancel":
-            return None
-        if k == "up":
-            sel = (sel - 1) % len(labels); draw()
-        elif k == "down":
-            sel = (sel + 1) % len(labels); draw()
+    try:
+        tty.setraw(fd)                       # raw ONCE for the whole selection
+        draw(first=True)
+        while True:
+            ch = os.read(fd, 1)              # read the fd directly, not buffered stdin
+            if ch in (b"\r", b"\n"):
+                return sel
+            if ch in (b"q", b"\x03"):        # q / Ctrl-C
+                return None
+            if ch == b"\x1b":                # ESC: arrow burst (ESC [ A/B) or bare ESC
+                if select.select([fd], [], [], 0.05)[0]:
+                    seq = os.read(fd, 2)
+                    if seq == b"[A":
+                        sel = (sel - 1) % len(labels); draw()
+                    elif seq == b"[B":
+                        sel = (sel + 1) % len(labels); draw()
+                else:
+                    return None              # bare ESC cancels
+            elif ch == b"k":
+                sel = (sel - 1) % len(labels); draw()
+            elif ch == b"j":
+                sel = (sel + 1) % len(labels); draw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def models_menu():
