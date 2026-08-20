@@ -653,6 +653,11 @@ def _inline(s):
     return s
 
 
+def _vlen(s):
+    """Visible width: characters minus ANSI SGR escapes (for cursor math)."""
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
 def _prose(line):
     """Format one non-code line of markdown for the terminal."""
     h = re.match(r"^(#{1,6})\s+(.*)", line)
@@ -1244,12 +1249,31 @@ def read_line(prompt):
     buf, pos = [], 0
     hlen = _rl.get_current_history_length() if _rl else 0
     hidx, saved = hlen, ""
+    crow = 0                                   # cursor's row offset from the line's start row
 
     def redraw():
-        sys.stdout.write("\r\033[K" + prompt + "".join(buf))
-        back = len(buf) - pos
-        if back:
-            sys.stdout.write(f"\033[{back}D")
+        # Wrapping-aware: the prompt+buffer may span several terminal rows. Go up to the
+        # block's start, clear to end of screen, rewrite, then reposition the cursor —
+        # otherwise a line past the screen width cascades one copy per keystroke.
+        nonlocal crow
+        w = max(1, shutil.get_terminal_size((80, 24)).columns)
+        plen = _vlen(prompt)
+        if crow:
+            sys.stdout.write(f"\033[{crow}A")
+        sys.stdout.write("\r\033[J" + prompt + "".join(buf))
+        total = plen + len(buf)
+        endrow = (total - 1) // w if total else 0
+        if pos == len(buf):                    # cursor already at the natural end
+            crow = endrow
+        else:                                  # editing mid-line: move back to `pos`
+            tgt = plen + pos
+            trow, tcol = divmod(tgt, w)
+            sys.stdout.write("\r")             # col 0 of the bottom row (clears pending wrap)
+            if endrow - trow > 0:
+                sys.stdout.write(f"\033[{endrow - trow}A")
+            if tcol:
+                sys.stdout.write(f"\033[{tcol}C")
+            crow = trow
         sys.stdout.flush()
 
     def load(item):
