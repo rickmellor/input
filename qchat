@@ -15,10 +15,10 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       code blocks stream plain then redraw boxed + line-numbered; ^C copies the last
       reply's code blocks (^D or /quit to exit); /models switches seat. Every request
       is grounded with the current date/time (+ location if /location or settings set).
-      Tools: the model can call built-ins (get_current_time; run_command runs shell
-      commands, gated by a gemma risk-review — none/low auto-run, riskier prompts) plus
-      user tools in ~/.config/qchat/tools/*.py; /tools opens an arrow-key per-tool on/off
-      menu (/tools on|off master switch). MCP support planned.
+      Tools: the model can call built-ins (get_current_time; list_files shows an ls -l
+      listing; run_command runs shell commands, gated by a gemma risk-review — none/low
+      auto-run, riskier prompts) plus user tools in ~/.config/qchat/tools/*.py; /tools
+      opens an arrow-key per-tool on/off menu (/tools on|off master switch). MCP planned.
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
@@ -186,11 +186,13 @@ MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't
 
 
 class Tool:
-    def __init__(self, name, description, parameters, run, source="built-in", confirm="never"):
+    def __init__(self, name, description, parameters, run, source="built-in",
+                 confirm="never", display="compact"):
         self.name, self.description = name, description
         self.parameters, self.run, self.source = parameters, run, source
         self.enabled = True           # per-tool on/off (settings 'tools_disabled'); /tools menu
         self.confirm = confirm        # gate policy: "never" | "review" | "always" (see _gate)
+        self.display = display        # result view: "compact" (one line) | "full" (whole output)
 
     def schema(self):
         return {"type": "function", "function": {
@@ -283,7 +285,8 @@ def load_user_tools():
                 register(Tool(d["name"], d["description"],
                               d.get("parameters", {"type": "object", "properties": {}}),
                               d["run"], source=os.path.basename(path),
-                              confirm=d.get("confirm", "never")))
+                              confirm=d.get("confirm", "never"),
+                              display=d.get("display", "compact")))
         except Exception as e:
             print(f"{DIM}(tool load failed: {os.path.basename(path)}: {e}){RESET}")
 
@@ -335,8 +338,9 @@ def _tool_run_command(args):
 register(Tool(
     "run_command",
     "Run a shell command on the user's machine (their default shell/OS) and return its "
-    "exit code plus combined stdout/stderr. Use for filesystem work (read/list/find/edit), "
+    "exit code plus combined stdout/stderr. Use for filesystem work (read/find/edit), "
     "inspecting or running programs, git, network tools — anything the shell can do. "
+    "To list a directory's contents, use the list_files tool instead of ls. "
     "Prefer non-interactive commands; the working directory is qchat's cwd.",
     {"type": "object",
      "properties": {
@@ -345,6 +349,29 @@ register(Tool(
      "required": ["command"]},
     _tool_run_command,
     confirm="review"))   # gemma rates risk: none/low auto-run, medium+ prompts; denylist warns
+
+
+def _tool_list_files(args):
+    path = os.path.expanduser((args or {}).get("path") or ".")
+    try:
+        p = subprocess.run(["ls", "-lhA", path], capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        return f"Failed to list {path}: {e}"
+    return (((p.stdout or "") + (p.stderr or "")).strip()) or "(empty)"
+
+
+register(Tool(
+    "list_files",
+    "List a directory's contents in long format (like `ls -l`: permissions, size, date, "
+    "name). This is THE way to list files or directories — use it whenever the user wants "
+    "to see what's in a directory; do not use run_command/ls for that. Path defaults to "
+    "the current directory; ~ is allowed.",
+    {"type": "object",
+     "properties": {
+         "path": {"type": "string", "description": "Directory to list; defaults to the cwd"}},
+     "required": []},
+    _tool_list_files,
+    display="full"))     # a listing is meant to be shown, not summarized
 
 # --- catastrophic-command denylist: hard-blocked even in --auto, no LLM involved.
 _DENY = [
@@ -1023,6 +1050,16 @@ def _fmt_args(s):
         return s or "{}"
 
 
+def _print_full_result(out, cap=200):
+    """Print a tool result verbatim (for display='full' tools like list_files), under a
+    dim gutter so it reads as tool output; capped so a huge dir can't flood the screen."""
+    lines = out.splitlines()
+    for ln in lines[:cap]:
+        print(f"{DIM}│{RESET} {ln}")
+    if len(lines) > cap:
+        print(f"{DIM}  … {len(lines) - cap} more lines{RESET}")
+
+
 def _fmt_result(out):
     """Compact one-line view of a tool result (the model still gets the full text).
     Small results show inline (whitespace flattened); large ones collapse to a peek + a
@@ -1055,7 +1092,11 @@ def _turn(history, thinks, user, model=None, base=None):
                 fn = tc.get("function") or {}
                 print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}")
                 out = execute_tool(tc)             # gates per the tool's confirm policy
-                print(f"{DIM}  → {_fmt_result(out)}{RESET}")
+                tool = TOOLS.get(fn.get("name"))
+                if out and getattr(tool, "display", "compact") == "full":
+                    _print_full_result(out)        # e.g. list_files: show the whole ls -l
+                else:
+                    print(f"{DIM}  → {_fmt_result(out)}{RESET}")
                 history.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
         print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
     except KeyboardInterrupt:

@@ -13,6 +13,11 @@
 #                 "review"  if the args have a "command" string, gemma rates its risk
 #                           (none/low auto-run, medium+ prompt); the catastrophic denylist
 #                           always prompts. This is what the built-in run_command uses.
+#   display     optional result view (default "compact"):
+#                 "compact" the result line is summarized to one line (large output stays
+#                           readable); the model still receives the full text
+#                 "full"    the whole result is printed under a gutter (use for output the
+#                           user should see verbatim, e.g. a directory listing)
 #
 # NOTE: user tools run in-process with no sandbox. A "never" tool auto-executes when the
 # model calls it — keep those read-only. For anything that writes, deletes, or reaches the
