@@ -72,6 +72,24 @@ SEATS = {
     "cloud-large": ("saint-cloud-large",  "http://127.0.0.1:4000/v1"),  # force cloud (Opus/Sonnet tier) via SAINT
     "cloud-small": ("saint-cloud-small",  "http://127.0.0.1:4000/v1"),  # force cloud (Haiku tier) via SAINT
 }
+
+# Function-key escape sequences (plain; Ctrl/Alt/Shift add a ";N" modifier we strip) → Fn label.
+_FKEY_SEQ = {
+    b"OP": "f1", b"OQ": "f2", b"OR": "f3", b"OS": "f4",
+    b"[11~": "f1", b"[12~": "f2", b"[13~": "f3", b"[14~": "f4",
+    b"[15~": "f5", b"[17~": "f6", b"[18~": "f7", b"[19~": "f8",
+    b"[20~": "f9", b"[21~": "f10", b"[23~": "f11", b"[24~": "f12",
+}
+# Fn → seat for one-shot routing (F9/F10 = the user's cloud-large / local-coder). Any Fn
+# works with or without Ctrl (Ctrl+F9 and F9 both fire). Override via settings `seat_hotkeys`.
+_DEFAULT_HOTKEYS = {"f7": "cloud-small", "f8": "saint", "f9": "cloud-large",
+                    "f10": "coder", "f11": "gemma", "f12": "qwen38"}
+
+
+def seat_hotkeys():
+    hk = dict(_DEFAULT_HOTKEYS)
+    hk.update(load_settings().get("seat_hotkeys") or {})
+    return {k.lower(): v for k, v in hk.items()}
 MAX_AUTO_STEPS = 8
 # SAINT extracts volatile per-turn context placed after this marker in the system prompt
 # and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
@@ -1654,7 +1672,16 @@ def read_line(prompt):
                 del buf[pos:]; redraw()
             elif ch == b"\x1b":                        # escape sequences
                 if select.select([fd], [], [], 0.05)[0]:
-                    seq = os.read(fd, 2)
+                    intro = os.read(fd, 1)             # '[' (CSI) or 'O' (SS3)
+                    seq = intro
+                    if intro in (b"[", b"O"):          # read to the final byte (a letter or '~')
+                        while len(seq) < 16:
+                            c = os.read(fd, 1)
+                            if not c:
+                                break
+                            seq += c
+                            if c.isalpha() or c == b"~":
+                                break
                     if seq == b"[A" and _rl and hidx > 0:
                         if hidx == hlen:
                             saved = "".join(buf)
@@ -1671,6 +1698,10 @@ def read_line(prompt):
                         pos = len(buf); redraw()
                     elif seq == b"[Z":                 # Shift+Tab → cycle permission mode
                         sys.stdout.write("\r\n"); return "".join(buf), "cycle"
+                    else:                              # F-keys (plain or Ctrl/Alt+Fn) → one-shot seat
+                        fk = _FKEY_SEQ.get(re.sub(rb";\d+", b"", seq))
+                        if fk:
+                            sys.stdout.write("\r\n"); return "".join(buf), "seat:" + fk
             elif ch >= b"\x20":                        # printable (+ utf-8 continuation)
                 b0 = ch[0]
                 extra = 0 if b0 < 0x80 else (1 if b0 < 0xE0 else (2 if b0 < 0xF0 else 3))
@@ -1828,8 +1859,11 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · Shift+Tab cycles mode · "
-          f"/models /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /seats /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
+    print(f"{DIM}  Fn one-shot: " + " · ".join(
+        f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
+        + f"  ·  Ctrl+Enter picker{RESET}")
     mem_status = mem_connect()
     if mem_status:
         print(f"{DIM}{mem_status}{RESET}")
@@ -1860,6 +1894,18 @@ def repl():
             seat = choose_seat()
             if not seat:
                 print("(cancelled)"); continue
+            m, b = SEATS[seat]
+            _turn(history, thinks, user, stats, model=m, base=b)
+            print(f"{DIM}(one-shot via {seat} · active seat still {MODEL}){RESET}")
+            print(_status_line(stats))
+            continue
+        if mode.startswith("seat:"):           # Fn hotkey → one-shot to a bound seat
+            fk = mode.split(":", 1)[1]
+            seat = seat_hotkeys().get(fk)
+            if not seat or seat not in SEATS:
+                print(f"{DIM}{fk.upper()}: no seat bound — set settings seat_hotkeys{RESET}"); continue
+            if not user:
+                print(f"{DIM}{fk.upper()} → {seat}: type a message first, then press it{RESET}"); continue
             m, b = SEATS[seat]
             _turn(history, thinks, user, stats, model=m, base=b)
             print(f"{DIM}(one-shot via {seat} · active seat still {MODEL}){RESET}")
@@ -1898,6 +1944,13 @@ def repl():
             continue
         if user in ("/models", "/model"):
             models_menu(); continue
+        if user == "/seats":                   # show the Fn one-shot bindings
+            print(f"{DIM}Fn one-shot seats (type a message, then press the key; Ctrl+Fn works too):{RESET}")
+            for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])):
+                up = "up" if v in SEATS and seat_alive(SEATS[v][1]) else f"{DIM}down{RESET}"
+                print(f"{DIM}  {k.upper():<4} → {v:<12} [{up}{DIM}]{RESET}")
+            print(f"{DIM}  override in settings.json: \"seat_hotkeys\": {{\"f9\": \"cloud-large\", …}}{RESET}")
+            continue
         if user in ("/think", "/expand"):
             print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
             continue
