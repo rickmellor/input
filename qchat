@@ -50,8 +50,9 @@ SEATS = {
     "gemma":  ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
     "coder":  ("qwen-27b-coder",                 "http://127.0.0.1:8003/v1"),
     "qwen38": ("Qwen3.8-27B-AWQ-INT4",           "http://127.0.0.1:8004/v1"),
-    "saint":  ("saint-auto",                     "http://127.0.0.1:4000/v1"),  # router: classify → local/cloud
-    "cloud":  ("saint-cloud-large",              "http://127.0.0.1:4000/v1"),  # force the cloud tier via SAINT
+    "saint":       ("saint-auto",         "http://127.0.0.1:4000/v1"),  # router: classify → local/cloud
+    "cloud-large": ("saint-cloud-large",  "http://127.0.0.1:4000/v1"),  # force cloud (Opus/Sonnet tier) via SAINT
+    "cloud-small": ("saint-cloud-small",  "http://127.0.0.1:4000/v1"),  # force cloud (Haiku tier) via SAINT
 }
 MAX_AUTO_STEPS = 8
 _DEFAULT_CFG = os.path.expanduser("~/.config/qchat/default-seat")
@@ -493,7 +494,7 @@ def _seat_labels():
         m, b = SEATS[n]
         status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
         star = f"{YEL}★{RESET}" if n == default else " "
-        labels.append(f"{star} {n:<8} {m}  [{status}]")
+        labels.append(f"{star} {n:<12} {m}  [{status}]")
     return names, labels, cur
 
 
@@ -510,7 +511,7 @@ def active_name():
 
 def _prompt():
     n = active_name()
-    color = YEL if n in ("saint", "cloud") else CODE_FG   # highlight the routed/cloud seats
+    color = YEL if n == "saint" or n.startswith("cloud") else CODE_FG   # highlight routed/cloud seats
     return f"{color}{n}{RESET} > "
 
 
