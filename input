@@ -31,6 +31,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
 Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
 import json, math, os, platform, re, shlex, shutil, subprocess, sys, threading, time, urllib.request, urllib.parse
+import io, concurrent.futures
 from datetime import datetime
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
@@ -852,6 +853,90 @@ def _resolve_seat(name):
     return (name, SAINT_BASE)          # treat an unknown name as a saint-* model id
 
 
+# --- per-model agent concurrency -------------------------------------------------
+# Parallel sub-agents must not overwhelm a backend: a local inference server handles far
+# less concurrency than a cloud API. Each MODEL gets its own bounded semaphore (default
+# local=2, cloud=5, tunable via settings "agent_concurrency"), enforced inside spawn_agent
+# so the limit holds across every in-flight spawn regardless of which turn issued it.
+_MODEL_SEMS = {}
+_MODEL_SEMS_LK = threading.Lock()
+
+
+def _seat_kind(model, base):
+    """'local' for a directly-hosted inference seat, else 'cloud' (incl. saint-auto/router)."""
+    m, b = (model or "").lower(), (base or "")
+    if "local" in m or "qwen" in m or "gemma" in m:
+        return "local"
+    if "cloud" in m:
+        return "cloud"
+    if ("127.0.0.1" in b or "localhost" in b) and ":4000" not in b:  # direct port, not the router
+        return "local"
+    return "cloud"                     # saint-auto / router / unknown → the generous budget
+
+
+def _agent_caps():
+    c = load_settings().get("agent_concurrency") or {}
+    return {"local": max(1, int(c.get("local", 2))), "cloud": max(1, int(c.get("cloud", 5)))}
+
+
+def _model_sem(model, base):
+    """The bounded semaphore for `model` (created once, at that seat-kind's cap)."""
+    with _MODEL_SEMS_LK:
+        s = _MODEL_SEMS.get(model)
+        if s is None:
+            s = threading.BoundedSemaphore(_agent_caps()[_seat_kind(model, base)])
+            _MODEL_SEMS[model] = s
+        return s
+
+
+class _StdoutRouter:
+    """Installed as sys.stdout. Writes go to a thread-local buffer when one is set (so
+    parallel tool dispatch captures each agent's output for ordered, non-interleaved flush),
+    otherwise straight to the real stdout — transparent when nothing is capturing."""
+    def __init__(self, real):
+        self._real = real
+        self._loc = threading.local()
+
+    def _t(self):
+        return getattr(self._loc, "buf", None) or self._real
+
+    def write(self, s):
+        return self._t().write(s)
+
+    def flush(self):
+        try:
+            return self._t().flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._real.isatty()
+        except Exception:
+            return False
+
+    def capture(self, buf):
+        self._loc.buf = buf
+
+    def release(self):
+        self._loc.buf = None
+
+    def __getattr__(self, n):
+        return getattr(self._real, n)
+
+
+_STDOUT = None
+
+
+def _install_stdout_router():
+    """Idempotently wrap sys.stdout so parallel tool dispatch can buffer per-agent output."""
+    global _STDOUT
+    if _STDOUT is None and not isinstance(sys.stdout, _StdoutRouter):
+        _STDOUT = _StdoutRouter(sys.stdout)
+        sys.stdout = _STDOUT
+    return _STDOUT
+
+
 def _subagent_system(cwd, skill):
     """A sub-agent's system prompt: grounding + the cwd's folder context + one skill brief +
     autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills."""
@@ -899,8 +984,9 @@ def _tool_spawn_agent(args):
         return None
 
     print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
-    res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
-                     budget_tokens=budget, on_tool=on_tool, gate=False)
+    with _model_sem(m, b):                 # per-model concurrency cap (local=2, cloud=5)
+        res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
+                         budget_tokens=budget, on_tool=on_tool, gate=False)
     tag = "" if res["stopped"] == "done" else f" [{res['stopped']}]"
     print(f"{DIM}  ⟳ done[{label}] {res['rounds']}r · {res['tool_calls']} tools · "
           f"{res['tokens_out']} out{tag}{RESET}")
@@ -911,12 +997,16 @@ def _tool_spawn_agent(args):
 
 register(Tool(
     "spawn_agent",
-    "Spawn a sub-agent: a fresh autonomous agent with its own context and a sandboxed toolset "
-    "(read/list/bash by default; write/edit if write=true), working in `cwd`. Use to delegate "
-    "a self-contained unit of work (research a subsystem, review a file, draft a component) — "
-    "especially several in a row to parallelize investigation. It routes via saint-auto unless "
-    "you pin `model` (e.g. 'cloud-flagship'/'cloud-large' for a design or hard-reasoning agent) "
-    "or the chosen `skill` declares a seat. Returns the sub-agent's final deliverable.",
+    "Spawn a sub-agent — a fresh autonomous agent with its own context and a sandboxed toolset "
+    "(read/list/bash by default; write/edit if write=true), working in `cwd`. "
+    "THE USER'S NAMES FOR THIS TOOL: \"mini-5\", \"mini5\", \"mini 5\", \"a mini\", \"sub-agent\", "
+    "\"subagent\", \"spin up / kick off / fire off / spawn an agent (to …)\" — when the user says "
+    "any of these, they mean CALL THIS TOOL: hand the work to a sub-agent, don't just do it "
+    "yourself in this thread. Use it to delegate a self-contained unit of work (research a "
+    "subsystem, review a file, draft a component) — especially several in a row to parallelize "
+    "investigation. Routes via saint-auto unless you pin `model` ('cloud-flagship'/'cloud-large' "
+    "for a design or hard-reasoning agent) or the chosen `skill` declares a seat. Returns the "
+    "sub-agent's final deliverable.",
     {"type": "object",
      "properties": {
          "task": {"type": "string", "description": "the sub-agent's brief — what to do and what to return"},
@@ -2259,10 +2349,17 @@ def read_line(prompt):
         redraw()
         while True:
             ch = os.read(fd, 1)
-            if ch == b"\r":
-                sys.stdout.write("\r\n"); return "".join(buf), "send"
-            if ch == b"\n":
-                sys.stdout.write("\r\n"); return "".join(buf), "pick"
+            if ch in (b"\r", b"\n"):
+                # Descend past the whole wrapped block before the newline: crow can lag
+                # the true bottom row (wrap math drift / a resize mid-entry), and a bare
+                # \r\n from a too-high row leaves the next output (the ⟐ memory notice,
+                # routing) printed on top of the still-visible prompt.
+                w = max(1, shutil.get_terminal_size((80, 24)).columns)
+                endrow = (_vlen(prompt) + len(buf) - 1) // w if (buf or prompt) else 0
+                if endrow > crow:
+                    sys.stdout.write(f"\033[{endrow - crow}B")
+                sys.stdout.write("\r\n")
+                return "".join(buf), ("send" if ch == b"\r" else "pick")
             if ch == b"\x04":                          # Ctrl-D
                 if not buf:
                     sys.stdout.write("\r\n"); return None, "eof"
@@ -2583,6 +2680,11 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
             msg = {"role": "assistant", "content": text}
             if tcs:
                 msg["tool_calls"] = tcs
+                if not (text or "").strip():
+                    msg["content"] = None      # tool-call-only turn: send null, not "" — the
+                                               # OpenAI-valid shape, so the Anthropic relay
+                                               # doesn't pad an empty block with a visible
+                                               # "[System: Empty message content sanitised]" line
             messages.append(msg)
             if budget_tokens and res["tokens_in"] + res["tokens_out"] > budget_tokens:
                 res["stopped"] = "budget"; break
@@ -2592,31 +2694,65 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                     if not done and nudge:
                         messages.append({"role": "user", "content": nudge}); continue
                 break
-            for tc in tcs:                         # run each call, feed results back
+            # Resolve confirmation gates first, on this thread — prompts can't run
+            # concurrently. Then run the calls: one → inline (live output); several → a
+            # thread pool, each call's output buffered and flushed in submit (== tcs) order
+            # so parallel agents don't interleave. Per-MODEL limits live in spawn_agent.
+            # FUTURE: an "observe" affordance to tail one parallel agent's live output (its
+            # buffer is already isolated per-thread — surface it on demand instead of only
+            # flushing at completion).
+            decided = []
+            for tc in tcs:
                 fn = tc.get("function") or {}
                 name = fn.get("name")
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     args = {}
-                res["tool_calls"] += 1
-                if on_tool:
-                    on_tool("call", tc, None)
                 tool = toolmap.get(name)
+                allow, reason = True, None
                 if tool is None:
-                    out = f"Error: no such tool {name!r}"
-                else:
+                    allow, reason = False, f"Error: no such tool {name!r}"
+                elif gate and not quiet and getattr(tool, "confirm", "never") != "never":
                     cmd = args.get("command") if isinstance(args, dict) else None
-                    if gate and not quiet and getattr(tool, "confirm", "never") != "never" \
-                            and not _gate(tool.confirm, cmd):
-                        out = "Declined by the user; not run."
+                    if not _gate(tool.confirm, cmd):
+                        allow, reason = False, "Declined by the user; not run."
+                decided.append((tc, name, args, tool, allow, reason))
+            res["tool_calls"] += len(decided)
+
+            def _run_one(item, buffered):
+                tc, name, args, tool, allow, reason = item
+                buf = io.StringIO()
+                if buffered and _STDOUT is not None:
+                    _STDOUT.capture(buf)
+                try:
+                    if on_tool:
+                        on_tool("call", tc, None)
+                    if not allow:
+                        out = reason
                     else:
                         try:
                             out = str(tool.run(args))
                         except Exception as e:
                             out = f"Error running {name}: {e}"
+                    shown = on_tool("result", tc, out) if on_tool else None
+                finally:
+                    if buffered and _STDOUT is not None:
+                        _STDOUT.release()
+                return tc, out, shown, buf.getvalue()
+
+            if len(decided) <= 1:
+                results = [_run_one(it, False) for it in decided]
+            else:
+                buffered = not quiet
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(decided))) as ex:
+                    futs = [ex.submit(_run_one, it, buffered) for it in decided]
+                    results = [f.result() for f in futs]      # submit order == tcs order
+
+            for tc, out, shown, printed in results:
+                if printed:
+                    sys.stdout.write(printed); sys.stdout.flush()
                 _note_saved(tc, out)
-                shown = on_tool("result", tc, out) if on_tool else None
                 messages.append({"role": "tool", "tool_call_id": tc["id"],
                                  "content": shown if shown is not None else out})
         else:
@@ -2938,7 +3074,8 @@ def repl():
         except KeyboardInterrupt:
             # ^C on the prompt: copy the last reply's code blocks (terminals that copy a
             # mouse selection on ^C never deliver this — so selection-copy still wins).
-            last = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+            last = next((m["content"] for m in reversed(history)
+                         if m["role"] == "assistant" and m.get("content")), "")
             blocks = code_blocks(last)
             if blocks and copy_clip("\n\n".join(blocks)):
                 print(f"\n(copied {len(blocks)} code block{'s' * (len(blocks) != 1)})")
@@ -3476,6 +3613,7 @@ def _task():
 
 
 def _main():
+    _install_stdout_router()   # transparent passthrough until parallel dispatch buffers output
     if MODE == "--job":
         sys.exit(run_job(JOB_ID))
     if MODE == "--gen":
