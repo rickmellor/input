@@ -21,7 +21,9 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       listing; run_command runs shell commands, gated by a gemma risk-review — none/low
       auto-run, riskier prompts; web_search + web_fetch browse the web via Brave) plus
       user tools in ~/.config/qchat/tools/*.py; /tools
-      opens an arrow-key per-tool on/off menu (/tools on|off master switch).
+      opens an arrow-key per-tool on/off menu (/tools on|off master switch). Tools from
+      MCP servers auto-register DISABLED (enable via /tools); /mcp lists servers (added
+      directly vs discovered from ~/.claude.json) and /mcp add <name> <url> adds one.
       Memory: an MCP client wires MemoryOS (network memory service) as an ambient layer —
       relevant memories are recalled before each turn and each exchange stored after;
       /memory toggles/configures (user_id, url in settings.json).
@@ -193,10 +195,11 @@ MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't
 
 class Tool:
     def __init__(self, name, description, parameters, run, source="built-in",
-                 confirm="never", display="compact"):
+                 confirm="never", display="compact", default_enabled=True):
         self.name, self.description = name, description
         self.parameters, self.run, self.source = parameters, run, source
-        self.enabled = True           # per-tool on/off (settings 'tools_disabled'); /tools menu
+        self.default_enabled = default_enabled   # MCP tools default OFF; built-ins/user ON
+        self.enabled = default_enabled           # per-tool on/off; /tools menu, settings tools_state
         self.confirm = confirm        # gate policy: "never" | "review" | "always" (see _gate)
         self.display = display        # result view: "compact" (one line) | "full" (whole output)
 
@@ -814,6 +817,65 @@ class MCPClient:
                          if c.get("type") == "text")
 
 
+_MCP_CLIENTS = {}      # url -> connected MCPClient (shared pool)
+
+
+def mcp_servers():
+    """Configured MCP servers as {name, url, source}. source 'added' = qchat settings.json
+    (mcp_servers); 'discovered' = scanned from ~/.claude.json. HTTP servers only (the
+    client speaks streamable HTTP). Added take precedence over discovered on url clash."""
+    seen, out = set(), []
+    for s in load_settings().get("mcp_servers", []):
+        if s.get("url") and s["url"] not in seen:
+            out.append({"name": s.get("name") or s["url"], "url": s["url"], "source": "added"})
+            seen.add(s["url"])
+    try:
+        d = json.load(open(os.path.expanduser("~/.claude.json")))
+        for name, cfg in (d.get("mcpServers") or {}).items():
+            u = cfg.get("url")
+            if u and cfg.get("type", "http") == "http" and u not in seen:
+                out.append({"name": name, "url": u, "source": "discovered"})
+                seen.add(u)
+    except Exception:
+        pass
+    return out
+
+
+def mcp_client(url, timeout=5):
+    """Get/create a pooled MCP client for url (raises on connect failure)."""
+    c = _MCP_CLIENTS.get(url)
+    if c is None:
+        c = MCPClient(url, timeout=timeout).connect()
+        _MCP_CLIENTS[url] = c
+    return c
+
+
+def register_mcp_server(s):
+    """Connect one server and register its tools DISABLED by default. Returns tool count."""
+    client = mcp_client(s["url"])
+    n = 0
+    for tdef in client.tools:
+        tname = tdef["name"]
+        if tname in TOOLS:                        # avoid clobbering a built-in / other server
+            tname = f"{s['name']}_{tname}"
+        def _run(args, _c=client, _t=tdef["name"]):
+            return _c.call(_t, args)
+        register(Tool(tname, tdef.get("description", ""),
+                      tdef.get("inputSchema") or {"type": "object", "properties": {}},
+                      _run, source=f"mcp:{s['name']}·{s['source']}", default_enabled=False))
+        n += 1
+    return n
+
+
+def load_mcp_tools():
+    """Auto-register tools from every configured MCP server (disabled by default)."""
+    for s in mcp_servers():
+        try:
+            register_mcp_server(s)
+        except Exception as e:
+            print(f"{DIM}(mcp {s['name']} unreachable: {e}){RESET}")
+
+
 _MEM = None            # connected MCPClient for MemoryOS, or None
 _MEM_PROFILE = ""      # cached user profile (stable → system prompt)
 
@@ -1214,7 +1276,9 @@ def tools_menu():
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     st = load_settings()
-    st["tools_disabled"] = [n for n in names if not TOOLS[n].enabled]
+    st["tools_state"] = {n: TOOLS[n].enabled for n in TOOLS
+                         if TOOLS[n].enabled != TOOLS[n].default_enabled}
+    st.pop("tools_disabled", None)                    # migrated to tools_state
     save_settings(st)
     on = sum(TOOLS[n].enabled for n in names)
     print(f"{DIM}→ {on}/{len(names)} tools enabled{RESET}")
@@ -1440,14 +1504,17 @@ def repl():
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
-    _disabled = set(_st.get("tools_disabled", []))   # restore per-tool state
+    load_mcp_tools()                                  # MCP server tools (disabled by default)
+    _state = dict(_st.get("tools_state", {}))         # explicit on/off overrides
+    for _n in _st.get("tools_disabled", []):          # migrate legacy list → state
+        _state.setdefault(_n, False)
     for _n, _t in TOOLS.items():
-        _t.enabled = _n not in _disabled
+        _t.enabled = _state.get(_n, _t.default_enabled)
     history, thinks = [], []
     stats = Stats()
     SESSION = "qchat-" + os.urandom(6).hex()
     print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
-          f"/models /system /tools /memory /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /system /tools /mcp /memory /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     mem_status = mem_connect()
     if mem_status:
         print(f"{DIM}{mem_status}{RESET}")
@@ -1498,6 +1565,30 @@ def repl():
                 print(f"(tools {'on' if TOOLS_ON else 'off'})")
             else:
                 tools_menu()                       # arrow-key per-tool on/off picker
+            continue
+        if user == "/mcp" or user.startswith("/mcp "):
+            arg = user[len("/mcp"):].strip()
+            if arg.startswith("add "):
+                parts = arg.split()
+                name, url = (parts[1], parts[2]) if len(parts) >= 3 else \
+                            (parts[1], parts[1]) if len(parts) == 2 else (None, None)
+                if not url:
+                    print("(usage: /mcp add <name> <url>)"); continue
+                st = load_settings(); st.setdefault("mcp_servers", []).append({"name": name, "url": url})
+                save_settings(st)
+                try:
+                    n = register_mcp_server({"name": name, "url": url, "source": "added"})
+                    print(f"{DIM}added mcp {name}: {n} tools registered (disabled — /tools to enable){RESET}")
+                except Exception as e:
+                    print(f"{DIM}added mcp {name}, but unreachable: {e}{RESET}")
+            else:
+                servers = mcp_servers()
+                if not servers:
+                    print(f"{DIM}no MCP servers · /mcp add <name> <url>{RESET}")
+                for s in servers:
+                    c = _MCP_CLIENTS.get(s["url"])
+                    n = len(c.tools) if c else "?"
+                    print(f"{DIM}  {s['name']:<14} {s['source']:<10} {n} tools  {s['url']}{RESET}")
             continue
         if user == "/memory" or user.startswith("/memory "):
             arg = user[len("/memory"):].strip()
