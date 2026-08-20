@@ -473,6 +473,61 @@ def _mode_hint(m):
     return {"cautious": "you review risky actions",
             "unrestricted": "reviewer model gates; no prompts",
             "plan": "MegaPlan planning (research → discuss → persist)"}.get(m, "")
+
+
+# --- /goal: exit criteria the agent works toward (anti-early-abort) -------------------
+# A goal is a termination CONTRACT for a thread (the session, a sub-agent, a job): keep
+# working until the exit criteria are met; don't stop at the first plausible answer. The
+# only legitimate early stop is a HARD BLOCK — needs a credential/secret, an ambiguous spec
+# that requires a human decision, a destructive/irreversible step, or repeated tool failure.
+# Then the thread parks in `blocked` with a PRECISE need (resumable), never silently quits.
+GOAL = ""              # the session's exit criteria ("" = none)
+GOAL_BLOCKED = ""      # the precise need when the session is hard-blocked ("" = not blocked)
+GOAL_MAX_NUDGES = 4    # per turn: how many times we push the model back to work before pausing
+_GOAL_DIRECTIVE = (
+    "SESSION GOAL (exit criteria): {goal}\n"
+    "Work toward this goal persistently across turns until the exit criteria are genuinely met — "
+    "do NOT stop early, do NOT declare success without evidence, do NOT ask permission for "
+    "routine steps. When the criteria are met, end your reply with a line `GOAL MET: <evidence>`. "
+    "The ONLY reason to stop short is a hard block: you need a credential/secret, the spec is "
+    "ambiguous in a way only the user can resolve, the next step is destructive/irreversible, "
+    "or a tool has failed repeatedly (3+) despite fixes. Then end your reply with ONE line "
+    "`BLOCKED: <exactly what you need>` and stop. Otherwise keep going."
+)
+_GOAL_MET_RE = re.compile(r"^\s*GOAL MET\b", re.M)
+_GOAL_BLOCKED_RE = re.compile(r"^\s*BLOCKED:\s*(.+)$", re.M)
+
+
+def goal_terminate(goal, nudges_left):
+    """Build a run_thread `terminate` hook for `goal`. Returns (done, nudge)."""
+    state = {"left": nudges_left}
+
+    def _t(text, res):
+        global GOAL_BLOCKED
+        t = text or ""
+        m = _GOAL_BLOCKED_RE.search(t)
+        if m:
+            GOAL_BLOCKED = m.group(1).strip()
+            res["blocked"] = GOAL_BLOCKED
+            return True, None                   # parked: needs the user (resumable)
+        if _GOAL_MET_RE.search(t):
+            res["goal_met"] = True
+            return True, None
+        if state["left"] <= 0:
+            res["goal_paused"] = True
+            return True, None                   # pause; user can say "continue"
+        state["left"] -= 1
+        return False, ("The goal is not yet met. Continue working toward the exit criteria: "
+                       f"{goal}. If you are genuinely hard-blocked, reply with `BLOCKED: <need>`; "
+                       "when done, `GOAL MET: <evidence>`.")
+    return _t
+
+
+def notify_blocked(source, need):
+    """Prominent in-UI notification that a thread/job is hard-blocked and waiting."""
+    bar = "━" * min(72, max(20, len(need) + 14))
+    print(f"\n{RED_VIVID}{BOLD}{bar}\n ⛔ BLOCKED — {source}\n    needs: {need}\n{bar}{RESET}")
+    print(f"{DIM}   answer it in your next message (or /goal answer <text>); /goal off abandons the goal{RESET}")
 _PLAN_DIRECTIVE = (
     "You are in MegaPlan mode — an interactive planning experience. Co-construct a build "
     "plan WITH the user and persist it to the MegaPlan store (the `megaplan` tool) so it "
@@ -505,6 +560,9 @@ def system_prompt(cwd=None):
     if BUILD_ID:                              # building (mutually exclusive with plan mode)
         b = _BUILD_DIRECTIVE + f"\n\nBuilding MegaPlan: {BUILD_ID}"
         s = (s + "\n\n" + b) if s else b
+    if GOAL:                                  # exit-criteria contract (stable → cache-safe)
+        g = _GOAL_DIRECTIVE.format(goal=GOAL)
+        s = (s + "\n\n" + g) if s else g
     return s
 
 
@@ -1997,7 +2055,9 @@ def _prompt():
            "unrestricted": f"{RED_VIVID}{BOLD} unrestricted▸{RESET}",
            "plan": f"{BLUE_ELECTRIC} plan▸{RESET}"}.get(PERM_MODE, "")
     build = f"{GREEN_BUILD} build▸{RESET}" if BUILD_ID else ""
-    return f"{color}{n}{RESET}{tag}{build} > "
+    goal = (f"{RED_VIVID}{BOLD} ⛔blocked▸{RESET}" if GOAL_BLOCKED else
+            (f"{DIM} goal▸{RESET}" if GOAL else ""))
+    return f"{color}{n}{RESET}{tag}{build}{goal} > "
 
 
 def read_line(prompt):
@@ -2447,14 +2507,26 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         # already saw it so it doesn't re-list the same content back
         return out + _SHOWN_NOTE if full else out
 
+    global GOAL_BLOCKED
+    if GOAL_BLOCKED:                               # the user's message answers the block → resume
+        user = f"(Answer to your BLOCKED need — {GOAL_BLOCKED!r}): {user}"
+        GOAL_BLOCKED = ""
     tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
+    terminate = goal_terminate(GOAL, GOAL_MAX_NUDGES) if GOAL else None
     try:
         res = run_thread(user, history=history, tools=tools, model=model, base=base, quiet=False,
-                         stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True)
+                         stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True,
+                         terminate=terminate)
     except KeyboardInterrupt:
         print(f"{RESET}\n(interrupted)"); return
     if res["stopped"] == "rounds":
         print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
+    if res.get("blocked"):
+        notify_blocked("session goal", res["blocked"])
+    elif res.get("goal_met"):
+        print(f"{GREEN_BUILD}{BOLD}✔ GOAL MET{RESET}{DIM} — {GOAL[:80]}  (/goal off to clear){RESET}")
+    elif res.get("goal_paused"):
+        print(f"{DIM}(goal not met after {GOAL_MAX_NUDGES} continues — pausing; say 'continue' to push on, /goal off to drop it){RESET}")
     if res["error"]:
         print(f"[error: {res['error']}]")
     else:
@@ -2462,7 +2534,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
 
 
 def repl():
-    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
+    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, GOAL, GOAL_BLOCKED
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
@@ -2504,7 +2576,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/models /seats /system /skill /context /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -2567,6 +2639,27 @@ def repl():
             continue
         if not user or user in ("/quit", "exit"):
             break
+        if user == "/goal" or user.startswith("/goal "):
+            arg = user[len("/goal"):].strip()
+            if arg.lower() in ("off", "clear", "done"):
+                GOAL, GOAL_BLOCKED = "", ""
+                print(f"{DIM}goal cleared{RESET}")
+            elif arg.lower().startswith("answer "):
+                if not GOAL_BLOCKED:
+                    print(f"{DIM}nothing is blocked{RESET}")
+                else:
+                    _turn(history, thinks, arg[7:].strip(), stats); print(_status_line(stats))
+            elif arg:
+                GOAL, GOAL_BLOCKED = arg, ""
+                print(f"{DIM}● goal set — the agent will work toward it until met or hard-blocked:\n  {arg}{RESET}")
+                print(f"{DIM}  (it ends with `GOAL MET: <evidence>` or `BLOCKED: <need>`; /goal off clears){RESET}")
+            else:
+                if GOAL:
+                    st = f"{RED_VIVID}BLOCKED — needs: {GOAL_BLOCKED}{RESET}" if GOAL_BLOCKED else "active"
+                    print(f"{DIM}goal ({st}{DIM}): {GOAL}\n  /goal off · /goal answer <text> (when blocked) · /goal <new criteria>{RESET}")
+                else:
+                    print(f"{DIM}no goal — /goal <exit criteria> makes the agent work toward it until met or hard-blocked{RESET}")
+            continue
         if user == "/mode" or user.startswith("/mode "):
             arg = user[len("/mode"):].strip().lower()
             if arg in MODES:
