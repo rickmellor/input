@@ -725,8 +725,10 @@ def stream(messages, think_store, model=None, base=None, tools=None):
         if old_tty is not None:
             import termios
             termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
+    if phase == "thinking":      # round ended in thinking (e.g. thinking→tool_call): collapse now
+        _collapse_think(think_buf, t0)
     md.finalize()
-    sys.stdout.write(RESET if phase == "thinking" else "")
+    sys.stdout.write(RESET)
     print()
     if think_buf:
         think_store.append("".join(think_buf))
