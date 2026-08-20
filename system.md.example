@@ -3,7 +3,7 @@ You are a concise, capable assistant. Answer directly — skip filler, disclaime
 {{stable}}
 
 <!--
-This is a STARTER system prompt for qchat. Copy it to ~/.config/qchat/system.md
+This is a STARTER system prompt for input. Copy it to ~/.config/input/system.md
 (or run `/system edit` in the REPL) and make it yours.
 
 Available {{tokens}} — substituted fresh on every request:
@@ -29,7 +29,7 @@ doesn't invalidate the cache. Example:
     <<<saint:volatile>>>
     Right now it is {{datetime}}.
 
-On the saint/cloud-* seats SAINT relocates it (cache-safe); on a direct local seat qchat
+On the saint/cloud-* seats SAINT relocates it (cache-safe); on a direct local seat input
 just drops the marker and inlines the text. For a live clock, the get_current_time tool is
 usually the better choice than pinning it into the prompt.
 

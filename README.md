@@ -1,17 +1,19 @@
-# qchat
+# input
+
+> Formerly **qchat**. The command, config dir (`~/.config/input`), and repo were renamed to `input`; a `qchat` symlink is kept as a back-compat alias.
 
 Zero-overhead chat REPL + shell-command generator for local OpenAI-compatible seats
 (johnny fleet). Stdlib-only Python, single file.
 
-- `qchat` — chat REPL on the gemma seat; thinking models stream reasoning dimmed
-- `qchat coder` / `qchat gemma` / `qchat qwen38` — seat shortcuts (or `qchat <model> <base_url>`)
+- `input` — chat REPL on the gemma seat; thinking models stream reasoning dimmed
+- `input coder` / `input gemma` / `input qwen38` — seat shortcuts (or `input <model> <base_url>`)
 - `/models` — toggle seats mid-conversation (live up/down status, history carries)
-- `qchat -e <task>` — NL → shell command via the coder seat (thinking off), then
+- `input -e <task>` — NL → shell command via the coder seat (thinking off), then
   `execute | revise | describe | copy | quit`
-- `qchat -x <task>` — same, but executes immediately
-- bare `qchat -e` / `-x` — prompts for the task (no shell quoting hazards)
+- `input -x <task>` — same, but executes immediately
+- bare `input -e` / `-x` — prompts for the task (no shell quoting hazards)
 
-Install: symlink `qchat` onto your PATH (`ln -s ~/repos/qchat/qchat ~/.local/bin/qchat`).
+Install: symlink `input` onto your PATH (`ln -s ~/repos/input/input ~/.local/bin/input`).
 
 Planned: butterfish-style `!` / `!!` goal mode via bash `command_not_found_handle`.
 
@@ -19,7 +21,7 @@ Planned: butterfish-style `!` / `!!` goal mode via bash `command_not_found_handl
 
 Source once from `~/.bashrc`:
 
-    source ~/repos/qchat/qchat-shell.bash
+    source ~/repos/input/input-shell.bash
 
 - `!<task>`  — goal agent: proposes each step, you confirm, it runs and observes output
 - `!!<task>` — autonomous agent: hardcoded catastrophic-command denylist (always blocks)

@@ -1,6 +1,6 @@
-# Example qchat user tool.
+# Example input user tool.
 #
-# Drop a copy in ~/.config/qchat/tools/ (any *.py there is loaded at REPL start) and the
+# Drop a copy in ~/.config/input/tools/ (any *.py there is loaded at REPL start) and the
 # model can call it. A file defines either TOOL (one dict) or TOOLS (a list of dicts).
 # Each dict needs:
 #   name        unique tool name (snake_case)
