@@ -207,6 +207,12 @@ def stream(messages):
     req = urllib.request.Request(f"{BASE}/chat/completions", body, {"Content-Type": "application/json"})
     reply, thinking = [], False
     with urllib.request.urlopen(req, timeout=600) as r:
+        b = r.headers.get("x-saint-backend")
+        if b:  # only SAINT sets these — show its routing decision
+            dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
+            cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
+            bits = " · ".join(x for x in (f"{dom}/{cx}" if dom else "", cls, state) if x)
+            print(f"{DIM}⟿ saint → {b}" + (f" · {bits}" if bits else "") + RESET)
         for raw in r:
             line = raw.decode().strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -228,28 +234,80 @@ def stream(messages):
     return "".join(reply)
 
 
+def _read_key():
+    """One keypress in raw mode: 'up'/'down'/'enter'/'cancel'/char."""
+    import select, termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch in ("q", "\x03"):       # q / Ctrl-C
+            return "cancel"
+        if ch == "\x1b":              # ESC — arrow seq or bare ESC
+            if select.select([fd], [], [], 0.05)[0] and sys.stdin.read(1) == "[":
+                a = sys.stdin.read(1)
+                return {"A": "up", "B": "down"}.get(a, "other")
+            return "cancel"
+        if ch == "k":
+            return "up"
+        if ch == "j":
+            return "down"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _pick(labels, start):
+    """Arrow/enter selector; returns chosen index or None. Falls back to numbers off-TTY."""
+    if not sys.stdin.isatty():
+        for i, lab in enumerate(labels, 1):
+            print(f" {i}. {lab}")
+        try:
+            s = input("switch to (number, blank=keep): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return int(s) - 1 if s.isdigit() and 1 <= int(s) <= len(labels) else None
+    sel = start
+    print(f"{DIM}↑/↓ or j/k · enter select · q cancel{RESET}")
+
+    def draw(first=False):
+        if not first:
+            sys.stdout.write(f"\033[{len(labels)}A")
+        for i, lab in enumerate(labels):
+            cur = f"{BOLD}❯ " if i == sel else "  "
+            sys.stdout.write(f"\r\033[K{cur}{lab}{RESET}\r\n")
+        sys.stdout.flush()
+
+    draw(first=True)
+    while True:
+        k = _read_key()
+        if k == "enter":
+            return sel
+        if k == "cancel":
+            return None
+        if k == "up":
+            sel = (sel - 1) % len(labels); draw()
+        elif k == "down":
+            sel = (sel + 1) % len(labels); draw()
+
+
 def models_menu():
     global MODEL, BASE
     names = list(SEATS)
-    print("seats:")
-    for i, n in enumerate(names, 1):
+    cur = next((i for i, n in enumerate(names) if SEATS[n] == (MODEL, BASE)), 0)
+    labels = []
+    for n in names:
         m, b = SEATS[n]
-        mark = "*" if (m, b) == (MODEL, BASE) else " "
         status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
-        print(f" {mark}{i}. {n:<8} {m}  [{status}]")
-    try:
-        pick = input("switch to (name/number, blank=keep): ").strip()
-    except (EOFError, KeyboardInterrupt):
+        labels.append(f"{n:<8} {m}  [{status}]")
+    idx = _pick(labels, cur)
+    if idx is None:
         return
-    if not pick:
-        return
-    if pick.isdigit() and 1 <= int(pick) <= len(names):
-        pick = names[int(pick) - 1]
-    if pick in SEATS:
-        MODEL, BASE = SEATS[pick]
-        print(f"→ {MODEL} @ {BASE}  (history carries over)")
-    else:
-        print(f"(unknown seat {pick!r})")
+    MODEL, BASE = SEATS[names[idx]]
+    print(f"→ {MODEL} @ {BASE}  (history carries over)")
 
 
 def repl():
