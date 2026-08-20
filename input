@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""qchat — chat REPL, NL shell-command generator, and shell goal-agent for local seats.
+"""input — chat REPL, NL shell-command generator, and shell goal-agent for local seats.
 
-Chat REPL:  qchat [seat|model [base_url]]        thinking streams dimmed
+Chat REPL:  input [seat|model [base_url]]        thinking streams dimmed
             /models · /system [edit] · /tools · /memory · /location · /think · /clear · /quit
-Command:    qchat -e <task>   propose → execute|revise|describe|copy|quit
-            qchat -x <task>   propose → execute immediately
-            qchat --gen <buf> print one command to stdout (Ctrl-G binding)
-Goal agent: qchat --goal <task>   iterate: propose→confirm→run→observe→next
-            qchat --auto <task>   iterate autonomously; denylist + gemma risk gate
+Command:    input -e <task>   propose → execute|revise|describe|copy|quit
+            input -x <task>   propose → execute immediately
+            input --gen <buf> print one command to stdout (Ctrl-G binding)
+Goal agent: input --goal <task>   iterate: propose→confirm→run→observe→next
+            input --auto <task>   iterate autonomously; denylist + gemma risk gate
 Bare -e/-x/--goal/--auto with no words prompts for the task (no shell quoting).
 
 Seats: gemma (chat default) | coder (command/goal default) | qwen38 (on-demand).
@@ -20,7 +20,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       Tools: the model can call built-ins (get_current_time; list_files shows an ls -l
       listing; run_command runs shell commands, gated by a gemma risk-review — none/low
       auto-run, riskier prompts; web_search + web_fetch browse the web via Brave) plus
-      user tools in ~/.config/qchat/tools/*.py; /tools
+      user tools in ~/.config/input/tools/*.py; /tools
       opens an arrow-key per-tool on/off menu (/tools on|off master switch). Tools from
       MCP servers auto-register DISABLED (enable via /tools); /mcp lists servers (added
       directly vs discovered from ~/.claude.json) and /mcp add <name> <url> adds one.
@@ -28,7 +28,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       relevant memories are recalled before each turn and each exchange stored after;
       /memory toggles/configures (user_id, url in settings.json); /memory browse [query]
       inspects the stored profile, recent history, knowledge, and pages.
-Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
+Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request, urllib.parse
 from datetime import datetime
@@ -42,7 +42,7 @@ SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to t
 # readline gives the prompt up/down input-history recall; persist it across sessions.
 try:
     import readline as _rl
-    _HIST = os.path.expanduser("~/.config/qchat/history")
+    _HIST = os.path.expanduser("~/.config/input/history")
     try:
         os.makedirs(os.path.dirname(_HIST), exist_ok=True)
         _rl.read_history_file(_HIST)
@@ -72,9 +72,9 @@ SEATS = {
 MAX_AUTO_STEPS = 8
 # SAINT extracts volatile per-turn context placed after this marker in the system prompt
 # and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
-# for a direct local seat qchat strips the marker and inlines the text (see stream()).
+# for a direct local seat input strips the marker and inlines the text (see stream()).
 SAINT_SENTINEL = "<<<saint:volatile>>>"
-_DEFAULT_CFG = os.path.expanduser("~/.config/qchat/default-seat")
+_DEFAULT_CFG = os.path.expanduser("~/.config/input/default-seat")
 
 
 def load_default_seat():
@@ -98,8 +98,8 @@ def save_default_seat(name):
 # settings.json is the shared config store (location now; tool prefs later). Grounding
 # is injected into the system context on EVERY request so the model always knows the
 # current time — cheaper and more reliable than a get_current_time tool it must decide
-# to call. Location rides along when set (settings 'location' or $QCHAT_LOCATION).
-_SETTINGS = os.path.expanduser("~/.config/qchat/settings.json")
+# to call. Location rides along when set (settings 'location' or $INPUT_LOCATION).
+_SETTINGS = os.path.expanduser("~/.config/input/settings.json")
 
 
 def load_settings():
@@ -121,13 +121,13 @@ def save_settings(d):
 def ground_text():
     now = datetime.now().astimezone()
     s = "Current date and time: " + now.strftime("%A, %Y-%m-%d %H:%M %Z (%z)") + "."
-    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location")
+    loc = os.environ.get("INPUT_LOCATION") or load_settings().get("location")
     if loc:
         s += f" User location: {loc}."
     return s
 
 
-# The chat system prompt is a user-editable template at ~/.config/qchat/system.md.
+# The chat system prompt is a user-editable template at ~/.config/input/system.md.
 # {{tokens}} substitute fresh at send time; unknown {{tokens}} and literal braces in the
 # body are left untouched. Absent/empty file → "{{stable}}".
 #
@@ -139,14 +139,14 @@ def ground_text():
 # available for users who want a live clock in the prompt, at that cache cost. Live
 # minute-time on demand is a job for the get_current_time tool (v2.1), not the prefix.
 # Shell/goal modes keep the full-resolution ground_text() (single-shot, no cache to protect).
-_SYSTEM_TMPL = os.path.expanduser("~/.config/qchat/system.md")
+_SYSTEM_TMPL = os.path.expanduser("~/.config/input/system.md")
 
 
 def stable_context():
     """Session-stable grounding for the system prefix — no minute clock, so SAINT's
     system breakpoint and local prefix reuse stay warm across turns."""
     s = "Today is " + datetime.now().astimezone().strftime("%A, %Y-%m-%d") + "."
-    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location")
+    loc = os.environ.get("INPUT_LOCATION") or load_settings().get("location")
     if loc:
         s += f" You are assisting a user located in {loc}."
     return s
@@ -154,7 +154,7 @@ def stable_context():
 
 def _tokens():
     now = datetime.now().astimezone()
-    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location") or ""
+    loc = os.environ.get("INPUT_LOCATION") or load_settings().get("location") or ""
     return {"stable": stable_context(), "grounding": ground_text(),
             "datetime": now.strftime("%A, %Y-%m-%d %H:%M %Z (%z)"),
             "date": now.strftime("%A, %Y-%m-%d"), "time": now.strftime("%H:%M %Z"),
@@ -185,10 +185,10 @@ def chat_system():
 
 # --- tool framework --------------------------------------------------------------
 # A Tool = name + description + JSON-Schema parameters + run(args:dict) -> str. Built-ins
-# register below; user tools auto-load from ~/.config/qchat/tools/*.py (each file defines
+# register below; user tools auto-load from ~/.config/input/tools/*.py (each file defines
 # TOOL, a dict, or TOOLS, a list of them). MCP tools will register the same way later.
 # Tools ride the OpenAI tools/tool_calls protocol, which every seat accepts (local + SAINT).
-_TOOLS_DIR = os.path.expanduser("~/.config/qchat/tools")
+_TOOLS_DIR = os.path.expanduser("~/.config/input/tools")
 TOOLS = {}            # name -> Tool
 TOOLS_ON = True       # set from settings at REPL start; /tools toggles + persists
 MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't spin forever
@@ -285,7 +285,7 @@ def load_user_tools():
     for path in sorted(glob.glob(os.path.join(_TOOLS_DIR, "*.py"))):
         try:
             spec = importlib.util.spec_from_file_location(
-                "qchat_tool_" + os.path.basename(path)[:-3], path)
+                "input_tool_" + os.path.basename(path)[:-3], path)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             defs = getattr(mod, "TOOLS", None)
@@ -311,7 +311,7 @@ def _tool_current_time(args):
             local = datetime.now().astimezone().strftime("%A, %Y-%m-%d %H:%M:%S %Z (%z)")
             return f"Unknown timezone {tzname!r}. Local time is {local}."
     now = datetime.now().astimezone()
-    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location")
+    loc = os.environ.get("INPUT_LOCATION") or load_settings().get("location")
     s = now.strftime("%A, %Y-%m-%d %H:%M:%S %Z (%z)")
     return s + (f" (user location: {loc})" if loc else "")
 
@@ -351,7 +351,7 @@ register(Tool(
     "exit code plus combined stdout/stderr. Use for filesystem work (read/find/edit), "
     "inspecting or running programs, git, network tools — anything the shell can do. "
     "To list a directory's contents, use the list_files tool instead of ls. "
-    "Prefer non-interactive commands; the working directory is qchat's cwd.",
+    "Prefer non-interactive commands; the working directory is input's cwd.",
     {"type": "object",
      "properties": {
          "command": {"type": "string", "description": "The shell command to run"},
@@ -424,7 +424,7 @@ def _tool_web_fetch(args):
         return "Error: no url"
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    req = urllib.request.Request(url, headers={"User-Agent": "qchat/2.1 (+local)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "input/2.1 (+local)"})
     try:
         raw = urllib.request.urlopen(req, timeout=20).read()
     except Exception as e:
@@ -550,7 +550,7 @@ def copy_clip(text):
 
 
 def _cmd_sys():
-    ctx = os.environ.get("QCHAT_CTX", "").strip()
+    ctx = os.environ.get("INPUT_CTX", "").strip()
     ctx = f" Recent shell history:\n{ctx}\n" if ctx else ""
     return (f"You generate shell commands for {platform.system()} / {SHELL} / cwd {os.getcwd()}. "
             f"{ground_text()}{ctx}"
@@ -605,7 +605,7 @@ def goal_mode(task, auto=False):
                 "Each turn output EITHER the single next command (no markdown/explanation) "
                 "OR a line 'DONE: <summary>' when the goal is met. Commands must be non-interactive. "
                 "You are shown each command's exit code and output.")
-    ctx = os.environ.get("QCHAT_CTX", "").strip()
+    ctx = os.environ.get("INPUT_CTX", "").strip()
     first = f"Goal: {task}" + (f"\n\nRecent shell history:\n{ctx}" if ctx else "")
     messages = [{"role": "system", "content": goal_sys}, {"role": "user", "content": first}]
     for step in range(1, MAX_AUTO_STEPS + 1):
@@ -766,7 +766,7 @@ def _collapse_think(think_buf, t0):
 
 # --- MCP client + MemoryOS ambient memory ----------------------------------------
 # Minimal streamable-HTTP MCP client (JSON-RPC: initialize → tools/list → tools/call).
-# MemoryOS is a shared, network memory service (not app-specific); qchat is one client of
+# MemoryOS is a shared, network memory service (not app-specific); input is one client of
 # it. Used AMBIENTLY: recall relevant memories before each turn (injected as per-turn
 # volatile context, cache-safe via the SAINT sentinel) and store each exchange after; the
 # user profile (stable) rides in the system prompt. The same client will serve other MCP
@@ -803,7 +803,7 @@ class MCPClient:
 
     def connect(self):
         init = self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                        "clientInfo": {"name": "qchat", "version": "2.1"}})
+                                        "clientInfo": {"name": "input", "version": "2.1"}})
         if not init or "result" not in init:
             raise RuntimeError("initialize failed")
         self._rpc("notifications/initialized", notify=True)
@@ -822,7 +822,7 @@ _MCP_CLIENTS = {}      # url -> connected MCPClient (shared pool)
 
 
 def mcp_servers():
-    """Configured MCP servers as {name, url, source}. source 'added' = qchat settings.json
+    """Configured MCP servers as {name, url, source}. source 'added' = input settings.json
     (mcp_servers); 'discovered' = scanned from ~/.claude.json. HTTP servers only (the
     client speaks streamable HTTP). Added take precedence over discovered on url clash."""
     seen, out = set(), []
@@ -1551,8 +1551,8 @@ def repl():
         _t.enabled = _state.get(_n, _t.default_enabled)
     history, thinks = [], []
     stats = Stats()
-    SESSION = "qchat-" + os.urandom(6).hex()
-    print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
+    SESSION = "input-" + os.urandom(6).hex()
+    print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
           f"/models /system /tools /mcp /memory /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     mem_status = mem_connect()
     if mem_status:
@@ -1675,14 +1675,14 @@ def repl():
                     st["location"] = arg; save_settings(st)
                     print(f"(location set: {arg})")
             else:
-                cur = os.environ.get("QCHAT_LOCATION") or st.get("location")
-                env = " (from $QCHAT_LOCATION)" if os.environ.get("QCHAT_LOCATION") else ""
+                cur = os.environ.get("INPUT_LOCATION") or st.get("location")
+                env = " (from $INPUT_LOCATION)" if os.environ.get("INPUT_LOCATION") else ""
                 print(f"location: {cur}{env}" if cur else
                       "(no location set — /location <city, state zip>, or /location clear)")
             continue
         if user == "/clear":
             history.clear(); thinks.clear()
-            SESSION = "qchat-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
+            SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
         _turn(history, thinks, user, stats)
         print(_status_line(stats))
@@ -1712,7 +1712,7 @@ def _task():
     if t:
         return t
     if MODE == "--gen":
-        sys.exit("usage: qchat --gen <buffer text>")
+        sys.exit("usage: input --gen <buffer text>")
     try:
         return input("task: ").strip()
     except (EOFError, KeyboardInterrupt):
