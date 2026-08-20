@@ -266,6 +266,183 @@ def load_system_template():
         return "{{stable}}"
 
 
+# --- instruction layer: skills + AGENTS.md/CLAUDE.md ------------------------------
+# Two flavours of instruction source, differing only in loading policy:
+#   skills     — on-demand playbooks. Claude Code's SKILL.md format verbatim (frontmatter
+#                name/description[/model], markdown body) so one skill works in both tools.
+#                Found in ~/.config/input/skills/, ~/.claude/skills/ (reuse Claude's), and
+#                <git-root>/.claude/skills/; either <name>/SKILL.md or a bare <name>.md.
+#                name+description ride the system prompt always (cheap); the BODY loads
+#                only on trigger: explicit `/skill <name>` or the model calling load_skill.
+#   AGENTS.md  — folder-scoped, always-on. Read AGENTS.md (else CLAUDE.md) from the project
+#                (git) root down to cwd, plus a global ~/.config/input/AGENTS.md; stacked
+#                root-first so the file CLOSEST to the work wins on conflict while inheriting
+#                the rest. Keyed by cwd, so sub-agents/jobs load the folder they run in.
+# Both ride the STABLE system prefix (cache-safe); they change rarely.
+_SKILL_ROOTS = [os.path.expanduser("~/.config/input/skills"), os.path.expanduser("~/.claude/skills")]
+_GLOBAL_AGENTS = os.path.expanduser("~/.config/input/AGENTS.md")
+SKILLS = {}            # name -> {"name","description","path","seat"}; body read lazily
+LOADED_SKILLS = []     # names whose bodies are in the system prompt (in load order)
+_FOLDER_CACHE = {}     # cwd -> (signature, text)
+
+
+def _frontmatter(text):
+    """Minimal YAML-frontmatter reader: `key: value` and `key: |` block scalars. Returns
+    (meta:dict, body:str). No frontmatter → ({}, text)."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    head, body = text[3:end], text[end + 4:]
+    meta, key, block = {}, None, None
+    for line in head.splitlines():
+        if block is not None and (line.startswith("  ") or line.startswith("\t") or not line.strip()):
+            block.append(line.strip()); continue
+        if block is not None:
+            meta[key] = " ".join(x for x in block if x).strip(); block = None
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val in ("|", ">", "|-", ">-"):
+            block = []
+        else:
+            meta[key] = val.strip("'\"")
+    if block is not None:
+        meta[key] = " ".join(x for x in block if x).strip()
+    return meta, body.lstrip("\n")
+
+
+def _git_root(path):
+    p = os.path.abspath(path)
+    while True:
+        if os.path.isdir(os.path.join(p, ".git")):
+            return p
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+
+
+def discover_skills(cwd=None):
+    """(Re)scan the skill roots (+ the project's .claude/skills) into SKILLS."""
+    roots = list(_SKILL_ROOTS)
+    gr = _git_root(cwd or os.getcwd())
+    if gr:
+        roots.append(os.path.join(gr, ".claude", "skills"))
+    found = {}
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for entry in sorted(os.listdir(root)):
+            full = os.path.join(root, entry)
+            path = os.path.join(full, "SKILL.md") if os.path.isdir(full) else (full if entry.endswith(".md") else None)
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                meta, _ = _frontmatter(open(path).read())
+            except Exception:
+                continue
+            name = (meta.get("name") or (entry[:-3] if entry.endswith(".md") else entry)).strip()
+            if not name or name in found:        # first root wins (input's own > claude's > project)
+                continue
+            found[name] = {"name": name, "description": meta.get("description", "").strip(),
+                           "path": path, "seat": (meta.get("model") or meta.get("seat") or "").strip()}
+    SKILLS.clear(); SKILLS.update(found)
+    return found
+
+
+def skill_body(name):
+    s = SKILLS.get(name)
+    if not s:
+        return None
+    try:
+        _, body = _frontmatter(open(s["path"]).read())
+        return body.strip()
+    except Exception:
+        return None
+
+
+def load_skill(name):
+    """Load a skill's body into the system prompt. Returns the body, or None if unknown."""
+    body = skill_body(name)
+    if body is None:
+        return None
+    if name not in LOADED_SKILLS:
+        LOADED_SKILLS.append(name)
+    return body
+
+
+def skills_index_text():
+    """The always-on, cheap skills listing for the system prompt (names + descriptions)."""
+    if not SKILLS:
+        return ""
+    lines = [f"- {n}: {s['description'] or '(no description)'}" for n, s in SKILLS.items()
+             if n not in LOADED_SKILLS]
+    if not lines:
+        return ""
+    return ("Available skills (playbooks). When a request matches one, call load_skill(name) "
+            "to pull in its full instructions BEFORE acting:\n" + "\n".join(lines))
+
+
+def folder_context(cwd=None):
+    """AGENTS.md/CLAUDE.md stack for `cwd`: global file, then project root → cwd (root-first;
+    closest wins). Cached by (cwd, file mtimes). Returns text ('' if none)."""
+    cwd = os.path.abspath(cwd or os.getcwd())
+    paths = []
+    if os.path.isfile(_GLOBAL_AGENTS):
+        paths.append(_GLOBAL_AGENTS)
+    root = _git_root(cwd) or cwd
+    chain, p = [], cwd
+    while True:
+        chain.append(p)
+        if p == root or os.path.dirname(p) == p:
+            break
+        p = os.path.dirname(p)
+    for d in reversed(chain):                  # root → cwd
+        for fn in ("AGENTS.md", "CLAUDE.md"):  # AGENTS.md wins when both exist in a dir
+            f = os.path.join(d, fn)
+            if os.path.isfile(f):
+                paths.append(f); break
+    sig = tuple((f, os.path.getmtime(f)) for f in paths)
+    hit = _FOLDER_CACHE.get(cwd)
+    if hit and hit[0] == sig:
+        return hit[1]
+    parts = []
+    for f in paths:
+        try:
+            body = open(f).read().strip()
+        except Exception:
+            continue
+        if body:
+            label = "global" if f == _GLOBAL_AGENTS else os.path.relpath(f, root) if f.startswith(root) else f
+            parts.append(f"### {label}\n{body}")
+    text = ""
+    if parts:
+        text = ("Project instructions (AGENTS.md / CLAUDE.md). Instructions closer to the "
+                "working directory take precedence over those above them; otherwise all apply.\n\n"
+                + "\n\n".join(parts))
+    _FOLDER_CACHE[cwd] = (sig, text)
+    return text
+
+
+def instruction_layer(cwd=None):
+    """Folder context + skills index + loaded skill bodies, for the system prompt."""
+    blocks = []
+    fc = folder_context(cwd)
+    if fc:
+        blocks.append(fc)
+    idx = skills_index_text()
+    if idx:
+        blocks.append(idx)
+    for n in LOADED_SKILLS:
+        b = skill_body(n)
+        if b:
+            blocks.append(f"## Skill: {n}\n{b}")
+    return "\n\n".join(blocks)
+
+
 # --- permission modes ------------------------------------------------------------
 # Shift+Tab cycles them (also /mode, and /plan enters plan). They govern how tool calls
 # that make changes are gated (see _gate):
@@ -312,12 +489,16 @@ _PLAN_DIRECTIVE = (
 )
 
 
-def system_prompt():
-    """Render the template: substitute known {{tokens}}, leave the rest verbatim.
-    In /plan mode, append the MegaPlan-mode directive (stable prefix → cache-safe)."""
+def system_prompt(cwd=None):
+    """Render the template: substitute known {{tokens}}, leave the rest verbatim; then the
+    instruction layer (AGENTS.md stack for cwd + skills index + loaded skills); then any
+    mode directive. All session-stable → cache-safe prefix."""
     toks = _tokens()
     s = re.sub(r"\{\{(\w+)\}\}", lambda m: toks.get(m.group(1), m.group(0)),
                load_system_template()).strip()
+    il = instruction_layer(cwd)
+    if il:
+        s = (s + "\n\n" + il) if s else il
     if PERM_MODE == "plan":
         d = _PLAN_DIRECTIVE + (f"\n\nThis session's planning target: {PLAN_GOAL}" if PLAN_GOAL else "")
         s = (s + "\n\n" + d) if s else d
@@ -523,6 +704,28 @@ register(Tool(
          "type": "string", "description": "IANA timezone name; omit for local time"}},
      "required": []},
     _tool_current_time))
+
+
+def _tool_load_skill(args):
+    name = ((args or {}).get("name") or "").strip()
+    if not name:
+        return "Error: no skill name given. Available: " + ", ".join(SKILLS) if SKILLS else "Error: no skills installed"
+    body = load_skill(name)
+    if body is None:
+        return f"Error: no such skill {name!r}. Available: {', '.join(SKILLS) or '(none)'}"
+    print(f"{DIM}  ⟐ skill loaded: {name}{RESET}")
+    return f"Skill '{name}' loaded (its instructions now persist in your system prompt). Follow them:\n\n{body}"
+
+
+register(Tool(
+    "load_skill",
+    "Load a skill (a named playbook of instructions) into context and return its full text. "
+    "Call this when the user's request matches one of the 'Available skills' listed in your "
+    "system prompt, BEFORE acting — then follow the skill's instructions.",
+    {"type": "object",
+     "properties": {"name": {"type": "string", "description": "Skill name from the available list"}},
+     "required": ["name"]},
+    _tool_load_skill))
 
 
 def _tool_run_command(args):
@@ -1930,6 +2133,7 @@ def repl():
     load_user_tools()
     load_mcp_tools()                                  # MCP server tools (disabled by default)
     apply_tools_state()                               # restore per-tool on/off from settings
+    discover_skills()                                 # skills index (bodies load on trigger)
     history, thinks = [], []
     stats = Stats()
 
@@ -1965,7 +2169,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/models /seats /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /seats /system /skill /context /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -2065,6 +2269,47 @@ def repl():
             continue
         if user in ("/think", "/expand"):
             print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
+            continue
+        if user == "/skill" or user.startswith("/skill ") or user == "/skills":
+            arg = user.split(None, 1)[1].strip() if " " in user else ""
+            if arg == "reload":
+                discover_skills(); print(f"{DIM}{len(SKILLS)} skills discovered{RESET}")
+            elif arg.startswith("off"):
+                tgt = arg[3:].strip()
+                if tgt in ("", "all"):
+                    LOADED_SKILLS.clear(); print(f"{DIM}all skills unloaded{RESET}")
+                elif tgt in LOADED_SKILLS:
+                    LOADED_SKILLS.remove(tgt); print(f"{DIM}unloaded {tgt}{RESET}")
+                else:
+                    print(f"{DIM}{tgt} is not loaded{RESET}")
+            elif arg:
+                body = load_skill(arg)
+                if body is None:
+                    print(f"{DIM}no such skill {arg!r} — /skill to list{RESET}")
+                else:
+                    print(f"{DIM}⟐ skill loaded: {arg} ({len(body)} chars) — active for this session; /skill off {arg} to unload{RESET}")
+            else:
+                if not SKILLS:
+                    print(f"{DIM}no skills — drop <name>/SKILL.md (or <name>.md) in ~/.config/input/skills/  "
+                          f"(also reads ~/.claude/skills and <repo>/.claude/skills){RESET}")
+                for n, s in SKILLS.items():
+                    mark = f"{CODE_FG}●{RESET}" if n in LOADED_SKILLS else f"{DIM}○{RESET}"
+                    seat = f"  {DIM}[seat {s['seat']}]{RESET}" if s.get("seat") else ""
+                    print(f"  {mark} {n:<22} {DIM}{(s['description'] or '')[:70]}{RESET}{seat}")
+                print(f"{DIM}  /skill <name> load · /skill off [name|all] · /skill reload  (● = loaded){RESET}")
+            continue
+        if user == "/context" or user == "/ctx":   # what instruction context is active for this cwd
+            fc = folder_context()
+            root = _git_root(os.getcwd()) or os.getcwd()
+            print(f"{DIM}cwd {os.getcwd()}  ·  project root {root}{RESET}")
+            if fc:
+                heads = [l[4:] for l in fc.splitlines() if l.startswith("### ")]
+                print(f"{DIM}folder instructions ({len(heads)}): {', '.join(heads)}{RESET}")
+            else:
+                print(f"{DIM}no AGENTS.md/CLAUDE.md in the stack (global: {_GLOBAL_AGENTS}){RESET}")
+            print(f"{DIM}skills loaded: {', '.join(LOADED_SKILLS) or '(none)'} · available: {len(SKILLS)}{RESET}")
+            sp = system_prompt()
+            print(f"{DIM}system prompt: {len(sp)} chars  (/system to view){RESET}")
             continue
         if user == "/tools" or user.startswith("/tools "):
             arg = user[len("/tools"):].strip().lower()
