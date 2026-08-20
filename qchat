@@ -2,7 +2,7 @@
 """qchat — chat REPL, NL shell-command generator, and shell goal-agent for local seats.
 
 Chat REPL:  qchat [seat|model [base_url]]        thinking streams dimmed
-            /models seat · /system [edit] · /location [city] · /think · /clear · /quit
+            /models · /system [edit] · /tools [on|off] · /location [city] · /think · /clear · /quit
 Command:    qchat -e <task>   propose → execute|revise|describe|copy|quit
             qchat -x <task>   propose → execute immediately
             qchat --gen <buf> print one command to stdout (Ctrl-G binding)
@@ -15,6 +15,8 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       code blocks stream plain then redraw boxed + line-numbered; ^C copies the last
       reply's code blocks (^D or /quit to exit); /models switches seat. Every request
       is grounded with the current date/time (+ location if /location or settings set).
+      Tools: the model can call built-in tools (get_current_time) plus any user tools in
+      ~/.config/qchat/tools/*.py; /tools lists/toggles. MCP support planned.
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
@@ -168,6 +170,99 @@ def chat_system():
     """Fresh chat system message from the template, or None if it renders empty."""
     s = system_prompt()
     return {"role": "system", "content": s} if s else None
+
+
+# --- tool framework --------------------------------------------------------------
+# A Tool = name + description + JSON-Schema parameters + run(args:dict) -> str. Built-ins
+# register below; user tools auto-load from ~/.config/qchat/tools/*.py (each file defines
+# TOOL, a dict, or TOOLS, a list of them). MCP tools will register the same way later.
+# Tools ride the OpenAI tools/tool_calls protocol, which every seat accepts (local + SAINT).
+_TOOLS_DIR = os.path.expanduser("~/.config/qchat/tools")
+TOOLS = {}            # name -> Tool
+TOOLS_ON = True       # set from settings at REPL start; /tools toggles + persists
+MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't spin forever
+
+
+class Tool:
+    def __init__(self, name, description, parameters, run, source="built-in"):
+        self.name, self.description = name, description
+        self.parameters, self.run, self.source = parameters, run, source
+
+    def schema(self):
+        return {"type": "function", "function": {
+            "name": self.name, "description": self.description, "parameters": self.parameters}}
+
+
+def register(tool):
+    TOOLS[tool.name] = tool
+    return tool
+
+
+def active_tools():
+    """Tool schemas to send with a chat request, or None when tools are off/empty."""
+    return [t.schema() for t in TOOLS.values()] if TOOLS_ON and TOOLS else None
+
+
+def run_tool_call(tc):
+    """Execute one OpenAI tool_call dict; always returns a string (the tool result)."""
+    fn = tc.get("function") or {}
+    name = fn.get("name")
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except Exception:
+        args = {}
+    tool = TOOLS.get(name)
+    if tool is None:
+        return f"Error: no such tool {name!r}"
+    try:
+        return str(tool.run(args))
+    except Exception as e:
+        return f"Error running {name}: {e}"
+
+
+def load_user_tools():
+    import glob, importlib.util
+    for path in sorted(glob.glob(os.path.join(_TOOLS_DIR, "*.py"))):
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "qchat_tool_" + os.path.basename(path)[:-3], path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            defs = getattr(mod, "TOOLS", None)
+            if defs is None and hasattr(mod, "TOOL"):
+                defs = [mod.TOOL]
+            for d in defs or []:
+                register(Tool(d["name"], d["description"],
+                              d.get("parameters", {"type": "object", "properties": {}}),
+                              d["run"], source=os.path.basename(path)))
+        except Exception as e:
+            print(f"{DIM}(tool load failed: {os.path.basename(path)}: {e}){RESET}")
+
+
+def _tool_current_time(args):
+    tzname = (args or {}).get("timezone")
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(tzname)).strftime("%A, %Y-%m-%d %H:%M:%S %Z (%z)")
+        except Exception:
+            local = datetime.now().astimezone().strftime("%A, %Y-%m-%d %H:%M:%S %Z (%z)")
+            return f"Unknown timezone {tzname!r}. Local time is {local}."
+    now = datetime.now().astimezone()
+    loc = os.environ.get("QCHAT_LOCATION") or load_settings().get("location")
+    s = now.strftime("%A, %Y-%m-%d %H:%M:%S %Z (%z)")
+    return s + (f" (user location: {loc})" if loc else "")
+
+
+register(Tool(
+    "get_current_time",
+    "Get the current date and time. Defaults to the user's local timezone; pass an IANA "
+    "timezone name (e.g. 'America/New_York', 'UTC', 'Asia/Tokyo') for the time there.",
+    {"type": "object",
+     "properties": {"timezone": {
+         "type": "string", "description": "IANA timezone name; omit for local time"}},
+     "required": []},
+    _tool_current_time))
 
 # --- catastrophic-command denylist: hard-blocked even in --auto, no LLM involved.
 _DENY = [
@@ -471,19 +566,24 @@ def _collapse_think(think_buf, t0):
     sys.stdout.write(f"\r\033[J{summary}\n")   # wipe region, drop the summary
 
 
-def stream(messages, think_store, model=None, base=None):
+def stream(messages, think_store, model=None, base=None, tools=None):
+    """Stream one assistant response. Returns (text, tool_calls) — tool_calls is the
+    OpenAI-shaped list (possibly empty) accumulated from the stream's deltas."""
     model, base = model or MODEL, base or BASE
     sysmsg = chat_system()            # user template (date/location tokens), fresh, not stored
     if sysmsg and SAINT_SENTINEL in sysmsg["content"] and not _is_saint(base):
         # only SAINT relocates the volatile section; on a direct seat, inline it (drop marker)
         sysmsg = {**sysmsg, "content": sysmsg["content"].replace(SAINT_SENTINEL, "").strip()}
     msgs = ([sysmsg] if sysmsg else []) + messages
-    body = json.dumps({"model": model, "messages": msgs, "max_tokens": 8192, "stream": True}).encode()
+    payload = {"model": model, "messages": msgs, "max_tokens": 8192, "stream": True}
+    if tools:
+        payload["tools"] = tools
+    body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
     if SESSION:
         headers["x-session-id"] = SESSION
     req = urllib.request.Request(f"{base}/chat/completions", body, headers)
-    reply, think_buf, phase, t0 = [], [], "start", None
+    reply, think_buf, phase, t0, tool_acc = [], [], "start", None, {}
     md = MDRender()
     import select as _sel
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
@@ -529,6 +629,16 @@ def stream(messages, think_store, model=None, base=None):
                         _collapse_think(think_buf, t0)
                     phase = "content"
                     reply.append(c); md.feed(c)
+                for tc in delta.get("tool_calls") or []:   # deltas: id/name once, args in pieces
+                    acc = tool_acc.setdefault(tc.get("index", 0),
+                                              {"id": None, "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        acc["id"] = tc["id"]
+                    fnd = tc.get("function") or {}
+                    if fnd.get("name"):
+                        acc["name"] += fnd["name"]
+                    if fnd.get("arguments"):
+                        acc["arguments"] += fnd["arguments"]
     finally:
         if old_tty is not None:
             import termios
@@ -538,7 +648,12 @@ def stream(messages, think_store, model=None, base=None):
     print()
     if think_buf:
         think_store.append("".join(think_buf))
-    return "".join(reply)
+    tool_calls = [
+        {"id": a["id"] or f"call_{i}", "type": "function",
+         "function": {"name": a["name"], "arguments": a["arguments"] or "{}"}}
+        for i, a in sorted(tool_acc.items())
+    ]
+    return "".join(reply), tool_calls
 
 
 def _pick(labels, start):
@@ -751,22 +866,47 @@ def code_blocks(text):
     return blocks
 
 
+def _fmt_args(s):
+    try:
+        return json.dumps(json.loads(s or "{}"), separators=(",", ":"))
+    except Exception:
+        return s or "{}"
+
+
 def _turn(history, thinks, user, model=None, base=None):
+    base_len = len(history)                       # roll back the whole turn on abort/error
     history.append({"role": "user", "content": user})
     try:
-        history.append({"role": "assistant", "content": stream(history, thinks, model=model, base=base)})
+        tools = active_tools()
+        for _ in range(MAX_TOOL_ROUNDS):
+            text, tcs = stream(history, thinks, model=model, base=base, tools=tools)
+            msg = {"role": "assistant", "content": text}
+            if tcs:
+                msg["tool_calls"] = tcs
+            history.append(msg)
+            if not tcs:                            # plain answer → turn is done
+                return
+            for tc in tcs:                         # run each call, feed results back
+                fn = tc.get("function") or {}
+                print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}")
+                out = run_tool_call(tc)
+                print(f"{DIM}  → {out if len(out) <= 300 else out[:300] + '…'}{RESET}")
+                history.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
+        print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
     except KeyboardInterrupt:
-        print(f"{RESET}\n(interrupted)"); history.pop()
+        print(f"{RESET}\n(interrupted)"); del history[base_len:]
     except Exception as e:
-        print(f"[error: {e}]"); history.pop()
+        print(f"[error: {e}]"); del history[base_len:]
 
 
 def repl():
-    global SESSION
+    global SESSION, TOOLS_ON
+    TOOLS_ON = load_settings().get("tools", True)
+    load_user_tools()
     history, thinks = [], []
     SESSION = "qchat-" + os.urandom(6).hex()
     print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
-          f"/models /system /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /system /tools /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     while True:
         print()  # blank line before each prompt
         try:
@@ -804,6 +944,18 @@ def repl():
             models_menu(); continue
         if user in ("/think", "/expand"):
             print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
+            continue
+        if user == "/tools" or user.startswith("/tools "):
+            arg = user[len("/tools"):].strip().lower()
+            if arg in ("on", "off"):
+                TOOLS_ON = (arg == "on")
+                st = load_settings(); st["tools"] = TOOLS_ON; save_settings(st)
+                print(f"(tools {'on' if TOOLS_ON else 'off'})")
+            else:
+                print(f"{DIM}tools {'ON' if TOOLS_ON else 'OFF'} · {len(TOOLS)} available · "
+                      f"/tools on|off · add your own in {_TOOLS_DIR}/*.py{RESET}")
+                for t in TOOLS.values():
+                    print(f"{DIM}  {t.name:<18} [{t.source}]  {t.description[:52]}{RESET}")
             continue
         if user == "/system" or user.startswith("/system "):
             arg = user[len("/system"):].strip()
