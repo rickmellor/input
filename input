@@ -1548,11 +1548,13 @@ def _seat_extra(n):
     bits = []
     if ctx:
         bits.append(f"{ctx // 1000}k ctx")
+    # One comparable unit for every seat: $/Mtok output. Local = electricity (FREE of API
+    # charge but real power); cloud = the output price. Same axis → easy visual comparison.
     if meta.get("kind") == "local":
         elec = meta.get("elec_per_mtok")
-        bits.append(f"FREE · ~${elec}/Mtok elec" if elec else "FREE")
-    elif meta.get("price_in"):
-        bits.append(f"${meta['price_in']}/${meta.get('price_out')}")
+        bits.append(f"FREE · ~${elec:.2f}/Mtok" if elec else "FREE")
+    elif meta.get("price_out") is not None:
+        bits.append(f"${meta['price_out']:.2f}/Mtok")
     return f"  {DIM}· {' · '.join(bits)}{RESET}" if bits else ""
 
 
