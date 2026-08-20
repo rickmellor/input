@@ -286,16 +286,17 @@ def _confirm():
 
 
 def _gate_reviewer(cmd):
-    """Unrestricted mode: a reviewer model gates and YOU are never prompted. The catastrophic
-    denylist and high/critical risk are blocked; everything else auto-runs. If the reviewer is
-    unreachable, auto-run (the unrestricted contract) — the denylist still hard-blocks."""
+    """Unrestricted mode: a reviewer model gates and YOU are never prompted. Only the
+    catastrophic denylist and `critical` risk are blocked; everything else (high and below)
+    auto-runs. If the reviewer is unreachable, auto-run (the unrestricted contract) — the
+    denylist still hard-blocks."""
     if cmd and danger(cmd):
         print(f"{RED}  ⚠ reviewer: catastrophic pattern — blocked{RESET}")
         return False
     if cmd:
         v = review(cmd)
-        if v and v[0] in ("high", "critical"):
-            print(f"{RED}  reviewer: {v[0]} risk — blocked ({v[1]}){RESET}")
+        if v and v[0] == "critical":
+            print(f"{RED}  reviewer: critical risk — blocked ({v[1]}){RESET}")
             return False
         print(f"{DIM}  reviewer: {v[0] + ' risk' if v else 'unrated'} — auto-run{RESET}")
     return True
