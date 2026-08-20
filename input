@@ -354,7 +354,35 @@ def execute_tool(tc):
         cmd = args.get("command") if isinstance(args, dict) else None
         if not _gate(tool.confirm, cmd):
             return "Declined by the user; not run."
-    return run_tool_call(tc)
+    out = run_tool_call(tc)
+    _note_saved(tc, out)
+    return out
+
+
+_JUST_SAVED = ""   # plan id from the most recent successful megaplan save/update this turn
+
+
+def _note_saved(tc, out):
+    """If this call created/updated a plan, remember its id so the REPL can offer to build."""
+    global _JUST_SAVED
+    fn = tc.get("function") or {}
+    if fn.get("name") != "megaplan":
+        return
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+        if (args.get("action") or "").lower() not in ("save", "update"):
+            return
+        d = json.loads(out) if isinstance(out, str) else out
+    except Exception:
+        return
+    if isinstance(d, dict) and d.get("id") and "error" not in d:
+        _JUST_SAVED = d["id"]
+
+
+def _take_saved():
+    global _JUST_SAVED
+    v, _JUST_SAVED = _JUST_SAVED, ""
+    return v
 
 
 def load_user_tools():
@@ -1767,6 +1795,37 @@ def repl():
     apply_tools_state()                               # restore per-tool on/off from settings
     history, thinks = [], []
     stats = Stats()
+
+    def _enter_build(pid, kickoff=True):          # load a plan and drop into BUILD mode
+        global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
+        p = megaplan_call("get", id=pid)
+        if isinstance(p, dict) and "error" in p:
+            print(f"{DIM}megaplan: {p['error']}{RESET}"); return False
+        if PERM_MODE == "plan":                   # leave authoring; keep gating otherwise
+            PERM_MODE = "cautious"
+        PLAN_GOAL, PLAN_ID, BUILD_ID = "", pid, pid
+        plan_render(p)
+        print(f"{DIM}● BUILD mode — executing {pid}   ({PERM_MODE}; Shift+Tab to change · "
+              f"/build off to stop){RESET}")
+        if kickoff:
+            seed = (f"Build MegaPlan '{pid}'. Here is the plan:\n\n{p.get('body', '')}\n\n"
+                    f"Start with the first actionable task (dependencies satisfied): do the work, "
+                    f"then mark it complete via megaplan. Proceed.")
+            _turn(history, thinks, seed, stats)
+            print(_status_line(stats))
+        return True
+
+    def _offer_build():                           # after a save, offer the one-key handoff
+        pid = _take_saved()
+        if not pid or BUILD_ID:                   # nothing saved, or already building
+            return
+        try:
+            ans = input(f"{DIM}▸ build {pid} now? [y/N]: {RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans in ("y", "yes"):
+            _enter_build(pid)
+
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · Shift+Tab cycles mode · "
           f"/models /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
@@ -1835,20 +1894,7 @@ def repl():
             pid = arg or PLAN_ID or plan_pick("build")   # explicit id, the loaded plan, or pick
             if not pid:
                 print(f"{DIM}usage: /build <id>  (or /plan load one first){RESET}"); continue
-            p = megaplan_call("get", id=pid)
-            if isinstance(p, dict) and "error" in p:
-                print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
-            if PERM_MODE == "plan":                      # leave authoring; keep gating otherwise
-                PERM_MODE = "cautious"
-            PLAN_GOAL, PLAN_ID, BUILD_ID = "", pid, pid
-            plan_render(p)
-            print(f"{DIM}● BUILD mode — executing {pid}   ({PERM_MODE}; Shift+Tab to change · "
-                  f"/build off to stop){RESET}")
-            seed = (f"Build MegaPlan '{pid}'. Here is the plan:\n\n{p.get('body', '')}\n\n"
-                    f"Start with the first actionable task (dependencies satisfied): do the work, "
-                    f"then mark it complete via megaplan. Proceed.")
-            _turn(history, thinks, seed, stats)
-            print(_status_line(stats))
+            _enter_build(pid)
             continue
         if user in ("/models", "/model"):
             models_menu(); continue
@@ -2022,6 +2068,7 @@ def repl():
                           f"megaplan(action=\"save\"{idarg}, …) call — the whole plan incl. a "
                           f"## Tasks checklist in the body — then report the plan id.", stats)
                     print(_status_line(stats))
+                    _offer_build()                 # one-key handoff: build it now?
             elif sub in ("close", "off", "done", "stop", "exit"):
                 PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
                 print(f"{DIM}plan mode off{RESET}")
@@ -2065,6 +2112,7 @@ def repl():
             print("(history cleared)"); continue
         _turn(history, thinks, user, stats)
         print(_status_line(stats))
+        _offer_build()                             # if the model just saved a plan, offer to build it
 
 
 # --- arg parsing ----------------------------------------------------------------
