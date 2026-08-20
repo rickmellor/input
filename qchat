@@ -16,7 +16,8 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       reply's code blocks (^D or /quit to exit); /models switches seat. Every request
       is grounded with the current date/time (+ location if /location or settings set).
       Tools: the model can call built-in tools (get_current_time) plus any user tools in
-      ~/.config/qchat/tools/*.py; /tools lists/toggles. MCP support planned.
+      ~/.config/qchat/tools/*.py; /tools opens an arrow-key per-tool on/off menu
+      (/tools on|off is the master switch). MCP support planned.
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
@@ -187,6 +188,7 @@ class Tool:
     def __init__(self, name, description, parameters, run, source="built-in"):
         self.name, self.description = name, description
         self.parameters, self.run, self.source = parameters, run, source
+        self.enabled = True           # per-tool on/off (settings 'tools_disabled'); /tools menu
 
     def schema(self):
         return {"type": "function", "function": {
@@ -199,8 +201,10 @@ def register(tool):
 
 
 def active_tools():
-    """Tool schemas to send with a chat request, or None when tools are off/empty."""
-    return [t.schema() for t in TOOLS.values()] if TOOLS_ON and TOOLS else None
+    """Enabled tool schemas to send with a chat request, or None when off/none enabled."""
+    if not TOOLS_ON:
+        return None
+    return [t.schema() for t in TOOLS.values() if t.enabled] or None
 
 
 def run_tool_call(tc):
@@ -755,6 +759,72 @@ def choose_seat():
     return names[res[0]] if res else None
 
 
+def tools_menu():
+    """Per-tool on/off. ↑/↓ or j/k move; space/enter toggle; a/n all/none; q/esc close.
+    Persists the disabled set to settings so it survives restarts."""
+    names = list(TOOLS)
+    if not names:
+        print("(no tools registered)")
+        return
+    if not sys.stdin.isatty():                    # piped: just show state, can't toggle
+        for n in names:
+            print(f"  {'[x]' if TOOLS[n].enabled else '[ ]'} {n}  [{TOOLS[n].source}]")
+        return
+    import select, termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sel = 0
+    off = f"  {DIM}(tools globally OFF — /tools on){RESET}" if not TOOLS_ON else ""
+    print(f"{DIM}↑/↓ move · space/enter toggle · a all · n none · q done{RESET}{off}")
+
+    def draw(first=False):
+        if not first:
+            sys.stdout.write(f"\033[{len(names)}A")
+        for i, n in enumerate(names):
+            t = TOOLS[n]
+            box = f"{CODE_FG}[x]{RESET}" if t.enabled else f"{DIM}[ ]{RESET}"
+            cur = f"{BOLD}❯{RESET} " if i == sel else "  "
+            sys.stdout.write(f"\r\033[K{cur}{box} {n:<18}{DIM}[{t.source}]  "
+                             f"{t.description[:42]}{RESET}\r\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        draw(first=True)
+        while True:
+            ch = os.read(fd, 1)
+            if ch in (b"q", b"\x03"):
+                break
+            if ch in (b" ", b"\r", b"\n"):
+                TOOLS[names[sel]].enabled = not TOOLS[names[sel]].enabled; draw()
+            elif ch in (b"a", b"A"):
+                for n in names: TOOLS[n].enabled = True
+                draw()
+            elif ch in (b"n", b"N"):
+                for n in names: TOOLS[n].enabled = False
+                draw()
+            elif ch in (b"j", b"J"):
+                sel = (sel + 1) % len(names); draw()
+            elif ch in (b"k", b"K"):
+                sel = (sel - 1) % len(names); draw()
+            elif ch == b"\x1b":
+                if select.select([fd], [], [], 0.05)[0]:
+                    seq = os.read(fd, 2)
+                    if seq == b"[A":
+                        sel = (sel - 1) % len(names); draw()
+                    elif seq == b"[B":
+                        sel = (sel + 1) % len(names); draw()
+                else:
+                    break                          # bare Esc closes
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    st = load_settings()
+    st["tools_disabled"] = [n for n in names if not TOOLS[n].enabled]
+    save_settings(st)
+    on = sum(TOOLS[n].enabled for n in names)
+    print(f"{DIM}→ {on}/{len(names)} tools enabled{RESET}")
+
+
 def active_name():
     return next((n for n, (m, b) in SEATS.items() if (m, b) == (MODEL, BASE)), MODEL)
 
@@ -901,8 +971,12 @@ def _turn(history, thinks, user, model=None, base=None):
 
 def repl():
     global SESSION, TOOLS_ON
-    TOOLS_ON = load_settings().get("tools", True)
+    _st = load_settings()
+    TOOLS_ON = _st.get("tools", True)
     load_user_tools()
+    _disabled = set(_st.get("tools_disabled", []))   # restore per-tool state
+    for _n, _t in TOOLS.items():
+        _t.enabled = _n not in _disabled
     history, thinks = [], []
     SESSION = "qchat-" + os.urandom(6).hex()
     print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
@@ -952,10 +1026,7 @@ def repl():
                 st = load_settings(); st["tools"] = TOOLS_ON; save_settings(st)
                 print(f"(tools {'on' if TOOLS_ON else 'off'})")
             else:
-                print(f"{DIM}tools {'ON' if TOOLS_ON else 'OFF'} · {len(TOOLS)} available · "
-                      f"/tools on|off · add your own in {_TOOLS_DIR}/*.py{RESET}")
-                for t in TOOLS.values():
-                    print(f"{DIM}  {t.name:<18} [{t.source}]  {t.description[:52]}{RESET}")
+                tools_menu()                       # arrow-key per-tool on/off picker
             continue
         if user == "/system" or user.startswith("/system "):
             arg = user[len("/system"):].strip()
