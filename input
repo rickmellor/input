@@ -487,8 +487,44 @@ def _mode_hint(m):
 # that requires a human decision, a destructive/irreversible step, or repeated tool failure.
 # Then the thread parks in `blocked` with a PRECISE need (resumable), never silently quits.
 GOAL = ""              # the session's exit criteria ("" = none)
+GOAL_SEAT = ""         # seat the goal loop is pinned to (set when the goal is HARD; "" = active seat)
 GOAL_BLOCKED = ""      # the precise need when the session is hard-blocked ("" = not blocked)
 GOAL_MAX_NUDGES = 4    # per turn: how many times we push the model back to work before pausing
+
+
+def reasoning_seat():
+    """The capable seat agentic HARD reasoning escalates to (settings `reasoning_seat`).
+    Hard reasoning doesn't belong on weak local models — the goal/task's contract (GOAL MET /
+    BLOCKED) and multi-step planning need a strong model; trivial/medium work stays on
+    saint-auto (routed cheaply)."""
+    s = load_settings().get("reasoning_seat") or "cloud-medium"   # Sonnet: honors the contract, mid-cost
+    return s if s in SEATS else "saint"
+
+
+def classify_complexity(text):
+    """Ask SAINT to classify `text` (one throwaway token; SAINT caches). Returns
+    (domain, complexity) e.g. ('code','hard'), or ('','') if SAINT is unreachable."""
+    try:
+        req = urllib.request.Request(
+            SAINT_BASE + "/chat/completions",
+            json.dumps({"model": "saint-auto", "max_tokens": 1,
+                        "messages": [{"role": "user", "content": (text or "")[:2000]}]}).encode(),
+            {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
+    except Exception:
+        return "", ""
+
+
+def agentic_seat(task, pinned=None, default="saint"):
+    """Resolve the seat for agentic work: an explicit pin wins; else classify the task once —
+    HARD → reasoning_seat() (capable), otherwise `default` (saint-auto routes per turn). The
+    task's difficulty is judged from the WHOLE brief, not the trivial per-turn nudges, so a
+    hard goal/job stays on a strong model for its whole loop."""
+    if pinned:
+        return pinned
+    _, cx = classify_complexity(task)
+    return reasoning_seat() if cx == "hard" else default
 _GOAL_DIRECTIVE = (
     "SESSION GOAL (exit criteria): {goal}\n"
     "Work toward this goal persistently across turns until the exit criteria are genuinely met — "
@@ -846,8 +882,10 @@ def _tool_spawn_agent(args):
     cwd = os.path.abspath(a.get("cwd") or os.getcwd())
     write = bool(a.get("write"))
     budget = int(a.get("budget_tokens") or 200_000)
-    # model: explicit pin > skill's declared seat > saint-auto (SAINT routes by difficulty)
+    # model: explicit pin > skill's declared seat > (classify the brief) hard→reasoning_seat, else saint-auto
     model = (a.get("model") or "").strip() or (SKILLS.get(skill, {}).get("seat") or "")
+    if not model:
+        model = agentic_seat(task)
     m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
     system = _subagent_system(cwd, skill)
     sb = Sandbox(root=cwd, allow=(SANDBOX_DEV if write else SANDBOX_READONLY))
@@ -2703,7 +2741,11 @@ def run_job(jid):
             history = json.load(open(hp))
         except Exception:
             history = []
-    mo, bo = _resolve_seat(m.get("model")) or SEATS.get("saint") or (MODEL, BASE)
+    # model: explicit pin from submit > (classify goal) hard→reasoning_seat, else saint-auto.
+    # build jobs are inherently multi-step reasoning → always the capable seat.
+    pin = m.get("model") if m.get("model") not in (None, "", "saint") else None
+    seat = pin or (reasoning_seat() if m.get("kind") == "build" else agentic_seat(goal))
+    mo, bo = _resolve_seat(seat) or SEATS.get("saint") or (MODEL, BASE)
     _write_meta(jid, state="running", started=m.get("started") or time.time(),
                 pid=os.getpid(), last_activity=time.time())
     logline("start", goal=goal, model=mo)
@@ -2813,6 +2855,8 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         GOAL_BLOCKED = ""
     tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
     terminate = goal_terminate(GOAL, GOAL_MAX_NUDGES) if GOAL else None
+    if GOAL and GOAL_SEAT and GOAL_SEAT in SEATS and (model, base) == (None, None):
+        model, base = SEATS[GOAL_SEAT]         # hard goal → pin the loop to the capable seat
     try:
         res = run_thread(user, history=history, tools=tools, model=model, base=base, quiet=False,
                          stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True,
@@ -2834,7 +2878,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
 
 
 def repl():
-    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, GOAL, GOAL_BLOCKED
+    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, GOAL, GOAL_SEAT, GOAL_BLOCKED
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
@@ -3060,7 +3104,7 @@ def repl():
         if user == "/goal" or user.startswith("/goal "):
             arg = user[len("/goal"):].strip()
             if arg.lower() in ("off", "clear", "done"):
-                GOAL, GOAL_BLOCKED = "", ""
+                GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
                 print(f"{DIM}goal cleared{RESET}")
             elif arg.lower().startswith("answer "):
                 if not GOAL_BLOCKED:
@@ -3069,7 +3113,11 @@ def repl():
                     _turn(history, thinks, arg[7:].strip(), stats); print(_status_line(stats))
             elif arg:
                 GOAL, GOAL_BLOCKED = arg, ""
+                dom, cx = classify_complexity(arg)      # hard reasoning → capable seat for the loop
+                GOAL_SEAT = reasoning_seat() if cx == "hard" else ""
                 print(f"{DIM}● goal set — the agent will work toward it until met or hard-blocked:\n  {arg}{RESET}")
+                if GOAL_SEAT:
+                    print(f"{DIM}  ({dom}/{cx} → running the goal loop on {GOAL_SEAT}; hard reasoning off weak seats){RESET}")
                 print(f"{DIM}  (it ends with `GOAL MET: <evidence>` or `BLOCKED: <need>`; /goal off clears){RESET}")
             else:
                 if GOAL:
