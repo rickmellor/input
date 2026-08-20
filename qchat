@@ -280,10 +280,16 @@ def _prose(line):
 
 
 class MDRender:
-    """Line-buffered streaming renderer: prose formatted, ```fenced``` blocks boxed + numbered."""
+    """Line-buffered streaming renderer: prose formatted; ```fenced``` blocks stream
+    plain (top border + gutter, live) then redraw boxed + line-numbered on close, so a
+    long code generation shows progress instead of a frozen gap while it buffers."""
     def __init__(self):
         self.tty = sys.stdout.isatty()
         self.buf, self.in_code, self.lang, self.code = "", False, "", []
+        self.plain_rows = 0                   # terminal rows drawn for the in-progress block
+
+    def _cols(self):
+        return shutil.get_terminal_size((80, 24)).columns
 
     def feed(self, text):
         if not self.tty:                      # piped: keep it raw
@@ -297,19 +303,42 @@ class MDRender:
         if line.lstrip().startswith("```"):
             if not self.in_code:
                 self.in_code, self.lang, self.code = True, line.lstrip()[3:].strip(), []
+                self._open()
             else:
                 self._flush(); self.in_code = False
             return
-        (self.code.append(line) if self.in_code else print(_prose(line)))
+        if self.in_code:
+            self.code.append(line); self._stream_code(line)
+        else:
+            print(_prose(line))
+
+    def _open(self):
+        """Provisional top border so a streaming code block is visible immediately."""
+        lang = self.lang or "code"
+        inner = max(10, min(self._cols(), 80) - 2)
+        sys.stdout.write(f"{DIM}┌─ {lang} " + "─" * max(0, inner - len(lang) - 3) + f"{RESET}\n")
+        sys.stdout.flush()
+        self.plain_rows = 1
+
+    def _stream_code(self, cl):
+        """Print one code line live, plain (no number — count isn't known yet)."""
+        sys.stdout.write(f"{DIM}│{RESET} {cl}\n"); sys.stdout.flush()
+        self.plain_rows += max(1, math.ceil(len("│ " + cl) / self._cols()))
 
     def _flush(self):
-        lang = self.lang or "code"
-        inner = max(10, min(shutil.get_terminal_size((80, 24)).columns, 80) - 2)
-        numw = max(2, len(str(len(self.code))))
-        print(f"{DIM}┌─ {lang} " + "─" * max(0, inner - len(lang) - 3) + RESET)
-        for i, cl in enumerate(self.code, 1):
-            print(f"{DIM}{str(i).rjust(numw)} │{RESET} {cl}")
-        print(f"{DIM}└" + "─" * inner + RESET)
+        rows, self.plain_rows = self.plain_rows, 0
+        inner = max(10, min(self._cols(), 80) - 2)
+        height = shutil.get_terminal_size((80, 24)).lines
+        if rows and rows < height - 1:        # safe to erase the plain stream and redraw
+            sys.stdout.write(f"\033[{rows}A\r\033[J")
+            lang = self.lang or "code"
+            numw = max(2, len(str(len(self.code))))
+            print(f"{DIM}┌─ {lang} " + "─" * max(0, inner - len(lang) - 3) + RESET)
+            for i, cl in enumerate(self.code, 1):
+                print(f"{DIM}{str(i).rjust(numw)} │{RESET} {cl}")
+            print(f"{DIM}└" + "─" * inner + RESET)
+        else:                                 # taller than the viewport — keep the plain
+            print(f"{DIM}└" + "─" * inner + RESET)  # stream, just close the box (no numbers)
 
     def finalize(self):
         if not self.tty:
@@ -318,7 +347,7 @@ class MDRender:
             if self.buf.lstrip().startswith("```"):   # trailing close fence, no newline
                 self.buf = ""
             elif self.in_code:
-                self.code.append(self.buf); self.buf = ""
+                self.code.append(self.buf); self._stream_code(self.buf); self.buf = ""
             else:
                 print(_prose(self.buf), end=""); self.buf = ""
         if self.in_code:
