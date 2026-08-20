@@ -30,7 +30,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       inspects the stored profile, recent history, knowledge, and pages.
 Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
-import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request, urllib.parse
+import json, math, os, platform, re, shutil, subprocess, sys, threading, time, urllib.request, urllib.parse
 from datetime import datetime
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
@@ -1219,7 +1219,72 @@ class MCPClient:
                          if c.get("type") == "text")
 
 
-_MCP_CLIENTS = {}      # url -> connected MCPClient (shared pool)
+class StdioMCPClient:
+    """MCP over stdio: spawn the server process and speak newline-delimited JSON-RPC on its
+    stdin/stdout (the MCP stdio transport; what `claude mcp add <name> -- <cmd>` registers
+    and what most local servers, e.g. aco's `python -m aco.mcp`, implement). Same
+    connect()/call()/tools surface as the HTTP client."""
+
+    def __init__(self, command, cwd=None, env=None, timeout=600):
+        self.command = list(command)
+        self.cwd = os.path.expanduser(cwd) if cwd else None
+        self.env = {**os.environ, **{k: str(v) for k, v in (env or {}).items()}}
+        self.timeout, self.tools, self.proc = timeout, [], None
+        self._lock = threading.Lock()
+
+    def _start(self):
+        if self.proc is None or self.proc.poll() is not None:
+            self.proc = subprocess.Popen(self.command, cwd=self.cwd, env=self.env,
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
+
+    def _rpc(self, method, params=None, notify=False):
+        self._start()
+        p = {"jsonrpc": "2.0", "method": method}
+        if not notify:
+            p["id"] = os.urandom(8).hex()
+        if params is not None:
+            p["params"] = params
+        with self._lock:
+            self.proc.stdin.write(json.dumps(p) + "\n"); self.proc.stdin.flush()
+            if notify:
+                return None
+            deadline = time.time() + self.timeout
+            while time.time() < deadline:
+                line = self.proc.stdout.readline()
+                if not line:
+                    raise RuntimeError(f"mcp server exited: {self.command[0]}")
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue                       # non-protocol chatter on stdout
+                if o.get("id") == p["id"]:
+                    return o
+            raise RuntimeError("mcp stdio timeout")
+
+    def connect(self):
+        init = self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                        "clientInfo": {"name": "input", "version": "2.1"}})
+        if not init or "result" not in init:
+            raise RuntimeError("initialize failed")
+        self._rpc("notifications/initialized", notify=True)
+        self.tools = (self._rpc("tools/list", {}) or {}).get("result", {}).get("tools", [])
+        return self
+
+    def call(self, name, arguments):
+        res = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        if not res or "result" not in res:
+            raise RuntimeError((res or {}).get("error", "call failed"))
+        return "\n".join(c.get("text", "") for c in res["result"].get("content", [])
+                         if c.get("type") == "text")
+
+
+def _server_key(s):
+    """Pool key for a server entry: its url (http) or its command line (stdio)."""
+    return s.get("url") or " ".join(s.get("command") or [])
+
+
+_MCP_CLIENTS = {}      # server key -> connected client (shared pool)
 
 
 def _norm_url(u):
@@ -1242,11 +1307,11 @@ def mcp_suppression(s, tool=None):
     Whole-server: claimed by a subsystem, or excluded by name/url via `mcp_exclude`.
     Per-tool: excluded via a `server:tool` entry. Matchers in `mcp_exclude` are any of
     '<server>', '<url>', or '<server>:<tool>'."""
-    claim = mcp_claims().get(_norm_url(s["url"]))
+    claim = mcp_claims().get(_norm_url(s.get("url", "")))
     if claim:
         return f"claimed by {claim}"
     ex = load_settings().get("mcp_exclude") or []
-    keys = {s["name"], _norm_url(s["url"])}
+    keys = {s["name"], _norm_url(_server_key(s))}
     if tool is not None:
         keys.add(f"{s['name']}:{tool}")
     return "excluded" if keys & set(ex) else ""
@@ -1257,28 +1322,51 @@ def mcp_servers():
     (mcp_servers); 'discovered' = scanned from ~/.claude.json. HTTP servers only (the
     client speaks streamable HTTP). Added take precedence over discovered on url clash."""
     seen, out = set(), []
+
+    def _add(name, cfg, source):
+        e = {"name": name, "source": source}
+        if cfg.get("url"):
+            e["url"] = cfg["url"]
+        elif cfg.get("command"):                  # stdio: command (+args), optional cwd/env
+            cmd = cfg["command"]
+            cmd = [cmd] if isinstance(cmd, str) else list(cmd)
+            e["command"] = cmd + [str(a) for a in (cfg.get("args") or [])]
+            if cfg.get("cwd"):
+                e["cwd"] = cfg["cwd"]
+            if cfg.get("env"):
+                e["env"] = dict(cfg["env"])
+        else:
+            return
+        k = _server_key(e)
+        if k in seen:
+            return
+        seen.add(k); out.append(e)
+
     for s in load_settings().get("mcp_servers", []):
-        if s.get("url") and s["url"] not in seen:
-            out.append({"name": s.get("name") or s["url"], "url": s["url"], "source": "added"})
-            seen.add(s["url"])
+        _add(s.get("name") or _server_key(s), s, "added")
     try:
         d = json.load(open(os.path.expanduser("~/.claude.json")))
         for name, cfg in (d.get("mcpServers") or {}).items():
-            u = cfg.get("url")
-            if u and cfg.get("type", "http") == "http" and u not in seen:
-                out.append({"name": name, "url": u, "source": "discovered"})
-                seen.add(u)
+            t = cfg.get("type") or ("stdio" if cfg.get("command") else "http")
+            if t in ("http", "stdio"):
+                _add(name, cfg, "discovered")
     except Exception:
         pass
     return out
 
 
-def mcp_client(url, timeout=5):
-    """Get/create a pooled MCP client for url (raises on connect failure)."""
-    c = _MCP_CLIENTS.get(url)
+def mcp_client(server, timeout=5):
+    """Get/create a pooled MCP client for a server entry (dict with url | command) or a
+    bare http url string (raises on connect failure)."""
+    s = {"url": server} if isinstance(server, str) else server
+    key = _server_key(s)
+    c = _MCP_CLIENTS.get(key)
     if c is None:
-        c = MCPClient(url, timeout=timeout).connect()
-        _MCP_CLIENTS[url] = c
+        if s.get("url"):
+            c = MCPClient(s["url"], timeout=timeout).connect()
+        else:
+            c = StdioMCPClient(s["command"], cwd=s.get("cwd"), env=s.get("env")).connect()
+        _MCP_CLIENTS[key] = c
     return c
 
 
@@ -1288,7 +1376,7 @@ def register_mcp_server(s):
     tools matched by an `mcp_exclude` `server:tool` entry are skipped."""
     if mcp_suppression(s):                         # whole server claimed or excluded
         return 0
-    client = mcp_client(s["url"])
+    client = mcp_client(s)
     n = 0
     for tdef in client.tools:
         tname = tdef["name"]
@@ -2323,22 +2411,31 @@ def repl():
         if user == "/mcp" or user.startswith("/mcp "):
             arg = user[len("/mcp"):].strip()
             if arg.startswith("add "):
+                # http:  /mcp add <name> <url>      stdio: /mcp add <name> -- <cmd> [args…]
                 parts = arg.split()
-                name, url = (parts[1], parts[2]) if len(parts) >= 3 else \
-                            (parts[1], parts[1]) if len(parts) == 2 else (None, None)
-                if not url:
-                    print("(usage: /mcp add <name> <url>)"); continue
-                st = load_settings(); st.setdefault("mcp_servers", []).append({"name": name, "url": url})
+                entry = None
+                if "--" in parts:
+                    i = parts.index("--")
+                    if len(parts) >= 2 and i >= 2 and parts[i + 1:]:
+                        entry = {"name": parts[1], "command": parts[i + 1:], "cwd": os.getcwd()}
+                elif len(parts) >= 3:
+                    entry = {"name": parts[1], "url": parts[2]}
+                elif len(parts) == 2:
+                    entry = {"name": parts[1], "url": parts[1]}
+                if not entry:
+                    print("(usage: /mcp add <name> <url>   |   /mcp add <name> -- <command> [args…])"); continue
+                st = load_settings(); st.setdefault("mcp_servers", []).append(entry)
                 save_settings(st)
-                why = mcp_suppression({"name": name, "url": url})
+                s = {**entry, "source": "added"}
+                why = mcp_suppression(s)
                 if why:
-                    print(f"{DIM}added mcp {name} — tools not exposed ({why}); /mcp show {name} to expose{RESET}")
+                    print(f"{DIM}added mcp {entry['name']} — tools not exposed ({why}); /mcp show {entry['name']} to expose{RESET}")
                 else:
                     try:
-                        n = register_mcp_server({"name": name, "url": url, "source": "added"})
-                        print(f"{DIM}added mcp {name}: {n} tools registered (disabled — /tools to enable){RESET}")
+                        n = register_mcp_server(s)
+                        print(f"{DIM}added mcp {entry['name']}: {n} tools registered (disabled — /tools to enable){RESET}")
                     except Exception as e:
-                        print(f"{DIM}added mcp {name}, but unreachable: {e}{RESET}")
+                        print(f"{DIM}added mcp {entry['name']}, but unreachable: {e}{RESET}")
             elif arg.startswith("hide ") or arg.startswith("show "):
                 op, m = arg[:4], arg[5:].strip()
                 if not m:
@@ -2362,13 +2459,14 @@ def repl():
                     if why:
                         status = why
                     else:
-                        c = _MCP_CLIENTS.get(s["url"])
+                        c = _MCP_CLIENTS.get(_server_key(s))
                         status = f"{len(c.tools)} tools" if c else "? tools"
-                    print(f"{DIM}  {s['name']:<14} {s['source']:<10} {status:<18} {s['url']}{RESET}")
+                    where = s.get("url") or ("stdio: " + " ".join(s.get("command") or []))
+                    print(f"{DIM}  {s['name']:<14} {s['source']:<10} {status:<18} {where}{RESET}")
                 ex = load_settings().get("mcp_exclude") or []
                 if ex:
                     print(f"{DIM}  excluded: {', '.join(ex)}{RESET}")
-                print(f"{DIM}  /mcp add <name> <url> · /mcp hide|show <server[:tool]>{RESET}")
+                print(f"{DIM}  /mcp add <name> <url> · /mcp add <name> -- <cmd…> · /mcp hide|show <server[:tool]>{RESET}")
             continue
         if user == "/memory" or user.startswith("/memory "):
             arg = user[len("/memory"):].strip()
