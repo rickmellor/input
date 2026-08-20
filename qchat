@@ -11,9 +11,12 @@ Goal agent: qchat --goal <task>   iterate: propose→confirm→run→observe→n
 Bare -e/-x/--goal/--auto with no words prompts for the task (no shell quoting).
 
 Seats: gemma (chat default) | coder (command/goal default) | qwen38 (on-demand).
+REPL: reasoning streams live then collapses to one line (/think re-expands);
+      code blocks render boxed + line-numbered; ^C copies the last reply's code
+      blocks (^D or /quit to exit); /models switches seat.
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
-import json, os, platform, re, shutil, subprocess, sys, urllib.request
+import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
 SHELL = os.environ.get("SHELL", "/bin/bash")
@@ -100,11 +103,19 @@ def run(cmd, capture=False):
 
 
 def copy_clip(text):
-    for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
-        if shutil.which(tool[0]):
-            subprocess.run(tool, input=text.encode(), check=False)
-            return True
-    return False
+    # Prefer a local clipboard tool only when there's a local display; otherwise (e.g.
+    # over SSH) use OSC 52, which the terminal emulator puts on *your* clipboard.
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+        for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+            if shutil.which(tool[0]):
+                subprocess.run(tool, input=text.encode(), check=False)
+                return True
+    import base64
+    seq = "\033]52;c;" + base64.b64encode(text.encode()).decode() + "\a"
+    if os.environ.get("TMUX"):                       # tmux passthrough wrapper
+        seq = "\033Ptmux;\033" + seq + "\033\\"
+    sys.stdout.write(seq); sys.stdout.flush()
+    return True
 
 
 def _cmd_sys():
@@ -202,10 +213,73 @@ def goal_mode(task, auto=False):
 
 
 # --- chat REPL ------------------------------------------------------------------
-def stream(messages):
+class MDRender:
+    """Line-buffered streaming renderer: prose as-is, ```fenced``` blocks boxed + numbered."""
+    def __init__(self):
+        self.tty = sys.stdout.isatty()
+        self.buf, self.in_code, self.lang, self.code = "", False, "", []
+
+    def feed(self, text):
+        if not self.tty:                      # piped: keep it raw
+            sys.stdout.write(text); sys.stdout.flush(); return
+        self.buf += text
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            self._line(line)
+
+    def _line(self, line):
+        if line.lstrip().startswith("```"):
+            if not self.in_code:
+                self.in_code, self.lang, self.code = True, line.lstrip()[3:].strip(), []
+            else:
+                self._flush(); self.in_code = False
+            return
+        (self.code.append if self.in_code else print)(line)
+
+    def _flush(self):
+        lang = self.lang or "code"
+        inner = max(10, min(shutil.get_terminal_size((80, 24)).columns, 80) - 2)
+        numw = max(2, len(str(len(self.code))))
+        print(f"{DIM}┌─ {lang} " + "─" * max(0, inner - len(lang) - 3) + RESET)
+        for i, cl in enumerate(self.code, 1):
+            print(f"{DIM}{str(i).rjust(numw)} │{RESET} {cl}")
+        print(f"{DIM}└" + "─" * inner + RESET)
+
+    def finalize(self):
+        if not self.tty:
+            return
+        if self.buf:
+            if self.buf.lstrip().startswith("```"):   # trailing close fence, no newline
+                self.buf = ""
+            elif self.in_code:
+                self.code.append(self.buf); self.buf = ""
+            else:
+                print(self.buf, end=""); self.buf = ""
+        if self.in_code:
+            self._flush(); self.in_code = False
+
+
+def _collapse_think(think_buf, t0):
+    """Erase the live-streamed thinking block and leave a one-line summary."""
+    n = len("".join(think_buf))
+    summary = f"{DIM}▸ thought {time.monotonic() - t0:.1f}s, {n} chars · /think to expand{RESET}"
+    if not sys.stdout.isatty():           # piped: can't erase — just newline off the thinking
+        sys.stdout.write(f"{RESET}\n{summary}\n")
+        return
+    width = shutil.get_terminal_size((80, 24)).columns
+    visible = "[think] " + "".join(think_buf)
+    rows = sum(max(1, math.ceil(len(l) / width)) for l in visible.split("\n"))
+    sys.stdout.write(RESET)
+    if rows > 1:
+        sys.stdout.write(f"\033[{rows - 1}A")  # up to the block's first row
+    sys.stdout.write(f"\r\033[J{summary}\n")   # wipe region, drop the summary
+
+
+def stream(messages, think_store):
     body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": 8192, "stream": True}).encode()
     req = urllib.request.Request(f"{BASE}/chat/completions", body, {"Content-Type": "application/json"})
-    reply, thinking = [], False
+    reply, think_buf, phase, t0 = [], [], "start", None
+    md = MDRender()
     with urllib.request.urlopen(req, timeout=600) as r:
         saint_b = r.headers.get("x-saint-backend")  # only SAINT sets x-saint-*
         dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
@@ -225,17 +299,21 @@ def stream(messages):
             delta = chunk["choices"][0].get("delta") or {}
             rc = delta.get("reasoning_content") or delta.get("reasoning")
             if rc:
-                if not thinking:
-                    sys.stdout.write(f"{DIM}[think] "); thinking = True
+                if phase != "thinking":
+                    sys.stdout.write(f"{DIM}[think] "); phase, t0 = "thinking", time.monotonic()
                 sys.stdout.write(rc); sys.stdout.flush()
+                think_buf.append(rc)
             c = delta.get("content")
             if c:
-                if thinking:
-                    sys.stdout.write(f"{RESET}\n"); thinking = False
-                sys.stdout.write(c); sys.stdout.flush(); reply.append(c)
-    if thinking:
-        sys.stdout.write(RESET)
+                if phase == "thinking":
+                    _collapse_think(think_buf, t0)
+                phase = "content"
+                reply.append(c); md.feed(c)
+    md.finalize()
+    sys.stdout.write(RESET if phase == "thinking" else "")
     print()
+    if think_buf:
+        think_store.append("".join(think_buf))
     return "".join(reply)
 
 
@@ -306,23 +384,55 @@ def models_menu():
     print(f"→ {MODEL} @ {BASE}  (history carries over)")
 
 
+def code_blocks(text):
+    blocks, cur, in_code = [], [], False
+    for line in (text or "").split("\n"):
+        if line.lstrip().startswith("```"):
+            if in_code:
+                blocks.append("\n".join(cur)); cur, in_code = [], False
+            else:
+                in_code = True
+        elif in_code:
+            cur.append(line)
+    if in_code and cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+
 def repl():
-    history = []
-    print(f"qchat → {MODEL} @ {BASE}  (/models, /clear, /quit)")
+    history, thinks = [], []
+    print(f"qchat → {MODEL} @ {BASE}  (/models, /think, /clear, /quit · ^C copies code, ^D quits)")
     while True:
         try:
             user = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             break
+        except KeyboardInterrupt:
+            # ^C on the prompt: copy the last reply's code blocks (terminals that copy a
+            # mouse selection on ^C never deliver this — so selection-copy still wins).
+            last = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+            blocks = code_blocks(last)
+            if blocks and copy_clip("\n\n".join(blocks)):
+                print(f"\n(copied {len(blocks)} code block{'s' * (len(blocks) != 1)})")
+            elif blocks:
+                print("\n(no clipboard tool found)")
+            else:
+                print("\n(no code blocks — ^D or /quit to exit)")
+            continue
         if not user or user == "/quit":
             break
         if user in ("/models", "/model"):
             models_menu(); continue
+        if user in ("/think", "/expand"):
+            print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
+            continue
         if user == "/clear":
-            history.clear(); print("(history cleared)"); continue
+            history.clear(); thinks.clear(); print("(history cleared)"); continue
         history.append({"role": "user", "content": user})
         try:
-            history.append({"role": "assistant", "content": stream(history)})
+            history.append({"role": "assistant", "content": stream(history, thinks)})
+        except KeyboardInterrupt:
+            print(f"{RESET}\n(interrupted)"); history.pop()
         except Exception as e:
             print(f"[error: {e}]"); history.pop()
 
