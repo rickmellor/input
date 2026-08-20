@@ -160,7 +160,7 @@ def _seat_short(n):
 
 
 def _route_hint_lines():
-    """Two dim lines reminding you how to route the staged text (Ctrl+G peek)."""
+    """Two dim lines reminding you how to route the staged text (Ctrl+R peek)."""
     hk = sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:]))
     fn = "   ".join(f"{k.upper()} {_seat_short(v)}" for k, v in hk)
     return [f"{DIM}  ↵ send  ·  Ctrl+↵ seat picker  ·  Fn = one-shot this text to a seat:{RESET}",
@@ -1769,7 +1769,7 @@ def read_line(prompt):
                 del buf[:pos]; pos = 0; redraw()
             elif ch == b"\x0b":                        # Ctrl-K kill to end
                 del buf[pos:]; redraw()
-            elif ch == b"\x07":                        # Ctrl+G → peek routing shortcuts
+            elif ch == b"\x12":                        # Ctrl+R (route) → peek routing shortcuts
                 if buf:                                # only when there's staged text to route
                     sys.stdout.write("\r\n")
                     for ln in _route_hint_lines():
@@ -1964,7 +1964,7 @@ def repl():
             _enter_build(pid)
 
     SESSION = "input-" + os.urandom(6).hex()
-    print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^G routing hint · Shift+Tab cycles mode · "
+    print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
           f"/models /seats /system /tools /mcp /memory /mode /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
