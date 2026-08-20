@@ -15,9 +15,10 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       code blocks stream plain then redraw boxed + line-numbered; ^C copies the last
       reply's code blocks (^D or /quit to exit); /models switches seat. Every request
       is grounded with the current date/time (+ location if /location or settings set).
-      Tools: the model can call built-in tools (get_current_time) plus any user tools in
-      ~/.config/qchat/tools/*.py; /tools opens an arrow-key per-tool on/off menu
-      (/tools on|off is the master switch). MCP support planned.
+      Tools: the model can call built-ins (get_current_time; run_command runs shell
+      commands, gated by a gemma risk-review — none/low auto-run, riskier prompts) plus
+      user tools in ~/.config/qchat/tools/*.py; /tools opens an arrow-key per-tool on/off
+      menu (/tools on|off master switch). MCP support planned.
 Shell integration (! / !! prefixes, Ctrl-G): source qchat-shell.bash.
 """
 import json, math, os, platform, re, shutil, subprocess, sys, time, urllib.request
@@ -185,10 +186,11 @@ MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't
 
 
 class Tool:
-    def __init__(self, name, description, parameters, run, source="built-in"):
+    def __init__(self, name, description, parameters, run, source="built-in", confirm="never"):
         self.name, self.description = name, description
         self.parameters, self.run, self.source = parameters, run, source
         self.enabled = True           # per-tool on/off (settings 'tools_disabled'); /tools menu
+        self.confirm = confirm        # gate policy: "never" | "review" | "always" (see _gate)
 
     def schema(self):
         return {"type": "function", "function": {
@@ -224,6 +226,48 @@ def run_tool_call(tc):
         return f"Error running {name}: {e}"
 
 
+def _confirm():
+    try:
+        return input("  run? [y]es/[N]o: ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _gate(policy, cmd):
+    """Risk gate for a tool call; prints notes, prompts as needed. Returns True to proceed.
+    'review' rates a shell command via gemma (auto-run none/low, confirm the rest); the
+    catastrophic denylist always prompts; 'always' confirms every call."""
+    if cmd and danger(cmd):
+        print(f"{RED}  ⚠ matches a catastrophic pattern — review carefully{RESET}")
+        return _confirm()
+    if policy == "review" and cmd:
+        v = review(cmd)
+        if v and v[0] in ("none", "low"):
+            print(f"{DIM}  gemma: {v[0]} risk — auto-run{RESET}")
+            return True
+        if v:
+            print(f"{YEL}  gemma: {v[0]} risk — {v[1]}{RESET}")
+        else:
+            print(f"{YEL}  gemma review unavailable — confirm{RESET}")
+        return _confirm()
+    return _confirm()   # "always", or "review" with no command to rate
+
+
+def execute_tool(tc):
+    """Gate (per the tool's confirm policy) then run one tool call."""
+    fn = tc.get("function") or {}
+    tool = TOOLS.get(fn.get("name"))
+    if tool is not None and getattr(tool, "confirm", "never") != "never":
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {}
+        cmd = args.get("command") if isinstance(args, dict) else None
+        if not _gate(tool.confirm, cmd):
+            return "Declined by the user; not run."
+    return run_tool_call(tc)
+
+
 def load_user_tools():
     import glob, importlib.util
     for path in sorted(glob.glob(os.path.join(_TOOLS_DIR, "*.py"))):
@@ -238,7 +282,8 @@ def load_user_tools():
             for d in defs or []:
                 register(Tool(d["name"], d["description"],
                               d.get("parameters", {"type": "object", "properties": {}}),
-                              d["run"], source=os.path.basename(path)))
+                              d["run"], source=os.path.basename(path),
+                              confirm=d.get("confirm", "never")))
         except Exception as e:
             print(f"{DIM}(tool load failed: {os.path.basename(path)}: {e}){RESET}")
 
@@ -267,6 +312,39 @@ register(Tool(
          "type": "string", "description": "IANA timezone name; omit for local time"}},
      "required": []},
     _tool_current_time))
+
+
+def _tool_run_command(args):
+    cmd = ((args or {}).get("command") or "").strip()
+    if not cmd:
+        return "Error: no command given"
+    timeout = (args or {}).get("timeout")
+    try:
+        p = subprocess.run(cmd, shell=True, executable=SHELL, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {timeout}s"
+    except Exception as e:
+        return f"Failed to run: {e}"
+    out = ((p.stdout or "") + (p.stderr or "")).strip() or "(no output)"
+    if len(out) > 4000:
+        out = out[:4000] + f"\n… (truncated; {len(out)} chars total)"
+    return f"exit={p.returncode}\n{out}"
+
+
+register(Tool(
+    "run_command",
+    "Run a shell command on the user's machine (their default shell/OS) and return its "
+    "exit code plus combined stdout/stderr. Use for filesystem work (read/list/find/edit), "
+    "inspecting or running programs, git, network tools — anything the shell can do. "
+    "Prefer non-interactive commands; the working directory is qchat's cwd.",
+    {"type": "object",
+     "properties": {
+         "command": {"type": "string", "description": "The shell command to run"},
+         "timeout": {"type": "integer", "description": "Optional timeout in seconds"}},
+     "required": ["command"]},
+    _tool_run_command,
+    confirm="review"))   # gemma rates risk: none/low auto-run, medium+ prompts; denylist warns
 
 # --- catastrophic-command denylist: hard-blocked even in --auto, no LLM involved.
 _DENY = [
@@ -959,7 +1037,7 @@ def _turn(history, thinks, user, model=None, base=None):
             for tc in tcs:                         # run each call, feed results back
                 fn = tc.get("function") or {}
                 print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}")
-                out = run_tool_call(tc)
+                out = execute_tool(tc)             # gates per the tool's confirm policy
                 print(f"{DIM}  → {out if len(out) <= 300 else out[:300] + '…'}{RESET}")
                 history.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
         print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")

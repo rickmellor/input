@@ -7,10 +7,17 @@
 #   description what it does + WHEN to call it — the model routes on this, so be specific
 #   parameters  JSON Schema for the arguments (use {"type":"object","properties":{}} for none)
 #   run         callable(args: dict) -> str   (the string is returned to the model as the result)
+#   confirm     optional gate policy (default "never"):
+#                 "never"   run automatically when the model calls it
+#                 "always"  show the call and prompt y/N before running
+#                 "review"  if the args have a "command" string, gemma rates its risk
+#                           (none/low auto-run, medium+ prompt); the catastrophic denylist
+#                           always prompts. This is what the built-in run_command uses.
 #
-# NOTE: user tools run in-process with no sandbox and auto-execute when the model calls
-# them — only add tools you'd be comfortable running unattended. Side-effecting tools
-# (writes, network, shell) are your responsibility; keep them read-only unless you mean it.
+# NOTE: user tools run in-process with no sandbox. A "never" tool auto-executes when the
+# model calls it — keep those read-only. For anything that writes, deletes, or reaches the
+# network, set confirm="always" (or "review" if it takes a shell "command") so you get a
+# prompt before it runs.
 
 import subprocess
 
