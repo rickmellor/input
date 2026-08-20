@@ -2569,6 +2569,200 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
     return res
 
 
+# --- jobs: detached, goal-directed background work with a filesystem process table -------
+# A job is a run_thread running in a DETACHED process (`input --job <id>`, start_new_session
+# so it survives input exiting), writing its state to ~/.config/input/jobs/<id>/. The
+# filesystem IS the shared process table — any input session reads meta.json for status /
+# metrics and log.jsonl for progress; kill = signal the recorded pid; a hard block parks the
+# job (state=blocked + need + saved history) and `/jobs answer` relaunches it to resume.
+_JOBS_DIR = os.path.expanduser("~/.config/input/jobs")
+_JOB_HANG_S = 180          # no tool activity this long while 'running' → flagged as maybe-hung
+_JOB_MAX_ROUNDS = 80
+
+
+def _job_dir(jid):
+    return os.path.join(_JOBS_DIR, jid)
+
+
+def _read_meta(jid):
+    try:
+        return json.load(open(os.path.join(_job_dir(jid), "meta.json")))
+    except Exception:
+        return None
+
+
+def _write_meta(jid, **patch):
+    d = _read_meta(jid) or {}
+    d.update(patch); d["updated"] = time.time()
+    os.makedirs(_job_dir(jid), exist_ok=True)
+    p = os.path.join(_job_dir(jid), "meta.json")
+    with open(p + ".tmp", "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(p + ".tmp", p)
+    return d
+
+
+def list_jobs(include_done=True):
+    if not os.path.isdir(_JOBS_DIR):
+        return []
+    js = [m for m in (_read_meta(j) for j in os.listdir(_JOBS_DIR)) if m]
+    if not include_done:
+        js = [m for m in js if m.get("state") in ("queued", "running", "blocked")]
+    return sorted(js, key=lambda m: m.get("created", 0))
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0); return True
+    except Exception:
+        return False
+
+
+def job_state(m):
+    """Live state with hang/dead detection layered over the recorded state."""
+    st = m.get("state")
+    if st == "running":
+        if m.get("pid") and not _pid_alive(m["pid"]):
+            return "dead"                      # process gone but never wrote a terminal state
+        if time.time() - (m.get("last_activity") or m.get("started") or 0) > _JOB_HANG_S:
+            return "stalled"
+    return st
+
+
+def submit_job(kind, title, goal, cwd=None, model=None, plan_id=None):
+    """Create a job dir + spec and launch the detached runner. Returns the job id."""
+    jid = datetime.now().strftime("%H%M%S") + "-" + os.urandom(2).hex()
+    os.makedirs(_job_dir(jid), exist_ok=True)
+    _write_meta(jid, id=jid, kind=kind, title=title[:80], goal=goal, cwd=os.path.abspath(cwd or os.getcwd()),
+                model=model or "saint", plan_id=plan_id, state="queued", created=time.time(),
+                tokens_in=0, tokens_out=0, tool_calls=0, rounds=0, last_activity=time.time())
+    out = open(os.path.join(_job_dir(jid), "runner.out"), "a")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--job", jid],
+                     stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+    return jid
+
+
+def _job_progress(m):
+    """(done, total, pct) for a build job from the live MegaPlan plan, else (None,None,None)."""
+    if m.get("kind") == "build" and m.get("plan_id"):
+        r = megaplan_call("get", id=m["plan_id"])
+        pr = (r or {}).get("progress") if isinstance(r, dict) else None
+        if pr:
+            return pr.get("done"), pr.get("total"), pr.get("pct")
+    return None, None, None
+
+
+def run_job(jid):
+    """The detached runner (entry: `input --job <id>`). Runs the goal-directed thread,
+    streaming metrics/log to the job dir; parks on block, saves result on done."""
+    m = _read_meta(jid)
+    if not m:
+        return 2
+    logp = os.path.join(_job_dir(jid), "log.jsonl")
+    hp = os.path.join(_job_dir(jid), "history.json")
+
+    def logline(kind, **kw):
+        with open(logp, "a") as f:
+            f.write(json.dumps({"t": time.time(), "kind": kind, **kw}) + "\n")
+
+    load_user_tools(); load_mcp_tools(); apply_tools_state(); discover_skills(m["cwd"])
+    sb = Sandbox(root=m["cwd"], allow=SANDBOX_DEV)
+    tools = [t for t in TOOLS.values() if t.enabled] + sandbox_tools(sb, write=True)
+    if m.get("kind") == "build" and m.get("plan_id"):
+        system = stable_context() + "\n\n" + _BUILD_DIRECTIVE + f"\n\nBuilding MegaPlan: {m['plan_id']}"
+        goal = f"Every task of MegaPlan {m['plan_id']} is marked complete (plan status done)."
+        task = (f"Build MegaPlan '{m['plan_id']}'. Fetch it (megaplan get), then work its tasks to "
+                "completion one at a time, marking each complete; when all are done you are finished.")
+    else:
+        system, goal, task = stable_context(), m["goal"], m["goal"]
+    history = []
+    if os.path.exists(hp):
+        try:
+            history = json.load(open(hp))
+        except Exception:
+            history = []
+    mo, bo = _resolve_seat(m.get("model")) or SEATS.get("saint") or (MODEL, BASE)
+    _write_meta(jid, state="running", started=m.get("started") or time.time(),
+                pid=os.getpid(), last_activity=time.time())
+    logline("start", goal=goal, model=mo)
+
+    def on_tool(ev, tc, out):
+        fn = tc.get("function") or {}
+        if ev == "call":
+            logline("tool_call", name=fn.get("name"), args=(fn.get("arguments") or "")[:400])
+        else:
+            logline("tool_result", name=fn.get("name"), out=(out or "")[:400])
+            cur = _read_meta(jid) or {}
+            _write_meta(jid, last_activity=time.time(), tool_calls=(cur.get("tool_calls") or 0) + 1)
+        return None
+
+    sysfull = system + "\n\n" + _GOAL_DIRECTIVE.format(goal=goal)
+    res = run_thread(task, history=history, system=sysfull, model=mo, base=bo, tools=tools,
+                     quiet=True, on_tool=on_tool, gate=False, terminate=goal_terminate(goal, 24),
+                     max_rounds=_JOB_MAX_ROUNDS, session="job-" + jid)
+    _write_meta(jid, tokens_in=res["tokens_in"], tokens_out=res["tokens_out"], rounds=res["rounds"])
+    if res.get("blocked"):
+        json.dump(res["history"], open(hp, "w"))
+        _write_meta(jid, state="blocked", need=res["blocked"])
+        logline("blocked", need=res["blocked"])
+    elif res["error"]:
+        _write_meta(jid, state="failed", error=res["error"], ended=time.time())
+        logline("failed", error=res["error"])
+    else:
+        rp = os.path.join(_job_dir(jid), "result.md")
+        open(rp, "w").write(res["text"] or "")
+        _write_meta(jid, state="done", ended=time.time(), result_path=rp,
+                    goal_met=bool(res.get("goal_met")), stopped=res["stopped"])
+        logline("done", stopped=res["stopped"])
+    return 0
+
+
+def resume_job(jid, answer):
+    """Append the user's answer to a blocked job's saved history and relaunch it."""
+    m = _read_meta(jid)
+    if not m or m.get("state") != "blocked":
+        return False
+    hp = os.path.join(_job_dir(jid), "history.json")
+    try:
+        hist = json.load(open(hp))
+    except Exception:
+        hist = []
+    hist.append({"role": "user", "content": f"(Answer to your BLOCKED need — {m.get('need')!r}): {answer}"})
+    json.dump(hist, open(hp, "w"))
+    _write_meta(jid, state="queued", need=None)
+    out = open(os.path.join(_job_dir(jid), "runner.out"), "a")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--job", jid],
+                     stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+    return True
+
+
+def _fmt_dur(s):
+    s = int(s or 0)
+    return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s" if s < 3600 else f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+_JOBS_SEEN = {}   # jid -> last state we notified about (for the prompt-time notifier)
+
+
+def poll_jobs_notify():
+    """Print a one-line notice when a background job newly finishes / blocks / fails."""
+    for m in list_jobs():
+        jid, st = m["id"], job_state(m)
+        if _JOBS_SEEN.get(jid) == st:
+            continue
+        prev = _JOBS_SEEN.get(jid)
+        _JOBS_SEEN[jid] = st
+        if prev is None:                       # first sight (e.g. pre-existing) — don't shout
+            continue
+        if st == "blocked":
+            notify_blocked(f"job {jid} · {m.get('title','')}", m.get("need", "?"))
+        elif st == "done":
+            gm = " ✔goal met" if m.get("goal_met") else ""
+            print(f"\n{GREEN_BUILD}{BOLD}● job {jid} done{RESET}{DIM}{gm} — {m.get('title','')}  (/jobs show {jid}){RESET}")
+        elif st in ("failed", "dead"):
+            print(f"\n{RED_VIVID}● job {jid} {st}{RESET}{DIM} — {m.get('title','')}  (/jobs show {jid}){RESET}")
+
+
 def _turn(history, thinks, user, stats, model=None, base=None):
     """One interactive REPL turn = run_thread with printing, memory recall/store, gating."""
     stats.turns += 1
@@ -2660,7 +2854,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -2668,7 +2862,10 @@ def repl():
     mem_status = mem_connect()
     if mem_status:
         print(f"{DIM}{mem_status}{RESET}")
+    for _m in list_jobs():                     # don't shout about pre-existing jobs on startup
+        _JOBS_SEEN[_m["id"]] = job_state(_m)
     while True:
+        poll_jobs_notify()                     # surface background jobs that finished / blocked
         print()  # blank line before each prompt
         try:
             user, mode = read_line(_prompt())
@@ -2723,6 +2920,83 @@ def repl():
             continue
         if not user or user in ("/quit", "exit"):
             break
+        if user == "/jobs" or user.startswith("/jobs "):
+            parts = user.split(None, 2)
+            sub = parts[1].lower() if len(parts) > 1 else ""
+            rest = parts[2].strip() if len(parts) > 2 else ""
+            _JST = {"queued": DIM, "running": CODE_FG, "blocked": RED_VIVID, "done": GREEN_BUILD,
+                    "failed": RED_VIVID, "dead": RED_VIVID, "stalled": YEL, "killed": DIM}
+            if sub in ("", "list", "ls"):
+                js = list_jobs()
+                if not js:
+                    print(f"{DIM}no jobs — /jobs build <plan-id> · /jobs run <goal…>{RESET}")
+                for m in js:
+                    st = job_state(m); col = _JST.get(st, DIM)
+                    dur = _fmt_dur((m.get("ended") or time.time()) - (m.get("started") or m.get("created")))
+                    dn, tot, pct = _job_progress(m)
+                    prog = f" {pct}% ({dn}/{tot})" if pct is not None else ""
+                    toks = f" · {m.get('tokens_out', 0)}out" if m.get("tokens_out") else ""
+                    print(f"{DIM}  {m['id']}  {col}{st:<8}{RESET}{DIM} {dur:>6}{prog}{toks}  {m.get('title', '')[:44]}{RESET}")
+            elif sub in ("show", "status", "log", "tail") and rest:
+                jid = rest.split()[0]
+                m = _read_meta(jid)
+                if not m:
+                    print(f"{DIM}no job {jid}{RESET}"); continue
+                st = job_state(m)
+                dn, tot, pct = _job_progress(m)
+                print(f"{DIM}{jid} · {m.get('kind')} · {_JST.get(st, DIM)}{st}{RESET}{DIM} · {m.get('title', '')}{RESET}")
+                print(f"{DIM}  goal: {m.get('goal', '')[:100]}{RESET}")
+                print(f"{DIM}  cwd {m.get('cwd')} · model {m.get('model')} · "
+                      f"run {_fmt_dur((m.get('ended') or time.time()) - (m.get('started') or m.get('created')))} · "
+                      f"{m.get('rounds', 0)} rounds · {m.get('tool_calls', 0)} tools · "
+                      f"↑{m.get('tokens_out', 0)} ↓{m.get('tokens_in', 0)}"
+                      f"{f' · plan {pct}% {dn}/{tot}' if pct is not None else ''}{RESET}")
+                if st == "blocked":
+                    print(f"{RED_VIVID}  ⛔ needs: {m.get('need')}{RESET}{DIM}  → /jobs answer {jid} <text>{RESET}")
+                logp = os.path.join(_job_dir(jid), "log.jsonl")
+                if (sub in ("log", "tail")) and os.path.exists(logp):
+                    for ln in open(logp).read().splitlines()[-14:]:
+                        try:
+                            e = json.loads(ln)
+                            print(f"{DIM}   {e['kind']:<12} {e.get('name') or e.get('need') or e.get('error') or ''}"
+                                  f"  {(e.get('out') or e.get('args') or '')[:60]}{RESET}")
+                        except Exception:
+                            pass
+                elif m.get("result_path") and os.path.exists(m["result_path"]):
+                    print(f"{DIM}  ── result ──{RESET}")
+                    print(open(m["result_path"]).read()[:1600])
+            elif sub in ("stop", "kill") and rest:
+                jid = rest.split()[0]; m = _read_meta(jid)
+                if m and m.get("pid") and _pid_alive(m["pid"]):
+                    try:
+                        os.killpg(os.getpgid(m["pid"]), 15)
+                    except Exception:
+                        try: os.kill(m["pid"], 15)
+                        except Exception: pass
+                    _write_meta(jid, state="killed", ended=time.time())
+                    print(f"{DIM}killed {jid}{RESET}")
+                else:
+                    print(f"{DIM}{jid} not running{RESET}")
+            elif sub == "answer" and rest:
+                jid, _, ans = rest.partition(" ")
+                print(f"{DIM}{'resuming ' + jid if resume_job(jid, ans.strip()) else jid + ' is not blocked'}{RESET}")
+            elif sub == "build" and rest:
+                pid = rest.split()[0]
+                p = megaplan_call("get", id=pid)
+                if isinstance(p, dict) and "error" in p:
+                    print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
+                jid = submit_job("build", f"build {pid}", "", cwd=os.getcwd(), plan_id=pid,
+                                 model=(rest.split()[1] if len(rest.split()) > 1 else "saint"))
+                _JOBS_SEEN[jid] = "queued"
+                print(f"{DIM}● job {jid} — building {pid} in the background · /jobs show {jid}{RESET}")
+            elif sub == "run" and rest:
+                jid = submit_job("goal", rest[:60], rest, cwd=os.getcwd())
+                _JOBS_SEEN[jid] = "queued"
+                print(f"{DIM}● job {jid} — {rest[:50]} · /jobs show {jid}{RESET}")
+            else:
+                print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · "
+                      f"build <plan-id> [model] · run <goal…>{RESET}")
+            continue
         if user == "/goal" or user.startswith("/goal "):
             arg = user[len("/goal"):].strip()
             if arg.lower() in ("off", "clear", "done"):
@@ -3049,14 +3323,21 @@ def repl():
 
 # --- arg parsing ----------------------------------------------------------------
 argv = sys.argv[1:]
-MODE, task_words = None, None
+MODE, task_words, JOB_ID = None, None, None
+if "--job" in argv:                            # detached job runner: input --job <id>
+    i = argv.index("--job")
+    MODE, JOB_ID, argv = "--job", (argv[i + 1] if len(argv) > i + 1 else ""), argv[:i]
 for flag in ("-e", "-x", "--goal", "--auto", "--gen"):
+    if MODE:
+        break
     if flag in argv:
         i = argv.index(flag)
         MODE, task_words, argv = flag, argv[i + 1:], argv[:i]
         break
 
-if argv and argv[0] in SEATS:
+if MODE == "--job":
+    MODEL, BASE = SEATS.get("saint", (list(SEATS.values())[0] if SEATS else ("saint-auto", SAINT_BASE)))
+elif argv and argv[0] in SEATS:
     MODEL, BASE = SEATS[argv[0]]
 elif argv:
     MODEL, BASE = argv[0], (argv[1] if len(argv) > 1 else "http://127.0.0.1:8002/v1")
@@ -3079,6 +3360,8 @@ def _task():
 
 
 def _main():
+    if MODE == "--job":
+        sys.exit(run_job(JOB_ID))
     if MODE == "--gen":
         sys.stdout.write(generate(_task()))
     elif MODE in ("-e", "-x"):
