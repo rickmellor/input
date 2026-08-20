@@ -35,6 +35,8 @@ from datetime import datetime
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
 ITAL, ULINE, CODE_FG = "\033[3m", "\033[4m", "\033[36m"
+BLUE_ELECTRIC = "\033[38;2;92;179;255m"    # soft electric blue — plan-mode indicator
+RED_VIVID = "\033[38;2;255;45;45m"         # vivid red — unrestricted-mode indicator
 SHELL = os.environ.get("SHELL", "/bin/bash")
 SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to this run
                 # (else it keys on a hash of the first message — "hello" collides across chats)
@@ -1527,8 +1529,9 @@ def active_name():
 def _prompt():
     n = active_name()
     color = YEL if n == "saint" or n.startswith("cloud") else CODE_FG   # highlight routed/cloud seats
-    tag = {"cautious": "", "unrestricted": f"{YEL} unrestricted▸{RESET}",
-           "plan": f"{DIM} plan▸{RESET}"}.get(PERM_MODE, "")
+    tag = {"cautious": "",
+           "unrestricted": f"{RED_VIVID}{BOLD} unrestricted▸{RESET}",
+           "plan": f"{BLUE_ELECTRIC} plan▸{RESET}"}.get(PERM_MODE, "")
     return f"{color}{n}{RESET}{tag} > "
 
 
