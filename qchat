@@ -15,6 +15,8 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       code blocks stream plain then redraw boxed + line-numbered; ^C copies the last
       reply's code blocks (^D or /quit to exit); /models switches seat. Every request
       is grounded with the current date/time (+ location if /location or settings set).
+      A status line under each reply tracks tokens in/out, decode rate, context use, and
+      session turns/time.
       Tools: the model can call built-ins (get_current_time; list_files shows an ls -l
       listing; run_command runs shell commands, gated by a gemma risk-review — none/low
       auto-run, riskier prompts) plus user tools in ~/.config/qchat/tools/*.py; /tools
@@ -676,6 +678,64 @@ def _collapse_think(think_buf, t0):
     sys.stdout.write(f"\r\033[J{summary}\n")   # wipe region, drop the summary
 
 
+# --- session stats + status line ------------------------------------------------
+_CTX_CACHE = {}   # (model, base) -> context window (max_model_len) or None
+
+
+def context_window(model, base):
+    """Best-effort context window from the seat's /v1/models (vLLM max_model_len)."""
+    key = (model, base)
+    if key not in _CTX_CACHE:
+        w = None
+        try:
+            d = json.load(urllib.request.urlopen(f"{base}/models", timeout=1.5))
+            match = next((m for m in d.get("data", []) if m.get("id") == model), None)
+            w = (match or (d.get("data") or [{}])[0]).get("max_model_len")
+        except Exception:
+            pass
+        _CTX_CACHE[key] = w
+    return _CTX_CACHE[key]
+
+
+class Stats:
+    """Cumulative per-session usage. record() is called once per streamed response
+    (so tool-loop rounds all count); ctx tracks the latest request's footprint."""
+    def __init__(self):
+        self.t0 = time.monotonic()
+        self.turns = self.in_tot = self.out_tot = self.ctx = 0
+        self.rate = 0.0
+
+    def record(self, prompt, completion, rate):
+        self.in_tot += prompt or 0
+        self.out_tot += completion or 0
+        if prompt:
+            self.ctx = prompt + (completion or 0)   # ~ next request's input; last round wins
+        if rate:
+            self.rate = rate
+
+
+def _h(n):
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def _status_line(stats):
+    el = time.monotonic() - stats.t0
+    dur = (f"{int(el // 3600)}h{int(el % 3600 // 60):02d}m" if el >= 3600
+           else f"{int(el // 60)}m{int(el % 60):02d}s" if el >= 60 else f"{int(el)}s")
+    win = context_window(MODEL, BASE)
+    ctx = f"ctx {_h(stats.ctx)}" + (f"/{_h(win)} ({100 * stats.ctx / win:.0f}%)" if win else "")
+    parts = [f"↓{_h(stats.in_tot)} ↑{_h(stats.out_tot)}"]
+    if stats.rate:
+        parts.append(f"{stats.rate:.0f} tok/s")
+    parts += [ctx, f"{stats.turns}t", dur]
+    return f"{DIM}" + "  ·  ".join(parts) + RESET
+
+
 def stream(messages, think_store, model=None, base=None, tools=None):
     """Stream one assistant response. Returns (text, tool_calls) — tool_calls is the
     OpenAI-shaped list (possibly empty) accumulated from the stream's deltas."""
@@ -685,7 +745,8 @@ def stream(messages, think_store, model=None, base=None, tools=None):
         # only SAINT relocates the volatile section; on a direct seat, inline it (drop marker)
         sysmsg = {**sysmsg, "content": sysmsg["content"].replace(SAINT_SENTINEL, "").strip()}
     msgs = ([sysmsg] if sysmsg else []) + messages
-    payload = {"model": model, "messages": msgs, "max_tokens": 8192, "stream": True}
+    payload = {"model": model, "messages": msgs, "max_tokens": 8192, "stream": True,
+               "stream_options": {"include_usage": True}}   # final chunk carries token usage
     if tools:
         payload["tools"] = tools
     body = json.dumps(payload).encode()
@@ -694,6 +755,7 @@ def stream(messages, think_store, model=None, base=None, tools=None):
         headers["x-session-id"] = SESSION
     req = urllib.request.Request(f"{base}/chat/completions", body, headers)
     reply, think_buf, phase, t0, tool_acc = [], [], "start", None, {}
+    usage, t_first = None, None
     md = MDRender()
     import select as _sel
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
@@ -721,12 +783,18 @@ def stream(messages, think_store, model=None, base=None, tools=None):
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
                 chunk = json.loads(line[6:])
+                if not chunk.get("choices"):   # usage-only tail chunk (include_usage)
+                    usage = chunk.get("usage") or usage
+                    continue
                 if not banner_done:  # first chunk carries the actually-served model name
                     served = chunk.get("model", "")
                     arrow = f" >> {served}" if served and served != saint_b else ""
                     print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
                     banner_done = True
                 delta = chunk["choices"][0].get("delta") or {}
+                if t_first is None and (delta.get("reasoning_content") or delta.get("reasoning")
+                                        or delta.get("content") or delta.get("tool_calls")):
+                    t_first = time.monotonic()   # first output token → decode-rate clock start
                 rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     if phase != "thinking":
@@ -765,7 +833,14 @@ def stream(messages, think_store, model=None, base=None, tools=None):
          "function": {"name": a["name"], "arguments": a["arguments"] or "{}"}}
         for i, a in sorted(tool_acc.items())
     ]
-    return "".join(reply), tool_calls
+    prompt = usage.get("prompt_tokens") if usage else None
+    completion = usage.get("completion_tokens") if usage else None
+    if prompt is None:      # seat didn't report usage — rough char/4 estimates
+        prompt = sum(len(str(m.get("content") or "")) for m in msgs) // 4
+    if completion is None:
+        completion = max(1, len("".join(reply)) // 4)
+    rate = completion / (time.monotonic() - t_first) if t_first and completion else 0.0
+    return "".join(reply), tool_calls, {"prompt": prompt, "completion": completion, "rate": rate}
 
 
 def _pick(labels, start):
@@ -1084,13 +1159,15 @@ def _fmt_result(out):
     return f"{flat[:80]}… · {n} line{'' if n == 1 else 's'}, {len(out)} chars"
 
 
-def _turn(history, thinks, user, model=None, base=None):
+def _turn(history, thinks, user, stats, model=None, base=None):
     base_len = len(history)                       # roll back the whole turn on abort/error
     history.append({"role": "user", "content": user})
+    stats.turns += 1
     try:
         tools = active_tools()
         for _ in range(MAX_TOOL_ROUNDS):
-            text, tcs = stream(history, thinks, model=model, base=base, tools=tools)
+            text, tcs, usage = stream(history, thinks, model=model, base=base, tools=tools)
+            stats.record(usage["prompt"], usage["completion"], usage["rate"])
             msg = {"role": "assistant", "content": text}
             if tcs:
                 msg["tool_calls"] = tcs
@@ -1127,6 +1204,7 @@ def repl():
     for _n, _t in TOOLS.items():
         _t.enabled = _n not in _disabled
     history, thinks = [], []
+    stats = Stats()
     SESSION = "qchat-" + os.urandom(6).hex()
     print(f"qchat → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot to another seat · "
           f"/models /system /tools /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
@@ -1158,8 +1236,9 @@ def repl():
             if not seat:
                 print("(cancelled)"); continue
             m, b = SEATS[seat]
-            _turn(history, thinks, user, model=m, base=b)
+            _turn(history, thinks, user, stats, model=m, base=b)
             print(f"{DIM}(one-shot via {seat} · active seat still {MODEL}){RESET}")
+            print(_status_line(stats))
             continue
         if not user or user in ("/quit", "exit"):
             break
@@ -1213,7 +1292,8 @@ def repl():
             history.clear(); thinks.clear()
             SESSION = "qchat-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
-        _turn(history, thinks, user)
+        _turn(history, thinks, user, stats)
+        print(_status_line(stats))
 
 
 # --- arg parsing ----------------------------------------------------------------
