@@ -331,6 +331,9 @@ def discover_skills(cwd=None):
     gr = _git_root(cwd or os.getcwd())
     if gr:
         roots.append(os.path.join(gr, ".claude", "skills"))
+    # a skill for a capability an input subsystem owns (memoryos = ambient memory) would
+    # steer the model at suppressed tools — hide it, mirroring mcp_claims().
+    claimed = {"memoryos"} if mem_config().get("enabled") else set()
     found = {}
     for root in roots:
         if not os.path.isdir(root):
@@ -346,6 +349,8 @@ def discover_skills(cwd=None):
                 continue
             name = (meta.get("name") or (entry[:-3] if entry.endswith(".md") else entry)).strip()
             if not name or name in found:        # first root wins (input's own > claude's > project)
+                continue
+            if name in claimed:                  # claimed by a subsystem (e.g. memoryos = ambient memory)
                 continue
             found[name] = {"name": name, "description": meta.get("description", "").strip(),
                            "path": path, "seat": (meta.get("model") or meta.get("seat") or "").strip()}
@@ -521,6 +526,22 @@ def goal_terminate(goal, nudges_left):
                        f"{goal}. If you are genuinely hard-blocked, reply with `BLOCKED: <need>`; "
                        "when done, `GOAL MET: <evidence>`.")
     return _t
+
+
+# --- sidebar chats: fork the thread, branch a side discussion, fold conclusions back ------
+# A sidebar shares the context up to the fork point, then diverges. On merge, only a CONCISE
+# CONCLUSION returns to the main thread (not the whole side transcript) — so a tangent doesn't
+# bloat the main history. A stack, so sidebars can nest.
+SIDEBARS = []   # stack of {"parent": [...main msgs at fork...], "plen": int, "label": str}
+
+
+def sidebar_summarize(history, model, base):
+    """Ask the model for a concise carry-back conclusion of the current (branch) discussion."""
+    res = run_thread(
+        "Summarize the CONCLUSIONS of this side discussion for the main thread in 2–5 sentences: "
+        "decisions reached, findings, anything to carry back. No preamble, just the conclusion.",
+        history=list(history), model=model, base=base, quiet=True, max_rounds=1)
+    return (res.get("text") or "").strip()
 
 
 def notify_blocked(source, need):
@@ -2141,7 +2162,8 @@ def _prompt():
     build = f"{GREEN_BUILD} build▸{RESET}" if BUILD_ID else ""
     goal = (f"{RED_VIVID}{BOLD} ⛔blocked▸{RESET}" if GOAL_BLOCKED else
             (f"{DIM} goal▸{RESET}" if GOAL else ""))
-    return f"{color}{n}{RESET}{tag}{build}{goal} > "
+    aside = f"{CODE_FG} aside{'▸' * len(SIDEBARS)}{RESET}" if SIDEBARS else ""
+    return f"{color}{n}{RESET}{tag}{build}{goal}{aside} > "
 
 
 def read_line(prompt):
@@ -2854,7 +2876,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /sidebar /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -2920,6 +2942,36 @@ def repl():
             continue
         if not user or user in ("/quit", "exit"):
             break
+        if user == "/sidebar" or user.startswith("/sidebar ") or user == "/aside" or user.startswith("/aside "):
+            arg = user.split(None, 1)[1].strip() if " " in user else ""
+            if arg in ("merge", "done", "close", "drop", "cancel"):
+                if not SIDEBARS:
+                    print(f"{DIM}not in a sidebar{RESET}"); continue
+                sb = SIDEBARS[-1]
+                if arg in ("drop", "cancel"):
+                    SIDEBARS.pop(); history[:] = sb["parent"]
+                    print(f"{DIM}sidebar '{sb['label']}' dropped — main thread restored (nothing merged){RESET}")
+                else:
+                    print(f"{DIM}⟲ folding sidebar '{sb['label']}' back into the main thread…{RESET}")
+                    summary = sidebar_summarize(history, MODEL, BASE) or "(no conclusion captured)"
+                    SIDEBARS.pop(); history[:] = sb["parent"]
+                    history.append({"role": "user",
+                                    "content": f"[Sidebar '{sb['label']}' concluded — carrying back:] {summary}"})
+                    history.append({"role": "assistant", "content": f"Noted the sidebar's conclusion: {summary}"})
+                    print(f"{DIM}  ↩ merged: {summary[:200]}{RESET}")
+            elif arg:
+                SIDEBARS.append({"parent": list(history), "plen": len(history), "label": arg[:60]})
+                history.append({"role": "user",
+                                "content": f"[Entering a SIDEBAR about: {arg}] The main task is paused. "
+                                "Explore this side thread; when we finish I'll fold the conclusions back."})
+                history.append({"role": "assistant", "content": f"In a sidebar on '{arg}'. What would you like to explore?"})
+                print(f"{DIM}● sidebar — {arg}  (branch of the main thread; /sidebar merge to fold conclusions back, /sidebar drop to discard){RESET}")
+            else:
+                if SIDEBARS:
+                    print(f"{DIM}in sidebar: {' › '.join(s['label'] for s in SIDEBARS)}  ·  /sidebar merge | drop{RESET}")
+                else:
+                    print(f"{DIM}no sidebar — /sidebar <topic> forks a side discussion; merge folds its conclusion back{RESET}")
+            continue
         if user == "/jobs" or user.startswith("/jobs "):
             parts = user.split(None, 2)
             sub = parts[1].lower() if len(parts) > 1 else ""
