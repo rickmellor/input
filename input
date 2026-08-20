@@ -64,16 +64,66 @@ def _safe(fn):
     except Exception:
         pass
 
-SEATS = {
-    "gemma":  ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
-    "coder":  ("qwen-27b-coder",                 "http://127.0.0.1:8003/v1"),
-    "qwen38": ("Qwen3.8-27B-AWQ-INT4",           "http://127.0.0.1:8004/v1"),
-    "saint":        ("saint-auto",           "http://127.0.0.1:4000/v1"),  # router: classify → local/cloud
-    "cloud-small":  ("saint-cloud-small",    "http://127.0.0.1:4000/v1"),  # Haiku  ($1/$5)   via SAINT
-    "cloud-medium": ("saint-cloud-medium",   "http://127.0.0.1:4000/v1"),  # Sonnet ($3/$15)  via SAINT (needs saint restart)
-    "cloud-large":  ("saint-cloud-large",    "http://127.0.0.1:4000/v1"),  # Opus   ($5/$25)  via SAINT
-    "cloud-flagship": ("saint-cloud-flagship", "http://127.0.0.1:4000/v1"), # Fable  ($10/$50) via SAINT (needs saint restart)
+# --- seats: discovered live from SAINT /status; everything routes through SAINT (:4000) ----
+# input carries no static model list — SAINT is the source of truth. It maps out the whole
+# fleet (johnny-resolved local seats for the running profile + auto-configured cloud tiers,
+# each with context window + price + cost rank); input reflects exactly that.
+SAINT_BASE = "http://127.0.0.1:4000/v1"
+SAINT_STATUS_URL = "http://127.0.0.1:4000/status"
+
+# Fallback used ONLY when SAINT /status is unreachable — direct-to-johnny locals + the
+# router id, so input still works if SAINT is down.
+_STATIC_SEATS = {
+    "saint": ("saint-auto", SAINT_BASE),
+    "chat":  ("gemma-4-26B-A4B-it-FP8-Dynamic", "http://127.0.0.1:8002/v1"),
+    "coder": ("qwen-27b-coder",                 "http://127.0.0.1:8003/v1"),
 }
+SEATS: dict = {}        # name -> (model_id, base_url)
+SEAT_META: dict = {}    # name -> {kind, context, price_in, price_out, rank, state, aliases}
+
+
+def _seat_name(choice):
+    """Friendly seat name from a /status choice."""
+    kind, backend = choice.get("kind"), choice.get("backend", "")
+    if kind == "router":
+        return "saint"
+    if kind == "local":
+        return choice.get("role") or backend.removeprefix("local-") or backend
+    return backend          # cloud-* keep their tier name (cloud-small … cloud-flagship)
+
+
+def discover_seats(timeout=2.5):
+    """Populate SEATS + SEAT_META from SAINT /status. Returns True on success; on failure
+    the caller keeps the static fallback."""
+    try:
+        with urllib.request.urlopen(SAINT_STATUS_URL, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return False
+    seats, meta = {}, {}
+    for c in data.get("choices", []):
+        name = _seat_name(c)
+        seats[name] = (c.get("id"), SAINT_BASE)     # route every seat through SAINT
+        meta[name] = {k: c.get(k) for k in
+                      ("kind", "context", "price_in", "price_out", "rank", "state", "aliases")}
+    if not seats:
+        return False
+    SEATS.clear(); SEATS.update(seats)
+    SEAT_META.clear(); SEAT_META.update(meta)
+    return True
+
+
+if not discover_seats():
+    SEATS.update(_STATIC_SEATS)
+
+
+def _pick_seat(*names):
+    """First of `names` present in SEATS, else the lowest-rank (cheapest) seat, else None."""
+    for n in names:
+        if n in SEATS:
+            return n
+    return min(SEATS, key=lambda n: SEAT_META.get(n, {}).get("rank", 0)) if SEATS else None
+
 
 # Function-key escape sequences (plain; Ctrl/Alt/Shift add a ";N" modifier we strip) → Fn label.
 _FKEY_SEQ = {
@@ -82,15 +132,18 @@ _FKEY_SEQ = {
     b"[15~": "f5", b"[17~": "f6", b"[18~": "f7", b"[19~": "f8",
     b"[20~": "f9", b"[21~": "f10", b"[23~": "f11", b"[24~": "f12",
 }
-# Fn → seat for one-shot routing, escalating in cost LEFT→RIGHT: two free local seats,
-# then the cloud ladder Haiku → Sonnet → Opus → Fable. Any Fn works with or without Ctrl
-# (Ctrl+F9 and F9 both fire). Override via settings `seat_hotkeys`.
-_DEFAULT_HOTKEYS = {"f7": "gemma", "f8": "coder", "f9": "cloud-small",
-                    "f10": "cloud-medium", "f11": "cloud-large", "f12": "cloud-flagship"}
+
+
+def _default_hotkeys():
+    """Bind F7..F12 to the non-router seats in cost-ascending rank order (SAINT's rank)."""
+    ranked = sorted((n for n in SEATS if SEAT_META.get(n, {}).get("kind") != "router"),
+                    key=lambda n: SEAT_META.get(n, {}).get("rank", 0))
+    keys = ["f7", "f8", "f9", "f10", "f11", "f12"]
+    return {keys[i]: n for i, n in enumerate(ranked[:len(keys)])}
 
 
 def seat_hotkeys():
-    hk = dict(_DEFAULT_HOTKEYS)
+    hk = _default_hotkeys()
     hk.update(load_settings().get("seat_hotkeys") or {})
     return {k.lower(): v for k, v in hk.items()}
 MAX_AUTO_STEPS = 8
@@ -625,7 +678,7 @@ def seat_alive(base):
 
 
 def _is_saint(base):
-    return base == SEATS["saint"][1]   # saint/cloud-* seats share the one SAINT base (:4000)
+    return base == SAINT_BASE           # every discovered seat routes through SAINT (:4000)
 
 
 def clean_cmd(text):
@@ -634,8 +687,8 @@ def clean_cmd(text):
 
 
 def review(cmd):
-    """Ask gemma to risk-rate a command. Returns (risk, reason) or None if unavailable."""
-    model, base = SEATS["gemma"]
+    """Ask a fast local seat to risk-rate a command. Returns (risk, reason) or None."""
+    model, base = SEATS[_pick_seat("chat", "coder", "saint")]
     sysmsg = ("You are a shell-command safety reviewer. Rate the RISK of running the command. "
               'Reply ONLY compact JSON: {"risk":"none|low|medium|high|critical","reason":"short"}. '
               "high/critical = data loss, overwrite, exfiltration, system damage, irreversible.")
@@ -1477,17 +1530,43 @@ def _pick(labels, start, hint=None):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def _seat_status(n):
+    """Per-seat state: SAINT's reported state (ready|loading|absent) when known, else a
+    live probe of the base (the static-fallback path)."""
+    st = SEAT_META.get(n, {}).get("state")
+    if st:
+        return "up" if st == "ready" else st
+    m, b = SEATS.get(n, (None, None))
+    return "up" if (b and seat_alive(b)) else "down"
+
+
+def _seat_extra(n):
+    """Dim context + cost suffix for a seat label, from SAINT's map."""
+    meta = SEAT_META.get(n, {})
+    ctx = meta.get("context")
+    bits = []
+    if ctx:
+        bits.append(f"{ctx // 1000}k ctx")
+    if meta.get("kind") == "local":
+        bits.append("free")
+    elif meta.get("price_in"):
+        bits.append(f"${meta['price_in']}/${meta.get('price_out')}")
+    return f"  {DIM}· {' · '.join(bits)}{RESET}" if bits else ""
+
+
+def _seat_label(n, default, width=12):
+    st = _seat_status(n)
+    status = "up" if st == "up" else f"{DIM}{st}{RESET}"
+    star = f"{YEL}★{RESET}" if n == default else " "
+    return f"{star} {n:<{width}} {SEATS[n][0]}  [{status}]{_seat_extra(n)}"
+
+
 def models_menu():
     global MODEL, BASE
     names = list(SEATS)
-    default = load_default_seat() or "gemma"
+    default = load_default_seat() or _pick_seat("saint", "chat")
     cur = next((i for i, n in enumerate(names) if SEATS[n] == (MODEL, BASE)), 0)
-    labels = []
-    for n in names:
-        m, b = SEATS[n]
-        status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
-        star = f"{YEL}★{RESET}" if n == default else " "
-        labels.append(f"{star} {n:<8} {m}  [{status}]")
+    labels = [_seat_label(n, default, width=8) for n in names]
     res = _pick(labels, cur)
     if res is None:
         return
@@ -1500,14 +1579,9 @@ def models_menu():
 
 
 def _seat_labels():
-    names, default = list(SEATS), load_default_seat() or "gemma"
+    names, default = list(SEATS), load_default_seat() or _pick_seat("saint", "chat")
     cur = next((i for i, n in enumerate(names) if SEATS[n] == (MODEL, BASE)), 0)
-    labels = []
-    for n in names:
-        m, b = SEATS[n]
-        status = "up" if seat_alive(b) else f"{DIM}down{RESET}"
-        star = f"{YEL}★{RESET}" if n == default else " "
-        labels.append(f"{star} {n:<12} {m}  [{status}]")
+    labels = [_seat_label(n, default) for n in names]
     return names, labels, cur
 
 
@@ -1947,11 +2021,17 @@ def repl():
             continue
         if user in ("/models", "/model"):
             models_menu(); continue
-        if user == "/seats":                   # show the Fn one-shot bindings
-            print(f"{DIM}Fn one-shot seats (type a message, then press the key; Ctrl+Fn works too):{RESET}")
+        if user == "/seats" or user.startswith("/seats "):   # bindings + discovered fleet; `refresh` re-discovers
+            if user[len("/seats"):].strip() == "refresh":
+                ok = discover_seats()
+                print(f"{DIM}{'re-discovered ' + str(len(SEATS)) + ' seats from SAINT' if ok else 'SAINT unreachable — kept current seats'}{RESET}")
+            src = "SAINT /status" if SEAT_META else "static fallback (SAINT unreachable)"
+            print(f"{DIM}Fn one-shot seats — from {src} (type a message, then press the key; Ctrl+Fn too):{RESET}")
             for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])):
-                up = "up" if v in SEATS and seat_alive(SEATS[v][1]) else f"{DIM}down{RESET}"
-                print(f"{DIM}  {k.upper():<4} → {v:<12} [{up}{DIM}]{RESET}")
+                if v in SEATS:
+                    print(f"{DIM}  {k.upper():<4} → {_seat_label(v, None, width=14)}{RESET}")
+                else:
+                    print(f"{DIM}  {k.upper():<4} → {v}  {RED}[not in fleet]{RESET}")
             print(f"{DIM}  override in settings.json: \"seat_hotkeys\": {{\"f9\": \"cloud-large\", …}}{RESET}")
             continue
         if user in ("/think", "/expand"):
@@ -2185,9 +2265,9 @@ if argv and argv[0] in SEATS:
 elif argv:
     MODEL, BASE = argv[0], (argv[1] if len(argv) > 1 else "http://127.0.0.1:8002/v1")
 elif MODE in ("-e", "-x", "--goal", "--auto", "--gen"):
-    MODEL, BASE = SEATS["coder"]     # command/goal work → coder seat
+    MODEL, BASE = SEATS[_pick_seat("coder", "saint", "chat")]   # command/goal work → coder seat
 else:
-    MODEL, BASE = SEATS[load_default_seat() or "gemma"]   # chat → saved default (else gemma)
+    MODEL, BASE = SEATS[load_default_seat() or _pick_seat("saint", "chat")]   # chat → saved default
 
 
 def _task():
