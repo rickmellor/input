@@ -1338,6 +1338,11 @@ def _tool_run_command(args):
     cmd = ((args or {}).get("command") or "").strip()
     if not cmd:
         return "Error: no command given"
+    hit = danger(cmd)                              # HARD floor: the catastrophic denylist applies
+    if hit:                                        # on EVERY path (interactive, jobs, sub-agents),
+        return ("BLOCKED: refused by the catastrophic-command denylist "  # gate or no gate.
+                f"(matched {hit!r}). This safety floor cannot be bypassed; if it's a false "
+                "positive, run the specific safe subcommand instead.")
     timeout = (args or {}).get("timeout")
     try:
         p = subprocess.run(cmd, shell=True, executable=SHELL, capture_output=True,
