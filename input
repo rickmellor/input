@@ -3451,7 +3451,13 @@ def _write_meta(jid, **patch):
 def list_jobs(include_done=True):
     if not os.path.isdir(_JOBS_DIR):
         return []
-    js = [m for m in (_read_meta(j) for j in os.listdir(_JOBS_DIR)) if m]
+    js = []
+    for j in os.listdir(_JOBS_DIR):
+        m = _read_meta(j)
+        if not m:
+            continue
+        m.setdefault("id", j)          # backfill id from the dir name (partial/corrupt meta)
+        js.append(m)
     if not include_done:
         js = [m for m in js if m.get("state") in ("queued", "running", "blocked")]
     return sorted(js, key=lambda m: m.get("created", 0))
