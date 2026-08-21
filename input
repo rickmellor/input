@@ -4002,13 +4002,14 @@ def repl():
                          f"your tools, don't assume:\n"
                          f"  result: {rp}\n  history: {os.path.join(jd, 'history.json')}\n"
                          f"  log:    {os.path.join(jd, 'log.jsonl')}\n\n"
-                         f"Act on this as I direct.")
-                history.append({"role": "user", "content": block})
-                history.append({"role": "assistant", "content":
-                                f"Loaded job {jid} ({stj}) — I have its task and result in view, and "
-                                "can read the full history/log if I need to dig. What should I do with it?"})
+                         "You've just been handed this completed job. Orient yourself and reply "
+                         "briefly: 2-4 sentences on the outcome/verdict and the 1-3 most important "
+                         "findings (NOT exhaustive — I can ask for detail), flag anything that stands "
+                         "out, then ask me what I'd like to do with it. Don't start acting yet.")
                 print(f"{DIM}● loaded job {jid} — {mj.get('title','')[:50]} ({stj}); task + result in "
                       f"context, full history at {os.path.join(jd, 'history.json')}{RESET}")
+                _turn(history, thinks, block, stats)   # fire an orientation turn right away
+                print(_status_line(stats))
             else:
                 print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · load <id> · "
                       f"build <plan-id> [model] · run <goal…> · review <file|dir path>{RESET}")
