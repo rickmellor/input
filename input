@@ -3338,12 +3338,17 @@ def repl():
                 jid, _, ans = rest.partition(" ")
                 print(f"{DIM}{'resuming ' + jid if resume_job(jid, ans.strip()) else jid + ' is not blocked'}{RESET}")
             elif sub == "build" and rest:
-                pid = rest.split()[0]
+                # /jobs build is ALWAYS a detached job, so a trailing bg/background is redundant —
+                # drop it rather than mistake it for a model (that set an invalid seat "bg").
+                toks = [t for t in rest.split() if t.lower() not in ("bg", "background")]
+                pid = toks[0] if toks else ""
+                if not pid:
+                    print(f"{DIM}usage: /jobs build <plan-id> [model]  (already backgrounded){RESET}"); continue
                 p = megaplan_call("get", id=pid)
                 if isinstance(p, dict) and "error" in p:
                     print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
                 jid = submit_job("build", f"build {pid}", "", cwd=os.getcwd(), plan_id=pid,
-                                 model=(rest.split()[1] if len(rest.split()) > 1 else "saint"))
+                                 model=(toks[1] if len(toks) > 1 else "saint"))
                 _JOBS_SEEN[jid] = "queued"
                 print(f"{DIM}● job {jid} — building {pid} in the background · /jobs show {jid}{RESET}")
             elif sub == "run" and rest:
