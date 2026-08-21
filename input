@@ -3845,7 +3845,10 @@ def repl():
             PERM_MODE = MODES[(MODES.index(PERM_MODE) + 1) % len(MODES)]
             if PERM_MODE == "plan":            # authoring ≠ building; leaving build
                 BUILD_ID = ""
-            print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}{RESET}")
+            if _FOOTER_ACTIVE:                 # footer shows the mode live → don't spam a lookalike
+                render_footer()
+            else:
+                print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}{RESET}")
             if user and _rl:                   # don't lose text typed before the toggle
                 _safe(lambda: _rl.add_history(user))
                 print(f"{DIM}  (your text is in history — ↑ to recover){RESET}")
