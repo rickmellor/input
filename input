@@ -295,7 +295,8 @@ _HELP_TOPICS = {
         "                              accepted/refuted findings and a verdict\n"
         "  /jobs load <id>             pull a job's task + result into THIS session (lightweight —\n"
         "                              a path to the full history, not a fat prefill) so you can\n"
-        "                              act on its findings; the agent reads the history if it digs"
+        "                              act on its findings; the agent reads the history if it digs\n"
+        "At an <id> field, Tab cycles the valid ids and Ctrl+Enter opens a picker to drop one in."
     ),
     "/build": (
         "Execute a MegaPlan to completion — the agent works its tasks one at a time, marking\n"
@@ -2797,6 +2798,38 @@ def _prompt():
     return f"{color}{n}{RESET}{tag}{build}{goal}{aside} > "
 
 
+def _id_ctx(text):
+    """If the command line is positioned at an <id> argument, return (prefix, partial, ids):
+    prefix = text before the id being typed, partial = what's typed of it, ids = matching
+    candidates. Else None. Drives Tab-cycle and the Ctrl+Enter id picker in read_line."""
+    ends_space = text.endswith(" ")
+    toks = text.split()
+    if not toks:
+        return None
+    cmd = toks[0].lower()
+    if cmd == "/jobs":
+        if len(toks) < 2 or toks[1].lower() not in (
+                "show", "log", "tail", "status", "stop", "answer", "load"):
+            return None
+        id_pos, src = 2, (lambda: [str(m.get("id")) for m in list_jobs()])
+    elif cmd == "/build":
+        id_pos, src = 1, (lambda: [str(p.get("id")) for p in (megaplan_call("list") or [])
+                                   if isinstance(p, dict) and p.get("id")])
+    else:
+        return None
+    if len(toks) == id_pos and ends_space:              # cursor at a fresh id slot
+        prefix, partial = text, ""
+    elif len(toks) == id_pos + 1 and not ends_space:    # mid-typing the id
+        prefix, partial = " ".join(toks[:id_pos]) + " ", toks[id_pos]
+    else:
+        return None
+    try:
+        ids = [i for i in src() if i.startswith(partial)]
+    except Exception:
+        return None
+    return prefix, partial, ids
+
+
 def read_line(prompt, preset=""):
     """cbreak line reader: returns (text, mode). mode 'send' on Enter, 'pick' on
     Ctrl+Enter (terminals that send LF), None text with 'eof' on Ctrl-D. Falls back
@@ -2818,6 +2851,7 @@ def read_line(prompt, preset=""):
     hlen = _rl.get_current_history_length() if _rl else 0
     hidx, saved = hlen, ""
     crow = 0                                   # cursor's row offset from the line's start row
+    tabs = {"ids": [], "idx": -1, "prefix": "", "last": None}   # Tab-cycle state for id fields
 
     def redraw():
         # Wrapping-aware: the prompt+buffer may span several terminal rows. Go up to the
@@ -2854,6 +2888,16 @@ def read_line(prompt, preset=""):
         while True:
             ch = os.read(fd, 1)
             if ch in (b"\r", b"\n"):
+                # Ctrl+Enter (LF) while positioned at an <id> arg → arrow-pick an id, keep editing.
+                if ch == b"\n":
+                    ctx = _id_ctx("".join(buf))
+                    if ctx and ctx[2]:
+                        prefix, _partial, ids = ctx
+                        sys.stdout.write("\r\n")
+                        res = _pick(ids, 0, hint="↑/↓ or j/k · enter drop id in · q cancel")
+                        if res:
+                            buf[:] = list(prefix + ids[res[0]]); pos = len(buf)
+                        crow = 0; redraw(); continue
                 # Descend past the whole wrapped block before the newline: crow can lag
                 # the true bottom row (wrap math drift / a resize mid-entry), and a bare
                 # \r\n from a too-high row leaves the next output (the ⟐ memory notice,
@@ -2864,7 +2908,19 @@ def read_line(prompt, preset=""):
                     sys.stdout.write(f"\033[{endrow - crow}B")
                 sys.stdout.write("\r\n")
                 return "".join(buf), ("send" if ch == b"\r" else "pick")
-            if ch == b"\x04":                          # Ctrl-D
+            if ch == b"\t":                            # Tab → cycle valid ids at an <id> arg
+                cur = "".join(buf)
+                if tabs["ids"] and cur == tabs["last"]:            # continue an established cycle
+                    tabs["idx"] = (tabs["idx"] + 1) % len(tabs["ids"])
+                else:
+                    ctx = _id_ctx(cur)
+                    if not (ctx and ctx[2]):
+                        tabs.update(ids=[], idx=-1, last=None); continue
+                    tabs.update(prefix=ctx[0], ids=ctx[2], idx=0)
+                newbuf = tabs["prefix"] + tabs["ids"][tabs["idx"]]
+                tabs["last"] = newbuf
+                buf[:], pos = list(newbuf), len(newbuf); redraw()
+            elif ch == b"\x04":                        # Ctrl-D
                 if not buf:
                     sys.stdout.write("\r\n"); return None, "eof"
             elif ch in (b"\x7f", b"\x08"):             # backspace
