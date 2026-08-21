@@ -937,6 +937,43 @@ def _install_stdout_router():
     return _STDOUT
 
 
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _call_label(name, args):
+    """Short live-status label for a tool call: the sub-agent's skill/seat, else the tool."""
+    if name == "spawn_agent" and isinstance(args, dict):
+        sk = (args.get("skill") or "").strip()
+        if sk:
+            return sk
+        mdl = (args.get("model") or "").strip()
+        if mdl:
+            return mdl.split("-")[-1] if "-" in mdl else mdl   # cloud-small → small
+        return "agent"
+    return name
+
+
+def _agents_ticker(labels, states, stop):
+    """Live one-line spinner over parallel agents until `stop` is set. Runs on its own
+    thread and writes to the real terminal (the workers write to their own buffers, so this
+    is the only thing on screen while they run); the caller wipes the line when they return."""
+    f = 0
+    while not stop.wait(0.1 if f else 0):
+        frame = _SPIN[f % len(_SPIN)]
+        segs = []
+        for lab, st in zip(labels, states):
+            g = f"{GREEN_BUILD}✓{RESET}" if st == "done" else (frame if st == "running" else "·")
+            segs.append(f"{lab} {g}")
+        done = sum(1 for s in states if s == "done")
+        line = f"{DIM}  {frame} agents {done}/{len(states)} · {RESET}" + f"{DIM} · {RESET}".join(segs)
+        w = max(20, shutil.get_terminal_size((80, 24)).columns)
+        if _vlen(line) >= w:                       # too wide → compact summary
+            running = sum(1 for s in states if s == "running")
+            line = f"{DIM}  {frame} {len(states)} agents · {running} running · {done} done{RESET}"
+        sys.stdout.write("\r\033[K" + line); sys.stdout.flush()
+        f += 1
+
+
 def _subagent_system(cwd, skill):
     """A sub-agent's system prompt: grounding + the cwd's folder context + one skill brief +
     autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills."""
@@ -2720,8 +2757,10 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 decided.append((tc, name, args, tool, allow, reason))
             res["tool_calls"] += len(decided)
 
-            def _run_one(item, buffered):
+            def _run_one(item, buffered, states=None, idx=None):
                 tc, name, args, tool, allow, reason = item
+                if states is not None:
+                    states[idx] = "running"
                 buf = io.StringIO()
                 if buffered and _STDOUT is not None:
                     _STDOUT.capture(buf)
@@ -2739,15 +2778,34 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 finally:
                     if buffered and _STDOUT is not None:
                         _STDOUT.release()
+                    if states is not None:
+                        states[idx] = "done"
                 return tc, out, shown, buf.getvalue()
 
             if len(decided) <= 1:
                 results = [_run_one(it, False) for it in decided]
             else:
                 buffered = not quiet
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(decided))) as ex:
-                    futs = [ex.submit(_run_one, it, buffered) for it in decided]
-                    results = [f.result() for f in futs]      # submit order == tcs order
+                labels = [_call_label(nm, ar) for (tc, nm, ar, tool, allow, reason) in decided]
+                states = ["pending"] * len(decided)
+                # A live spinner naming the in-flight agents runs while their output is
+                # buffered, so the UI shows what it's waiting on instead of dead air.
+                live = buffered and _STDOUT is not None and sys.stdout.isatty()
+                stop_ticker = threading.Event()
+                ticker = None
+                if live:
+                    ticker = threading.Thread(target=_agents_ticker,
+                                              args=(labels, states, stop_ticker), daemon=True)
+                    ticker.start()
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(decided))) as ex:
+                        futs = [ex.submit(_run_one, it, buffered, states, i)
+                                for i, it in enumerate(decided)]
+                        results = [f.result() for f in futs]   # submit order == tcs order
+                finally:
+                    if ticker is not None:
+                        stop_ticker.set(); ticker.join(timeout=1.0)
+                        sys.stdout.write("\r\033[K"); sys.stdout.flush()   # wipe the status line
 
             for tc, out, shown, printed in results:
                 if printed:
