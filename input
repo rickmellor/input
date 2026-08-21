@@ -182,6 +182,7 @@ _CMD_HINTS = {
     "/new":     "start a fresh session — wipe history, stats, goal, skills, sidebars, mode",
     "/clear":   "clear the conversation history (keeps stats) and reset mode",
     "/help":    "list all capabilities · /help <command> for one command",
+    "/gate":    "risk auto-run tolerance · /gate <level> · interactive|auto <level>",
 }
 
 
@@ -193,7 +194,7 @@ def _command_hint_lines(buf):
     if cmd in _CMD_HINTS:
         return [f"{DIM}  {cmd}  {_CMD_HINTS[cmd]}{RESET}"]
     return [f"{DIM}  commands:{RESET}",
-            f"{DIM}  /help  /new  /clear  /build  /jobs  /plan  /goal  /sidebar  /skill  /context  "
+            f"{DIM}  /help  /new  /clear  /build  /jobs  /gate  /plan  /goal  /sidebar  /skill  /context  "
             f"/mcp  /tools  /models  /mode  /seats  /memory  /quit{RESET}"]
 
 
@@ -211,6 +212,7 @@ _HELP = [
     ("Agents & autonomy", [
         ("/goal", "work autonomously toward exit criteria until met or hard-blocked"),
         ("/jobs", "detached background jobs (build / run / review) + a status table"),
+        ("/gate", "risk tolerance — how much auto-runs before review, live vs. dark"),
         ("mini-5s", "the agent delegates self-contained sub-tasks via sub-agents"),
     ]),
     ("Plans (MegaPlan)", [
@@ -251,6 +253,19 @@ _HELP_TOPICS = {
         "  /goal answer <text>     reply to a BLOCKED goal to resume it\n"
         "Hard-reasoning goals run on the strong cloud-large seat and delegate mechanical work to\n"
         "sub-agents. Esc or ^C interrupts; say 'continue' to push a paused goal further."
+    ),
+    "/gate": (
+        "Set the risk tolerance for tool execution — how much auto-runs before review kicks in.\n"
+        "A fast local model rates each shell command none < low < medium < high < critical; the\n"
+        "tolerance is the highest level that auto-runs, and anything above it is gated. The\n"
+        "catastrophic-command denylist is a SEPARATE hard floor that always blocks, everywhere.\n"
+        "  interactive  live turns: over tolerance → you confirm (run? [y/N])\n"
+        "  autonomous   dark jobs: over tolerance → the job blocks for /jobs answer approval\n"
+        "  /gate                   show both tolerances\n"
+        "  /gate <level>           set BOTH to <level>\n"
+        "  /gate interactive <level>   set the live-turn tolerance only\n"
+        "  /gate auto <level>          set the dark-job tolerance only\n"
+        "Level ∈ none | low | medium | high | critical. Persists in settings (gate.*)."
     ),
     "/jobs": (
         "Run work in the background as DETACHED processes that survive quitting input. Each job\n"
@@ -950,6 +965,26 @@ def _confirm():
         return False
 
 
+# --- risk gate policy: how much risk auto-runs before review kicks in ------------------
+# gemma rates each command none<low<medium<high<critical. `gate` tolerance = the highest
+# level that auto-runs; anything ABOVE it is gated — a confirm prompt in a live turn, a
+# block-for-/jobs-answer in a dark job. The catastrophic denylist is a separate hard floor.
+_RISK_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_RISK_LEVELS = ("none", "low", "medium", "high", "critical")
+
+
+def gate_tolerance(dark=False):
+    """The configured auto-run tolerance for live turns (default 'low') or dark jobs."""
+    g = load_settings().get("gate") or {}
+    lvl = str(g.get("autonomous" if dark else "interactive", "low")).lower()
+    return lvl if lvl in _RISK_RANK else "low"
+
+
+def _over_tolerance(risk, tol):
+    """True when a rated risk exceeds the tolerance (unknown/unrated treated as medium)."""
+    return _RISK_RANK.get(risk, 2) > _RISK_RANK.get(tol, 1)
+
+
 def _gate_reviewer(cmd):
     """Unrestricted mode: a reviewer model gates and YOU are never prompted. Only the
     catastrophic denylist and `critical` risk are blocked; everything else (high and below)
@@ -979,11 +1014,12 @@ def _gate(policy, cmd):
         return _confirm()
     if policy == "review" and cmd:
         v = review(cmd)
-        if v and v[0] in ("none", "low"):
-            print(f"{DIM}  gemma: {v[0]} risk — auto-run{RESET}")
+        tol = gate_tolerance(dark=False)
+        if v and not _over_tolerance(v[0], tol):
+            print(f"{DIM}  gemma: {v[0]} risk (≤ {tol}) — auto-run{RESET}")
             return True
         if v:
-            print(f"{YEL}  gemma: {v[0]} risk — {v[1]}{RESET}")
+            print(f"{YEL}  gemma: {v[0]} risk (> {tol}) — {v[1]}{RESET}")
         else:
             print(f"{YEL}  gemma review unavailable — confirm{RESET}")
         return _confirm()
@@ -3525,7 +3561,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /sidebar /location /think /clear /new · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /gate /goal /plan /build /jobs /sidebar /location /think /clear /new · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -3763,6 +3799,32 @@ def repl():
             elif arg:
                 print(f"{DIM}mode ∈ {{{', '.join(MODES)}}} — or Shift+Tab to cycle{RESET}"); continue
             print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab cycles){RESET}")
+            continue
+        if user == "/gate" or user.startswith("/gate "):
+            arg = user[len("/gate"):].strip()
+            st = load_settings(); g = dict(st.get("gate") or {})
+            inter = str(g.get("interactive", "low")).lower()
+            auto = str(g.get("autonomous", "low")).lower()
+            _lv = "none · low · medium · high · critical"
+            if not arg:
+                print(f"{DIM}gate — highest risk that AUTO-RUNS (the catastrophic denylist always blocks){RESET}")
+                print(f"{DIM}  interactive: ≤ {CODE_FG}{inter}{RESET}{DIM}   (above → you confirm){RESET}")
+                print(f"{DIM}  autonomous:  ≤ {CODE_FG}{auto}{RESET}{DIM}   (above → job blocks for /jobs answer){RESET}")
+                print(f"{DIM}  set: /gate <level> (both) · /gate interactive <level> · /gate auto <level>   [{_lv}]{RESET}")
+            else:
+                p = arg.split()
+                w0 = p[0].lower()
+                if len(p) == 1 and w0 in _RISK_RANK:                 # /gate <level> → both
+                    g["interactive"] = g["autonomous"] = w0
+                    st["gate"] = g; save_settings(st)
+                    print(f"{DIM}gate: interactive & autonomous → ≤ {w0}{RESET}")
+                elif len(p) == 2 and w0 in ("interactive", "live", "auto", "autonomous", "jobs", "dark") \
+                        and p[1].lower() in _RISK_RANK:
+                    which = "interactive" if w0 in ("interactive", "live") else "autonomous"
+                    g[which] = p[1].lower(); st["gate"] = g; save_settings(st)
+                    print(f"{DIM}gate: {which} → ≤ {p[1].lower()}{RESET}")
+                else:
+                    print(f"{DIM}usage: /gate <level> · /gate interactive|auto <level>   [{_lv}]{RESET}")
             continue
         if user == "/build" or user.startswith("/build "):
             arg = user[len("/build"):].strip()
