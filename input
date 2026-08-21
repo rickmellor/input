@@ -1795,6 +1795,25 @@ def megaplan_call(action, **args):
         return {"error": str(e)}
 
 
+def _reopen_plan(pid):
+    """Reopen a completed plan for a re-run: mark every done task not-done and set the plan
+    status back to active. Returns (ok, message)."""
+    p = megaplan_call("get", id=pid)
+    if isinstance(p, dict) and "error" in p:
+        return False, p["error"]
+    n = 0
+    for t in p.get("tasks") or []:
+        if t.get("done"):
+            r = megaplan_call("update_task", id=pid, task_id=t["id"], done=False)
+            if isinstance(r, dict) and "error" in r:
+                return False, f"task {t.get('id')}: {r['error']}"
+            n += 1
+    r = megaplan_call("update", id=pid, status="active")
+    if isinstance(r, dict) and "error" in r:
+        return False, r["error"]
+    return True, f"reopened {n} task(s), status → active"
+
+
 _PRIO_MARK = {"critical": "‼", "high": "↑", "medium": "·", "low": "↓"}
 
 
@@ -3146,11 +3165,23 @@ def repl():
     history, thinks = [], []
     stats = Stats()
 
-    def _enter_build(pid, kickoff=True):          # load a plan and drop into BUILD mode
+    def _enter_build(pid, kickoff=True, rerun=False):   # load a plan and drop into BUILD mode
         global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
         p = megaplan_call("get", id=pid)
         if isinstance(p, dict) and "error" in p:
             print(f"{DIM}megaplan: {p['error']}{RESET}"); return False
+        if p.get("status") == "done" and not rerun:   # completed → nothing to build unless re-run
+            ans = input(f"{DIM}▸ '{pid}' is complete. Reopen all tasks and run it again? [y/N]: {RESET}").strip().lower()
+            if ans in ("y", "yes"):
+                rerun = True
+            else:
+                print(f"{DIM}(already done — /build {pid} rerun to force a re-run){RESET}"); return False
+        if rerun:
+            ok, msg = _reopen_plan(pid)
+            print(f"{DIM}↻ {msg if ok else 'reopen failed: ' + msg}{RESET}")
+            if not ok:
+                return False
+            p = megaplan_call("get", id=pid)          # refresh after reopening
         if PERM_MODE == "plan":                   # leave authoring; keep gating otherwise
             PERM_MODE = "cautious"
         PLAN_GOAL, PLAN_ID, BUILD_ID = "", pid, pid
@@ -3339,14 +3370,23 @@ def repl():
                 print(f"{DIM}{'resuming ' + jid if resume_job(jid, ans.strip()) else jid + ' is not blocked'}{RESET}")
             elif sub == "build" and rest:
                 # /jobs build is ALWAYS a detached job, so a trailing bg/background is redundant —
-                # drop it rather than mistake it for a model (that set an invalid seat "bg").
-                toks = [t for t in rest.split() if t.lower() not in ("bg", "background")]
+                # drop it (don't mistake it for a model). `rerun`/`again` reopens a done plan first.
+                rerun = any(t.lower() in ("rerun", "again", "rebuild") for t in rest.split())
+                toks = [t for t in rest.split()
+                        if t.lower() not in ("bg", "background", "rerun", "again", "rebuild")]
                 pid = toks[0] if toks else ""
                 if not pid:
-                    print(f"{DIM}usage: /jobs build <plan-id> [model]  (already backgrounded){RESET}"); continue
+                    print(f"{DIM}usage: /jobs build <plan-id> [model] [rerun]  (already backgrounded){RESET}"); continue
                 p = megaplan_call("get", id=pid)
                 if isinstance(p, dict) and "error" in p:
                     print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
+                if rerun:                              # detached runner can't prompt — reopen now
+                    ok, msg = _reopen_plan(pid)
+                    print(f"{DIM}↻ {msg if ok else 'reopen failed: ' + msg}{RESET}")
+                    if not ok:
+                        continue
+                elif p.get("status") == "done":
+                    print(f"{DIM}note: {pid} is complete — add 'rerun' to reopen its tasks first{RESET}")
                 jid = submit_job("build", f"build {pid}", "", cwd=os.getcwd(), plan_id=pid,
                                  model=(toks[1] if len(toks) > 1 else "saint"))
                 _JOBS_SEEN[jid] = "queued"
@@ -3407,18 +3447,28 @@ def repl():
             if arg.lower() in ("off", "done", "stop", "exit"):
                 BUILD_ID = ""
                 print(f"{DIM}build mode off{RESET}"); continue
-            bg = False
-            if arg.split() and arg.split()[-1].lower() in ("bg", "background"):   # /build <id> bg → detached job
-                bg = True; arg = " ".join(arg.split()[:-1])
+            bg = rerun = False                         # trailing flags: bg → detached, rerun → reopen first
+            words = arg.split()
+            while words and words[-1].lower() in ("bg", "background", "rerun", "again", "rebuild"):
+                if words.pop().lower() in ("bg", "background"):
+                    bg = True
+                else:
+                    rerun = True
+            arg = " ".join(words)
             pid = arg or PLAN_ID or plan_pick("build")   # explicit id, the loaded plan, or pick
             if not pid:
-                print(f"{DIM}usage: /build <id> [bg]  (or /plan load one first){RESET}"); continue
+                print(f"{DIM}usage: /build <id> [bg] [rerun]  (or /plan load one first){RESET}"); continue
             if bg:
+                if rerun:                              # a detached job can't prompt — reopen now
+                    ok, msg = _reopen_plan(pid)
+                    print(f"{DIM}↻ {msg if ok else 'reopen failed: ' + msg}{RESET}")
+                    if not ok:
+                        continue
                 jid = submit_job("build", f"build {pid}", "", cwd=os.getcwd(), plan_id=pid, model="saint")
                 _JOBS_SEEN[jid] = "queued"
                 print(f"{DIM}● job {jid} — building {pid} in the background · /jobs show {jid}{RESET}")
             else:
-                _enter_build(pid)
+                _enter_build(pid, rerun=rerun)
             continue
         if user in ("/models", "/model"):
             models_menu(); continue
