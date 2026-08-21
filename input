@@ -2041,7 +2041,14 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
             saint_b = r.headers.get("x-saint-backend")  # only SAINT sets x-saint-*
             dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
             cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
-            bits = " · ".join(x for x in (f"{dom}/{cx}" if dom else "", cls, state) if x)
+            _meta = []
+            if dom:
+                _meta.append(f"class: {dom}/{cx}")
+            if cls:
+                _meta.append(f"classifier: {cls}")
+            if state:
+                _meta.append(f"state: {state}")
+            paren = f" ({', '.join(_meta)})" if _meta else ""
             banner_done = not saint_b
             for raw in r:
                 if interactive and _sel.select([fd], [], [], 0)[0]:
@@ -2060,9 +2067,9 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
                     continue
                 if not banner_done:  # first chunk carries the actually-served model name
                     served = chunk.get("model", "")
-                    arrow = f" >> {served}" if served and served != saint_b else ""
+                    seat = f"{saint_b}/{served}" if served and served != saint_b else saint_b
                     if not quiet:
-                        print(f"{DIM}⟿ saint → {saint_b}{arrow}" + (f" · {bits}" if bits else "") + RESET)
+                        print(f"{DIM}--saint router → {seat}{paren}{RESET}")
                     banner_done = True
                 delta = chunk["choices"][0].get("delta") or {}
                 if t_first is None and (delta.get("reasoning_content") or delta.get("reasoning")
@@ -3179,7 +3186,9 @@ def repl():
                 _safe(lambda: _rl.add_history(user))
                 print(f"{DIM}  (your text is in history — ↑ to recover){RESET}")
             continue
-        if not user or user in ("/quit", "exit"):
+        if not user:                           # blank line → just re-prompt (Ctrl-D / /quit to exit)
+            continue
+        if user in ("/quit", "exit"):
             break
         if user == "/sidebar" or user.startswith("/sidebar ") or user == "/aside" or user.startswith("/aside "):
             arg = user.split(None, 1)[1].strip() if " " in user else ""
