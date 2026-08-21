@@ -1027,8 +1027,8 @@ def _tool_spawn_agent(args):
                          budget_tokens=budget, on_tool=on_tool, gate=False)
         dt = time.monotonic() - t0
     tag = "" if res["stopped"] == "done" else f" [{res['stopped']}]"
-    rate = res["tokens_out"] / dt if dt > 0 else 0
-    dur = f"{dt:.1f}s" if dt < 10 else _fmt_dur(dt)   # decimals for short agent runs
+    rate = res["tokens_out"] / res["decode_s"] if res.get("decode_s") else 0  # decode rate, not wall
+    dur = f"{dt:.1f}s" if dt < 10 else _fmt_dur(dt)   # wall time (incl. prefill/TTFT); decimals when short
     # this sub-agent's own metrics (kept OUT of the main stats, which stay the orchestrator's)
     print(f"{DIM}  ⟳ done[{label}] {res['rounds']}r · {res['tool_calls']} tools · "
           f"↓{res['tokens_in']} ↑{res['tokens_out']} · {rate:.0f} tok/s · {dur}{tag}{RESET}")
@@ -2716,13 +2716,15 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
     toolmap = {t.name: t for t in (tools or [])}
     schemas = [t.schema() for t in toolmap.values()] or None
     res = {"text": "", "history": messages, "rounds": 0, "tool_calls": 0,
-           "tokens_in": 0, "tokens_out": 0, "stopped": "done", "error": None}
+           "tokens_in": 0, "tokens_out": 0, "decode_s": 0.0, "stopped": "done", "error": None}
     try:
         for _ in range(max_rounds):
             text, tcs, usage = stream(messages, thinks, model=model, base=base, tools=schemas,
                                       volatile=volatile, system=system, quiet=quiet, session=session)
             res["rounds"] += 1
             res["tokens_in"] += usage["prompt"] or 0; res["tokens_out"] += usage["completion"] or 0
+            if usage.get("rate"):          # decode seconds = completion / decode-rate (excl. prefill/TTFT)
+                res["decode_s"] += (usage["completion"] or 0) / usage["rate"]
             if stats is not None:
                 stats.record(usage["prompt"], usage["completion"], usage["rate"])
             res["text"] = text or res["text"]
