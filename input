@@ -565,6 +565,15 @@ _GOAL_DIRECTIVE = (
     "or a tool has failed repeatedly (3+) despite fixes. Then end your reply with ONE line "
     "`BLOCKED: <exactly what you need>` and stop. Otherwise keep going."
 )
+_GOAL_DELEGATE = (
+    "DELEGATE to conserve this seat: you are running on a strong, expensive seat, and you have "
+    "`spawn_agent` — it runs a sub-agent on a cheaper seat by default (pin one with `model` when a "
+    "sub-task needs more power). Offload self-contained, mechanical, or independent sub-tasks to it "
+    "— scaffolding a file, running a test suite, gathering facts, drafting boilerplate — and fan "
+    "several out in parallel when they are independent. Keep your own turns for planning, hard "
+    "reasoning, integration, and judgment. Quality-critical work may stay with you, but do not "
+    "spend this seat on routine grunt work a sub-agent can do."
+)
 _GOAL_MET_RE = re.compile(r"^\s*GOAL MET\b", re.M)
 _GOAL_BLOCKED_RE = re.compile(r"^\s*BLOCKED:\s*(.+)$", re.M)
 
@@ -650,6 +659,8 @@ def system_prompt(cwd=None):
         s = (s + "\n\n" + b) if s else b
     if GOAL:                                  # exit-criteria contract (stable → cache-safe)
         g = _GOAL_DIRECTIVE.format(goal=GOAL)
+        if GOAL_SEAT:                         # goal pinned to the strong/expensive seat → delegate
+            g += "\n\n" + _GOAL_DELEGATE
         s = (s + "\n\n" + g) if s else g
     return s
 
