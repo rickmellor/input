@@ -179,6 +179,8 @@ _CMD_HINTS = {
     "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
     "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
     "/context": "show the active AGENTS.md stack + loaded skills",
+    "/new":     "start a fresh session — wipe history, stats, goal, skills, sidebars, mode",
+    "/clear":   "clear the conversation history (keeps stats) and reset mode",
 }
 
 
@@ -190,8 +192,8 @@ def _command_hint_lines(buf):
     if cmd in _CMD_HINTS:
         return [f"{DIM}  {cmd}  {_CMD_HINTS[cmd]}{RESET}"]
     return [f"{DIM}  commands:{RESET}",
-            f"{DIM}  /build  /jobs  /plan  /goal  /sidebar  /skill  /context  /mcp  /tools  "
-            f"/models  /mode  /seats  /memory  /quit{RESET}"]
+            f"{DIM}  /new  /clear  /build  /jobs  /plan  /goal  /sidebar  /skill  /context  /mcp  "
+            f"/tools  /models  /mode  /seats  /memory  /quit{RESET}"]
 MAX_AUTO_STEPS = 8
 # SAINT extracts volatile per-turn context placed after this marker in the system prompt
 # and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
@@ -3294,7 +3296,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /sidebar /location /think /clear · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /sidebar /location /think /clear /new · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -3850,6 +3852,15 @@ def repl():
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             print("(history cleared)"); continue
+        if user == "/new":                             # full reset — a brand-new session
+            history.clear(); thinks.clear()
+            stats = Stats()                            # zero the token/turn counters
+            SIDEBARS.clear(); LOADED_SKILLS.clear()    # drop sidebars + session-loaded skills
+            GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
+            PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
+            SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh SAINT affinity
+            print(f"{DIM}(new session — context, stats, goal, skills, sidebars and mode all reset){RESET}")
+            continue
         _turn(history, thinks, user, stats)
         print(_status_line(stats))
         _offer_build()                             # if the model just saved a plan, offer to build it
