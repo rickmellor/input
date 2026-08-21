@@ -3496,9 +3496,9 @@ def job_state(m):
     if st == "running":
         if m.get("pid") and not _pid_alive(m["pid"]):
             return "dead"                      # process gone but never wrote a terminal state
-        if m.get("active_tool"):               # blocked on a tool call = WORKING, not stalled;
+        if m.get("active_count", 0) > 0 or m.get("active_tool"):   # ≥1 tool in flight = WORKING
             if time.time() - (m.get("active_since") or 0) > _JOB_TOOL_HANG_S:
-                return "stalled"               # …unless that one call has run absurdly long
+                return "stalled"               # …unless a call has run absurdly long (30m)
             return "running"
         if time.time() - (m.get("last_activity") or m.get("started") or 0) > _JOB_HANG_S:
             return "stalled"
@@ -3563,20 +3563,33 @@ def run_job(jid):
     seat = pin or (reasoning_seat() if m.get("kind") == "build" else agentic_seat(goal))
     mo, bo = _resolve_seat(seat) or SEATS.get("saint") or (MODEL, BASE)
     _write_meta(jid, state="running", started=m.get("started") or time.time(),
-                pid=os.getpid(), last_activity=time.time())
+                pid=os.getpid(), last_activity=time.time(), active_count=0, active_tool=None)
     logline("start", goal=goal, model=mo)
+
+    # In-flight counter: tools run CONCURRENTLY (parallel dispatch), so track how many are
+    # in flight — the job is 'working' while any are, even if a fast one finished first. A
+    # single active_tool field would clear on the first result and mislabel a long call stalled.
+    _inflight = {"n": 0, "since": 0.0, "calls": (m.get("tool_calls") or 0)}
+    _inflight_lock = threading.Lock()
 
     def on_tool(ev, tc, out):
         fn = tc.get("function") or {}
         if ev == "call":
             logline("tool_call", name=fn.get("name"), args=(fn.get("arguments") or "")[:400])
-            _write_meta(jid, last_activity=time.time(),      # a long call is activity, not a hang
-                        active_tool=fn.get("name"), active_since=time.time())
+            with _inflight_lock:
+                _inflight["n"] += 1
+                if _inflight["n"] == 1:
+                    _inflight["since"] = time.time()
+                n, since = _inflight["n"], _inflight["since"]
+            _write_meta(jid, last_activity=time.time(), active_tool=fn.get("name"),
+                        active_since=since, active_count=n)
         else:
             logline("tool_result", name=fn.get("name"), out=(out or "")[:400])
-            cur = _read_meta(jid) or {}
-            _write_meta(jid, last_activity=time.time(), active_tool=None,
-                        tool_calls=(cur.get("tool_calls") or 0) + 1)
+            with _inflight_lock:
+                _inflight["n"] = max(0, _inflight["n"] - 1); _inflight["calls"] += 1
+                n, calls = _inflight["n"], _inflight["calls"]
+            _write_meta(jid, last_activity=time.time(), active_count=n, tool_calls=calls,
+                        active_tool=None if n == 0 else fn.get("name"))
         return None
 
     sysfull = system + "\n\n" + _GOAL_DIRECTIVE.format(goal=goal)
@@ -3592,7 +3605,7 @@ def run_job(jid):
         need = (f"approve command (risk {na['risk']}): {na['cmd']}"
                 + (f"  — {na['reason']}" if na.get("reason") else ""))
         json.dump(res["history"], open(hp, "w"))
-        _write_meta(jid, state="blocked", need=need, active_tool=None,
+        _write_meta(jid, state="blocked", need=need, active_tool=None, active_count=0,
                     pending_cmd=na["cmd"], approved_cmd=None)   # consume any prior one-time approval
         logline("blocked_approval", cmd=na["cmd"], risk=na["risk"])
     elif res.get("blocked"):
