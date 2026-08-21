@@ -3182,7 +3182,9 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
 # metrics and log.jsonl for progress; kill = signal the recorded pid; a hard block parks the
 # job (state=blocked + need + saved history) and `/jobs answer` relaunches it to resume.
 _JOBS_DIR = os.path.expanduser("~/.config/input/jobs")
-_JOB_HANG_S = 180          # no tool activity this long while 'running' → flagged as maybe-hung
+_JOB_HANG_S = 180          # idle this long BETWEEN tool calls while 'running' → maybe-hung
+_JOB_TOOL_HANG_S = 1800     # a single tool call in flight this long (30m) → maybe-hung. Higher
+                           # because tools like aco_review legitimately run for many minutes.
 _JOB_MAX_ROUNDS = 80
 
 
@@ -3230,6 +3232,10 @@ def job_state(m):
     if st == "running":
         if m.get("pid") and not _pid_alive(m["pid"]):
             return "dead"                      # process gone but never wrote a terminal state
+        if m.get("active_tool"):               # blocked on a tool call = WORKING, not stalled;
+            if time.time() - (m.get("active_since") or 0) > _JOB_TOOL_HANG_S:
+                return "stalled"               # …unless that one call has run absurdly long
+            return "running"
         if time.time() - (m.get("last_activity") or m.get("started") or 0) > _JOB_HANG_S:
             return "stalled"
     return st
@@ -3300,10 +3306,13 @@ def run_job(jid):
         fn = tc.get("function") or {}
         if ev == "call":
             logline("tool_call", name=fn.get("name"), args=(fn.get("arguments") or "")[:400])
+            _write_meta(jid, last_activity=time.time(),      # a long call is activity, not a hang
+                        active_tool=fn.get("name"), active_since=time.time())
         else:
             logline("tool_result", name=fn.get("name"), out=(out or "")[:400])
             cur = _read_meta(jid) or {}
-            _write_meta(jid, last_activity=time.time(), tool_calls=(cur.get("tool_calls") or 0) + 1)
+            _write_meta(jid, last_activity=time.time(), active_tool=None,
+                        tool_calls=(cur.get("tool_calls") or 0) + 1)
         return None
 
     sysfull = system + "\n\n" + _GOAL_DIRECTIVE.format(goal=goal)
