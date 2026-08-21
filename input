@@ -264,7 +264,10 @@ _HELP_TOPICS = {
         "  /jobs answer <id> <text>    reply to a job that parked on a block\n"
         "  /jobs build <plan> [rerun]  build a MegaPlan in the background\n"
         "  /jobs run <goal>            a goal-directed background job\n"
-        "  /jobs review <target>       an ACO adversarial review as a job"
+        "  /jobs review <path>         adversarially review a FILE or DIRECTORY (its code) with\n"
+        "                              ACO in the background — a reviewers → killers → oracle\n"
+        "                              pipeline across model families that returns\n"
+        "                              accepted/refuted findings and a verdict"
     ),
     "/build": (
         "Execute a MegaPlan to completion — the agent works its tasks one at a time, marking\n"
@@ -3706,7 +3709,7 @@ def repl():
                 print(f"{DIM}● job {jid} — ACO review of {tgt} in the background · /jobs show {jid}{RESET}")
             else:
                 print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · "
-                      f"build <plan-id> [model] · run <goal…> · review <target>{RESET}")
+                      f"build <plan-id> [model] · run <goal…> · review <file|dir path>{RESET}")
             continue
         if user == "/goal" or user.startswith("/goal "):
             arg = user[len("/goal"):].strip()
