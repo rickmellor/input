@@ -953,27 +953,28 @@ def _call_label(name, args):
     return name
 
 
-def _agents_ticker(labels, states, stop):
-    """Live multi-line spinner over parallel agents: a header + one indented line per agent,
-    redrawn in place until `stop` is set. Runs on its own thread and writes to the real
-    terminal (workers write to their own buffers, so this is the only thing on screen while
-    they run). Self-clears the whole block on stop, so the caller needn't know its height."""
-    n = len(labels)
-    width = min(40, max((len(l) for l in labels), default=0))
+def _agents_ticker(agents, stop):
+    """Live multi-line spinner over parallel agents: a header + one indented line per agent
+    carrying a running elapsed clock (s → Mm SSs → Hh MMm via _fmt_dur), redrawn in place
+    until `stop` is set. Own thread, writes to the real terminal (workers write to their own
+    buffers). Self-clears the whole block on stop, so the caller needn't know its height."""
+    n = len(agents)
+    width = min(40, max((len(a["label"]) for a in agents), default=0))
     drawn, f = 0, 0
     while not stop.wait(0.1 if f else 0):
         frame = _SPIN[f % len(_SPIN)]
-        done = sum(1 for s in states if s == "done")
-        run = sum(1 for s in states if s == "running")
+        now = time.monotonic()
+        done = sum(1 for a in agents if a["state"] == "done")
+        run = sum(1 for a in agents if a["state"] == "running")
         out = [f"{DIM}  {frame} {n} agents · {run} running · {done} done{RESET}"]
-        for lab, st in zip(labels, states):
-            if st == "done":
-                mark = f"{GREEN_BUILD}✓ done{RESET}"
-            elif st == "running":
-                mark = f"{frame} running"
+        for a in agents:
+            cell = f"{a['label'][:width]:<{width}}"
+            if a["state"] == "done":
+                out.append(f"{DIM}      {cell}  {RESET}{GREEN_BUILD}✓{RESET}{DIM} done · {_fmt_dur(a['dur'] or 0)}{RESET}")
+            elif a["state"] == "running":
+                out.append(f"{DIM}      {cell}  {frame} running · {_fmt_dur(now - (a['start'] or now))}{RESET}")
             else:
-                mark = "· queued"
-            out.append(f"{DIM}      {lab[:width]:<{width}}  {mark}{RESET}")
+                out.append(f"{DIM}      {cell}  · queued{RESET}")
         buf = (f"\033[{drawn}A" if drawn else "") + "".join("\r\033[K" + ln + "\n" for ln in out)
         sys.stdout.write(buf); sys.stdout.flush()
         drawn, f = len(out), f + 1
@@ -2805,10 +2806,10 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 decided.append((tc, name, args, tool, allow, reason))
             res["tool_calls"] += len(decided)
 
-            def _run_one(item, buffered, states=None, idx=None):
+            def _run_one(item, buffered, agents=None, idx=None):
                 tc, name, args, tool, allow, reason = item
-                if states is not None:
-                    states[idx] = "running"
+                if agents is not None:
+                    agents[idx]["state"] = "running"; agents[idx]["start"] = time.monotonic()
                 buf = io.StringIO()
                 if buffered and _STDOUT is not None:
                     _STDOUT.capture(buf)
@@ -2826,28 +2827,29 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 finally:
                     if buffered and _STDOUT is not None:
                         _STDOUT.release()
-                    if states is not None:
-                        states[idx] = "done"
+                    if agents is not None:
+                        agents[idx]["state"] = "done"
+                        agents[idx]["dur"] = time.monotonic() - (agents[idx]["start"] or time.monotonic())
                 return tc, out, shown, buf.getvalue()
 
             if len(decided) <= 1:
                 results = [_run_one(it, False) for it in decided]
             else:
                 buffered = not quiet
-                labels = [_call_label(nm, ar) for (tc, nm, ar, tool, allow, reason) in decided]
-                states = ["pending"] * len(decided)
-                # A live spinner naming the in-flight agents runs while their output is
-                # buffered, so the UI shows what it's waiting on instead of dead air.
+                agents = [{"label": _call_label(nm, ar), "state": "pending", "start": None, "dur": None}
+                          for (tc, nm, ar, tool, allow, reason) in decided]
+                # A live spinner naming the in-flight agents (with a running elapsed clock) shows
+                # what the UI is waiting on while their output is buffered, instead of dead air.
                 live = buffered and _STDOUT is not None and sys.stdout.isatty()
                 stop_ticker = threading.Event()
                 ticker = None
                 if live:
                     ticker = threading.Thread(target=_agents_ticker,
-                                              args=(labels, states, stop_ticker), daemon=True)
+                                              args=(agents, stop_ticker), daemon=True)
                     ticker.start()
                 try:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(decided))) as ex:
-                        futs = [ex.submit(_run_one, it, buffered, states, i)
+                        futs = [ex.submit(_run_one, it, buffered, agents, i)
                                 for i, it in enumerate(decided)]
                         results = [f.result() for f in futs]   # submit order == tcs order
                 finally:
