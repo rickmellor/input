@@ -517,6 +517,8 @@ GOAL = ""              # the session's exit criteria ("" = none)
 GOAL_SEAT = ""         # seat the goal loop is pinned to (set when the goal is HARD; "" = active seat)
 GOAL_BLOCKED = ""      # the precise need when the session is hard-blocked ("" = not blocked)
 GOAL_MAX_NUDGES = 4    # per turn: how many times we push the model back to work before pausing
+GOAL_MAX_ROUNDS = 40   # tool-round budget PER goal segment (vs MAX_TOOL_ROUNDS for a plain turn)
+GOAL_MAX_SEGMENTS = 6  # times we auto-continue a goal that's still working after a segment
 
 
 def reasoning_seat():
@@ -3169,23 +3171,40 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         user = f"(Answer to your BLOCKED need — {GOAL_BLOCKED!r}): {user}"
         GOAL_BLOCKED = ""
     tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
-    terminate = goal_terminate(GOAL, GOAL_MAX_NUDGES) if GOAL else None
     if GOAL and GOAL_SEAT and GOAL_SEAT in SEATS and (model, base) == (None, None):
         model, base = SEATS[GOAL_SEAT]         # hard goal → pin the loop to the capable seat
+    maxr = GOAL_MAX_ROUNDS if GOAL else MAX_TOOL_ROUNDS
     try:
-        res = run_thread(user, history=history, tools=tools, model=model, base=base, quiet=False,
-                         stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True,
-                         terminate=terminate)
+        nxt, seg = user, 0
+        while True:
+            terminate = goal_terminate(GOAL, GOAL_MAX_NUDGES) if GOAL else None
+            res = run_thread(nxt, history=history, tools=tools, model=model, base=base, quiet=False,
+                             stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True,
+                             terminate=terminate, max_rounds=maxr)
+            # A goal still actively working (hit the round budget, no GOAL MET/BLOCKED yet) is NOT
+            # done — auto-continue instead of dying mid-task, bounded so it can't spin forever.
+            if (GOAL and res["stopped"] == "rounds" and not res.get("goal_met")
+                    and not res.get("blocked") and not res["error"] and seg < GOAL_MAX_SEGMENTS):
+                seg += 1
+                print(f"{DIM}  ↻ goal in progress — {res['rounds']} rounds this segment; "
+                      f"continuing ({seg}/{GOAL_MAX_SEGMENTS})…{RESET}")
+                nxt = ("You have not signalled completion. Keep working toward the goal. When the exit "
+                       "criteria are genuinely met end with `GOAL MET: <evidence>`; if hard-blocked, "
+                       "`BLOCKED: <need>`.")
+                recalled = None                   # don't re-recall memory on continuations
+                continue
+            break
     except KeyboardInterrupt:
-        print(f"{RESET}\n(interrupted)"); return
-    if res["stopped"] == "rounds":
-        print(f"{DIM}(stopped after {MAX_TOOL_ROUNDS} tool rounds){RESET}")
+        print(f"{RESET}\n(interrupted — goal still set; 'continue' resumes, /goal off clears)"); return
     if res.get("blocked"):
         notify_blocked("session goal", res["blocked"])
     elif res.get("goal_met"):
         print(f"{GREEN_BUILD}{BOLD}✔ GOAL MET{RESET}{DIM} — {GOAL[:80]}  (/goal off to clear){RESET}")
-    elif res.get("goal_paused"):
-        print(f"{DIM}(goal not met after {GOAL_MAX_NUDGES} continues — pausing; say 'continue' to push on, /goal off to drop it){RESET}")
+    elif GOAL and (res["stopped"] == "rounds" or res.get("goal_paused")):
+        print(f"{YEL}◐ goal paused{RESET}{DIM} — worked {res['rounds']} rounds without a GOAL MET. "
+              f"Say 'continue' to push on · /goal off to stop · /goal shows status.{RESET}")
+    elif res["stopped"] == "rounds":
+        print(f"{DIM}(stopped after {maxr} tool rounds — say 'continue' to keep going){RESET}")
     if res["error"]:
         print(f"[error: {res['error']}]")
     else:
@@ -3461,10 +3480,12 @@ def repl():
                 GOAL, GOAL_BLOCKED = arg, ""
                 dom, cx = classify_complexity(arg)      # hard reasoning → capable seat for the loop
                 GOAL_SEAT = reasoning_seat() if cx == "hard" else ""
-                print(f"{DIM}● goal set — the agent will work toward it until met or hard-blocked:\n  {arg}{RESET}")
+                print(f"{GREEN_BUILD}● goal set{RESET}{DIM} — working toward it now until met or hard-blocked:\n  {arg}{RESET}")
                 if GOAL_SEAT:
-                    print(f"{DIM}  ({dom}/{cx} → running the goal loop on {GOAL_SEAT}; hard reasoning off weak seats){RESET}")
-                print(f"{DIM}  (it ends with `GOAL MET: <evidence>` or `BLOCKED: <need>`; /goal off clears){RESET}")
+                    print(f"{DIM}  ({dom}/{cx} → goal loop on {GOAL_SEAT}; hard reasoning off weak seats){RESET}")
+                print(f"{DIM}  ends with GOAL MET / BLOCKED · Esc or ^C interrupts · /goal off to stop{RESET}")
+                _turn(history, thinks, "Begin now: work toward the goal until the exit criteria are met.", stats)
+                print(_status_line(stats))
             else:
                 if GOAL:
                     st = f"{RED_VIVID}BLOCKED — needs: {GOAL_BLOCKED}{RESET}" if GOAL_BLOCKED else "active"
