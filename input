@@ -3618,7 +3618,9 @@ def repl():
             rest = parts[2].strip() if len(parts) > 2 else ""
             _JST = {"queued": DIM, "running": CODE_FG, "blocked": RED_VIVID, "done": GREEN_BUILD,
                     "failed": RED_VIVID, "dead": RED_VIVID, "stalled": YEL, "killed": DIM}
-            if sub in ("", "list", "ls"):
+            if sub in ("", "list", "ls") or (sub in ("show", "status", "log", "tail") and not rest):
+                if sub in ("show", "status", "log", "tail"):
+                    print(f"{DIM}(need a job id — here are the jobs; /jobs {sub} <id> for one){RESET}")
                 js = list_jobs()
                 if not js:
                     print(f"{DIM}no jobs — /jobs build <plan-id> · /jobs run <goal…>{RESET}")
