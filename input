@@ -236,12 +236,161 @@ _HELP = [
 ]
 
 
+# Fuller per-command explanations for `/help <command>` (the Ctrl+R _CMD_HINTS stay terse).
+_HELP_TOPICS = {
+    "/goal": (
+        "Set an exit criterion and let the agent work toward it autonomously, across as many\n"
+        "tool rounds as it takes — it starts immediately (no need to say 'go') and keeps going\n"
+        "as long as it's making progress. It stops only when the goal is met (it ends with a\n"
+        "`GOAL MET:` line and clears itself), when it hits a HARD block — needs a secret, an\n"
+        "ambiguous decision only you can make, or a destructive step — in which case it parks\n"
+        "as `BLOCKED:` and asks you, or when it STALLS (no new work for a few rounds).\n"
+        "  /goal <criteria>        set the goal and begin\n"
+        "  /goal                   show the current goal and status\n"
+        "  /goal off               abandon the goal\n"
+        "  /goal answer <text>     reply to a BLOCKED goal to resume it\n"
+        "Hard-reasoning goals run on the strong cloud-large seat and delegate mechanical work to\n"
+        "sub-agents. Esc or ^C interrupts; say 'continue' to push a paused goal further."
+    ),
+    "/jobs": (
+        "Run work in the background as DETACHED processes that survive quitting input. Each job\n"
+        "has a filesystem process-table entry (status, tokens, rounds, last activity), so any\n"
+        "session can check on it, and a finished or blocked job surfaces a notice at your next\n"
+        "prompt.\n"
+        "  /jobs                       list all jobs with status + progress\n"
+        "  /jobs show <id>             full detail for one job\n"
+        "  /jobs log <id>              stream its log\n"
+        "  /jobs stop <id>             kill a running job\n"
+        "  /jobs answer <id> <text>    reply to a job that parked on a block\n"
+        "  /jobs build <plan> [rerun]  build a MegaPlan in the background\n"
+        "  /jobs run <goal>            a goal-directed background job\n"
+        "  /jobs review <target>       an ACO adversarial review as a job"
+    ),
+    "/build": (
+        "Execute a MegaPlan to completion — the agent works its tasks one at a time, marking\n"
+        "each done and respecting dependencies, until the whole plan is complete.\n"
+        "  /build                  pick a plan (Tab in the picker fills the command line to edit)\n"
+        "  /build <id>             build it in the FOREGROUND (drops into BUILD mode)\n"
+        "  /build <id> bg          build it as a detached background job instead\n"
+        "  /build <id> rerun       reopen a completed plan's tasks, then build again\n"
+        "  /build <id> reset       reopen a completed plan WITHOUT building (mark undone only)\n"
+        "  /build off              leave BUILD mode"
+    ),
+    "/plan": (
+        "Author a plan interactively: research the problem, discuss the approach, then persist\n"
+        "it to MegaPlan (the shared, git-backed, memory-informed plan store on the NAS). Enters\n"
+        "plan mode, where the agent proposes and refines a task breakdown before saving — and\n"
+        "surfaces related prior plans and relevant memory as it goes.\n"
+        "  /plan                   enter plan mode\n"
+        "  /plan <goal>            enter plan mode aimed at a specific goal\n"
+        "  /plan load|show|archive manage saved plans\n"
+        "Once a plan is saved, /build executes it."
+    ),
+    "/skill": (
+        "Load a skill — a reusable playbook in Claude Code's SKILL.md format whose instructions\n"
+        "ride the system prompt while active. Skills are discovered from ~/.config/input/skills,\n"
+        "~/.claude/skills, and <git-root>/.claude/skills; every skill's name + description are\n"
+        "always visible to the model, and the full body loads on demand.\n"
+        "  /skill                  list available skills\n"
+        "  /skill <name>           load a skill for this session\n"
+        "  /skill off <name>       unload it\n"
+        "A skill's `model:` frontmatter pins any sub-agent that runs it to that seat."
+    ),
+    "/context": (
+        "Show the instruction layers active for the CURRENT directory: the AGENTS.md / CLAUDE.md\n"
+        "stack (global → git-root → cwd, with the file closest to your work winning on conflict)\n"
+        "plus any loaded skills. This is the folder-scoped, always-on guidance the agent is\n"
+        "following right now — check it to see what a given directory injects before you work in it."
+    ),
+    "/system": (
+        "View or edit the system-prompt TEMPLATE at ~/.config/input/system.md — the stable,\n"
+        "cache-safe grounding prepended to every turn (kept minimal so SAINT's prompt cache and\n"
+        "local prefix reuse stay warm).\n"
+        "  /system                 show the current template\n"
+        "  /system edit            open it in your editor"
+    ),
+    "/memory": (
+        "Show MemoryOS ambient-memory status — the NAS-hosted long-term memory that recalls\n"
+        "relevant facts before each turn and stores the exchange after. When it's on you'll see\n"
+        "a dim `⟐ memory: N recalled` line at the top of a turn; the recalled facts are placed\n"
+        "after the cache breakpoint so they don't invalidate the cached prefix."
+    ),
+    "/new": (
+        "Start a completely fresh session without restarting input: wipes the conversation\n"
+        "history and thinking, zeroes the token/turn stats, drops any active goal, the sidebar\n"
+        "stack, and session-loaded skills, resets the mode to cautious, and rolls a new SAINT\n"
+        "conversation id so routing affinity starts clean too. Use /clear for the lighter\n"
+        "version that only clears history."
+    ),
+    "/clear": (
+        "Clear the conversation history and thinking and reset the mode to cautious, but KEEP\n"
+        "the accumulated token/turn stats and loaded skills/goal. For a total wipe use /new."
+    ),
+    "/mode": (
+        "Switch permission mode — how tool calls that make changes are gated:\n"
+        "  cautious       YOU review risky actions (a fast model rates them; you confirm medium+)\n"
+        "  unrestricted   a reviewer model gates; you're never prompted (denylist still blocks)\n"
+        "  plan           the MegaPlan planning experience\n"
+        "  /mode <name>            set it directly\n"
+        "Shift+Tab cycles the modes from the prompt."
+    ),
+    "/sidebar": (
+        "Fork the conversation into an ASIDE — a side discussion that shares the context up to\n"
+        "the fork point, then diverges. When you finish, only the CONCLUSION folds back into the\n"
+        "main thread (not the whole tangent), so a detour doesn't bloat the main history. Nestable.\n"
+        "  /sidebar <topic>        start an aside about <topic>\n"
+        "  /sidebar merge          fold its conclusion back into the main thread\n"
+        "  /sidebar drop           discard it (nothing merged)"
+    ),
+    "/think": (
+        "Toggle whether the model's reasoning is shown. On, a dim [think] block streams before\n"
+        "the answer; off, you see only the final answer. This changes what you SEE, not how the\n"
+        "model thinks."
+    ),
+    "/tools": (
+        "Open the tool on/off menu — enable or disable individual tools the model may call\n"
+        "(run_command, spawn_agent, load_skill, MCP tools, …). Built-ins default on, MCP tools\n"
+        "default off; choices persist in settings. `/tools on` / `/tools off` is the master switch."
+    ),
+    "/mcp": (
+        "Manage MCP servers — external tool providers registered with input.\n"
+        "  /mcp                    list registered servers and their tools\n"
+        "  /mcp add <name> <url>       add an HTTP (streamable) server\n"
+        "  /mcp add <name> -- <cmd>    add a stdio server (runs the command as a subprocess)\n"
+        "Their tools auto-register disabled; enable them in /tools."
+    ),
+    "/models": (
+        "List the available models and switch the ACTIVE one for the session. The active model\n"
+        "is what a plain message routes to — saint-auto by default, which lets SAINT classify\n"
+        "and pick. The Fn keys (F7–F12) one-shot a single message to a specific seat without\n"
+        "changing the active model."
+    ),
+    "/seats": (
+        "Show the discovered fleet — every seat SAINT exposes (local + cloud tiers) with context\n"
+        "window, price and readiness — plus your Fn key bindings.\n"
+        "  /seats                  show seats + bindings\n"
+        "  /seats refresh          re-discover the fleet from SAINT"
+    ),
+    "/location": (
+        "Set your location, used to ground the system prompt (time zone, locale-aware answers).\n"
+        "  /location <place>       set and persist your location"
+    ),
+    "/help": (
+        "Show this capability reference. /help alone lists everything grouped by area;\n"
+        "/help <command> explains a single command in detail (with or without the leading slash)."
+    ),
+}
+
+
 def print_help(arg: str = "") -> None:
     """`/help` prints the grouped capability list; `/help <command>` prints one command's help."""
     arg = (arg or "").strip()
     if arg:                                            # command-specific
         cmd = arg if arg.startswith("/") else "/" + arg
-        if cmd in _CMD_HINTS:                          # richest: has flags/usage
+        topic = _HELP_TOPICS.get(cmd)
+        if topic:                                      # the fuller explanation
+            print(f"{CODE_FG}{BOLD}{cmd}{RESET}\n{DIM}{topic}{RESET}"); return
+        if cmd in _CMD_HINTS:                          # else the terse flag line
             print(f"  {CODE_FG}{cmd}{RESET}  {DIM}{_CMD_HINTS[cmd]}{RESET}"); return
         for _sec, rows in _HELP:
             for c, d in rows:
@@ -254,7 +403,7 @@ def print_help(arg: str = "") -> None:
         for c, d in rows:
             print(f"  {c:<12}{DIM}{d}{RESET}")
     print(f"\n{DIM}  keys: Esc abort · ^C copy code · ^D or /quit exit{RESET}")
-    print(f"{DIM}  /help <command> for command-specific help{RESET}")
+    print(f"{DIM}  /help <command> for a fuller explanation of one command{RESET}")
 
 
 MAX_AUTO_STEPS = 8
