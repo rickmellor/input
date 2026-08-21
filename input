@@ -1336,6 +1336,16 @@ def footer_disable():
     _FOOTER_ACTIVE = False
 
 
+def clear_screen():
+    """Clear the visible screen AND scrollback, cursor home; re-paint the footer if active."""
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\033[3J\033[2J\033[H")   # scrollback + screen + home
+    sys.stdout.flush()
+    if _FOOTER_ACTIVE:
+        render_footer()
+
+
 def _footer_loop():
     last_h = None
     while not _footer_stop.wait(1.0):
@@ -4407,6 +4417,7 @@ def repl():
             history.clear(); thinks.clear()
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
+            clear_screen()
             print("(history cleared)"); continue
         if user == "/new":                             # full reset — a brand-new session
             history.clear(); thinks.clear()
@@ -4415,6 +4426,7 @@ def repl():
             GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh SAINT affinity
+            clear_screen()
             print(f"{DIM}(new session — context, stats, goal, skills, sidebars and mode all reset){RESET}")
             continue
         _turn(history, thinks, user, stats)
