@@ -276,7 +276,8 @@ _HELP_TOPICS = {
         "  /jobs show <id>             full detail for one job\n"
         "  /jobs log <id>              stream its log\n"
         "  /jobs stop <id>             kill a running job\n"
-        "  /jobs answer <id> <text>    reply to a job that parked on a block\n"
+        "  /jobs answer <id> yes|no    approve/deny a job parked on a risky command (per /gate)\n"
+        "  /jobs answer <id> <text>    …or answer a goal-level BLOCKED need\n"
         "  /jobs build <plan> [rerun]  build a MegaPlan in the background\n"
         "  /jobs run <goal>            a goal-directed background job\n"
         "  /jobs review <path>         adversarially review a FILE or DIRECTORY (its code) with\n"
@@ -3074,9 +3075,17 @@ def sandbox_tools(sb, write=True):
     return ts
 
 
+class _NeedsApproval(Exception):
+    """Raised in a DARK (job) run when a command's risk exceeds the autonomous tolerance:
+    the job parks for `/jobs answer` approval instead of prompting (no terminal) or running."""
+    def __init__(self, cmd, risk, reason=""):
+        super().__init__(cmd)
+        self.cmd, self.risk, self.reason = cmd, risk, reason
+
+
 def run_thread(task, *, history=None, system=None, model=None, base=None, tools=None,
                max_rounds=MAX_TOOL_ROUNDS, quiet=True, stats=None, thinks=None, volatile=None,
-               terminate=None, budget_tokens=None, on_tool=None, session=None, gate=True):
+               terminate=None, budget_tokens=None, on_tool=None, session=None, gate=True, dark=None):
     """Run one agent thread. `task` is appended as the user message to `history` (a list,
     mutated in place; new list if None). `tools` = list of Tool objects (thread-local).
     `system` overrides the system prompt (e.g. system_prompt(cwd) + a brief). `terminate`
@@ -3142,6 +3151,12 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                     cmd = args.get("command") if isinstance(args, dict) else None
                     if not _gate(tool.confirm, cmd):
                         allow, reason = False, "Declined by the user; not run."
+                elif dark and getattr(tool, "confirm", "never") != "never":   # autonomous job gate
+                    cmd = args.get("command") if isinstance(args, dict) else None
+                    if cmd and cmd != dark.get("approved"):       # a pre-approved cmd runs once
+                        v = review(cmd)
+                        if v and _over_tolerance(v[0], dark.get("tol", "low")):
+                            raise _NeedsApproval(cmd, v[0], v[1] if v else "")
                 decided.append((tc, name, args, tool, allow, reason))
             res["tool_calls"] += len(decided)
 
@@ -3213,6 +3228,11 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
             res["stopped"] = "rounds"
     except KeyboardInterrupt:
         del messages[base_len:]; raise
+    except _NeedsApproval as na:                    # dark run hit an over-tolerance command
+        if messages and messages[-1].get("role") == "assistant":
+            messages.pop()                         # drop the un-run tool-call turn → clean resume
+        res["stopped"] = "approval"
+        res["needs_approval"] = {"cmd": na.cmd, "risk": na.risk, "reason": na.reason}
     except Exception as e:
         del messages[base_len:]
         res["stopped"], res["error"] = "error", f"{type(e).__name__}: {e}"
@@ -3360,11 +3380,22 @@ def run_job(jid):
         return None
 
     sysfull = system + "\n\n" + _GOAL_DIRECTIVE.format(goal=goal)
+    # Dark gate: a command over the autonomous risk tolerance parks the job for /jobs answer.
+    dark = {"tol": gate_tolerance(dark=True), "approved": m.get("approved_cmd")}
     res = run_thread(task, history=history, system=sysfull, model=mo, base=bo, tools=tools,
-                     quiet=True, on_tool=on_tool, gate=False, terminate=goal_terminate(goal, 24),
+                     quiet=True, on_tool=on_tool, gate=False, dark=dark,
+                     terminate=goal_terminate(goal, 24),
                      max_rounds=_JOB_MAX_ROUNDS, session="job-" + jid)
     _write_meta(jid, tokens_in=res["tokens_in"], tokens_out=res["tokens_out"], rounds=res["rounds"])
-    if res.get("blocked"):
+    if res.get("needs_approval"):                  # over-tolerance command → park for approval
+        na = res["needs_approval"]
+        need = (f"approve command (risk {na['risk']}): {na['cmd']}"
+                + (f"  — {na['reason']}" if na.get("reason") else ""))
+        json.dump(res["history"], open(hp, "w"))
+        _write_meta(jid, state="blocked", need=need, active_tool=None,
+                    pending_cmd=na["cmd"], approved_cmd=None)   # consume any prior one-time approval
+        logline("blocked_approval", cmd=na["cmd"], risk=na["risk"])
+    elif res.get("blocked"):
         json.dump(res["history"], open(hp, "w"))
         _write_meta(jid, state="blocked", need=res["blocked"])
         logline("blocked", need=res["blocked"])
@@ -3390,7 +3421,23 @@ def resume_job(jid, answer):
         hist = json.load(open(hp))
     except Exception:
         hist = []
-    hist.append({"role": "user", "content": f"(Answer to your BLOCKED need — {m.get('need')!r}): {answer}"})
+    pending = m.get("pending_cmd")
+    if pending is not None:                         # this was a tool-approval block (yes/no)
+        approve = (answer or "").strip().lower() in (
+            "y", "yes", "yep", "yeah", "approve", "approved", "ok", "okay", "allow", "run", "proceed")
+        if approve:
+            _write_meta(jid, approved_cmd=pending, pending_cmd=None)
+            hist.append({"role": "user", "content":
+                         f"APPROVED by the operator: you may run `{pending}`. Re-issue that command "
+                         "now and continue toward the goal."})
+        else:
+            _write_meta(jid, approved_cmd=None, pending_cmd=None)
+            hist.append({"role": "user", "content":
+                         f"DECLINED by the operator: do NOT run `{pending}`. Find another approach; "
+                         "if you genuinely cannot proceed, end your reply with `BLOCKED: <need>`."})
+    else:                                           # a goal-level BLOCKED the model raised itself
+        hist.append({"role": "user",
+                     "content": f"(Answer to your BLOCKED need — {m.get('need')!r}): {answer}"})
     json.dump(hist, open(hp, "w"))
     _write_meta(jid, state="queued", need=None)
     out = open(os.path.join(_job_dir(jid), "runner.out"), "a")
