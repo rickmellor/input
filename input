@@ -296,6 +296,8 @@ _HELP_TOPICS = {
         "  /jobs load <id>             pull a job's task + result into THIS session (lightweight —\n"
         "                              a path to the full history, not a fat prefill) so you can\n"
         "                              act on its findings; the agent reads the history if it digs\n"
+        "  /jobs rm <id>               delete a finished job's files · rm done = all finished ·\n"
+        "                              rm all / clean = every finished job (active ones are kept)\n"
         "At an <id> field, Tab cycles the valid ids and Ctrl+Enter opens a picker to drop one in."
     ),
     "/build": (
@@ -2819,7 +2821,7 @@ def _id_ctx(text):
     cmd = toks[0].lower()
     if cmd == "/jobs":
         if len(toks) < 2 or toks[1].lower() not in (
-                "show", "log", "tail", "status", "stop", "answer", "load"):
+                "show", "log", "tail", "status", "stop", "answer", "load", "rm", "delete", "del"):
             return None
         id_pos, src = 2, (lambda: [str(m.get("id")) for m in list_jobs()])
     elif cmd == "/build":
@@ -4036,9 +4038,37 @@ def repl():
                       f"context, full history at {os.path.join(jd, 'history.json')}{RESET}")
                 _turn(history, thinks, block, stats)   # fire an orientation turn right away
                 print(_status_line(stats))
+            elif sub in ("rm", "delete", "del", "clean"):   # delete job dirs (never active ones)
+                target = (rest.split()[0] if rest else "") or ("done" if sub == "clean" else "")
+                if not target:
+                    print(f"{DIM}usage: /jobs rm <id> · rm done (finished) · rm all · clean{RESET}"); continue
+                jobs = list_jobs()
+                if target in ("done", "finished", "old"):
+                    victims = [j for j in jobs if job_state(j) in
+                               ("done", "failed", "killed", "stalled", "dead")]
+                elif target == "all":
+                    victims = list(jobs)
+                else:
+                    victims = [j for j in jobs if j["id"] == target]
+                    if not victims:
+                        print(f"{DIM}no such job {target}{RESET}"); continue
+                removed = kept = 0
+                for j in victims:
+                    stt = job_state(j)
+                    alive = bool(j.get("pid") and _pid_alive(j["pid"]))
+                    if stt in ("running", "queued", "blocked") or alive:   # never delete a live job
+                        print(f"{DIM}  keeping {j['id']} — {stt}"
+                              f"{' (/jobs answer first)' if stt == 'blocked' else ' (/jobs stop first)'}{RESET}")
+                        kept += 1; continue
+                    try:
+                        shutil.rmtree(_job_dir(j["id"])); _JOBS_SEEN.pop(j["id"], None); removed += 1
+                    except Exception as e:
+                        print(f"{DIM}  {j['id']}: {e}{RESET}")
+                print(f"{DIM}removed {removed} job{'s' if removed != 1 else ''}"
+                      f"{f' · kept {kept} active' if kept else ''}{RESET}")
             else:
                 print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · load <id> · "
-                      f"build <plan-id> [model] · run <goal…> · review <file|dir path>{RESET}")
+                      f"rm <id>|done|all · build <plan-id> [model] · run <goal…> · review <file|dir path>{RESET}")
             continue
         if user == "/goal" or user.startswith("/goal "):
             arg = user[len("/goal"):].strip()
