@@ -181,6 +181,7 @@ _CMD_HINTS = {
     "/context": "show the active AGENTS.md stack + loaded skills",
     "/new":     "start a fresh session — wipe history, stats, goal, skills, sidebars, mode",
     "/clear":   "clear the conversation history (keeps stats) and reset mode",
+    "/help":    "list all capabilities · /help <command> for one command",
 }
 
 
@@ -192,8 +193,70 @@ def _command_hint_lines(buf):
     if cmd in _CMD_HINTS:
         return [f"{DIM}  {cmd}  {_CMD_HINTS[cmd]}{RESET}"]
     return [f"{DIM}  commands:{RESET}",
-            f"{DIM}  /new  /clear  /build  /jobs  /plan  /goal  /sidebar  /skill  /context  /mcp  "
-            f"/tools  /models  /mode  /seats  /memory  /quit{RESET}"]
+            f"{DIM}  /help  /new  /clear  /build  /jobs  /plan  /goal  /sidebar  /skill  /context  "
+            f"/mcp  /tools  /models  /mode  /seats  /memory  /quit{RESET}"]
+
+
+# One source of truth for /help — grouped capabilities. Per-command detail (flags) comes from
+# _CMD_HINTS when richer; this supplies the short line and the grouping for the full listing.
+_HELP = [
+    ("Chat & routing", [
+        ("send", "type a message + Enter → the active seat (saint-auto by default)"),
+        ("Ctrl+Enter", "pick a seat for this one message"),
+        ("F7–F12", "one-shot to coder / chat / cloud-small / medium / large / flagship"),
+        ("Ctrl+R", "peek routing shortcuts, or command help for a staged /command"),
+        ("/models", "list and switch the active model"),
+        ("/seats", "the discovered fleet + Fn seat bindings"),
+    ]),
+    ("Agents & autonomy", [
+        ("/goal", "work autonomously toward exit criteria until met or hard-blocked"),
+        ("/jobs", "detached background jobs (build / run / review) + a status table"),
+        ("mini-5s", "the agent delegates self-contained sub-tasks via sub-agents"),
+    ]),
+    ("Plans (MegaPlan)", [
+        ("/plan", "author a plan — research → discuss → persist"),
+        ("/build", "execute a plan · bg = detached · rerun|reset a completed one"),
+    ]),
+    ("Context & memory", [
+        ("/skill", "load a skill playbook (SKILL.md) into the prompt"),
+        ("/context", "show the AGENTS.md stack + loaded skills for the cwd"),
+        ("/system", "view / edit the system-prompt template"),
+        ("/memory", "MemoryOS ambient-memory status"),
+    ]),
+    ("Session & modes", [
+        ("/new", "fresh session — wipe history, stats, goal, skills, sidebars, mode"),
+        ("/clear", "clear the conversation history (keeps stats)"),
+        ("/mode", "cautious · unrestricted · plan   (Shift+Tab cycles)"),
+        ("/sidebar", "fork an aside; merge folds only its conclusion back"),
+        ("/think", "toggle showing the model's reasoning"),
+        ("/tools", "toggle which tools are available"),
+        ("/mcp", "add / list MCP servers"),
+        ("/location", "set your location for grounding"),
+    ]),
+]
+
+
+def print_help(arg: str = "") -> None:
+    """`/help` prints the grouped capability list; `/help <command>` prints one command's help."""
+    arg = (arg or "").strip()
+    if arg:                                            # command-specific
+        cmd = arg if arg.startswith("/") else "/" + arg
+        if cmd in _CMD_HINTS:                          # richest: has flags/usage
+            print(f"  {CODE_FG}{cmd}{RESET}  {DIM}{_CMD_HINTS[cmd]}{RESET}"); return
+        for _sec, rows in _HELP:
+            for c, d in rows:
+                if c == cmd:
+                    print(f"  {CODE_FG}{cmd}{RESET}  {DIM}{d}{RESET}"); return
+        print(f"{DIM}no help for {cmd!r} — /help lists everything{RESET}"); return
+    print(f"{BOLD}input — capabilities{RESET}")
+    for title, rows in _HELP:
+        print(f"\n{CODE_FG}{title}{RESET}")
+        for c, d in rows:
+            print(f"  {c:<12}{DIM}{d}{RESET}")
+    print(f"\n{DIM}  keys: Esc abort · ^C copy code · ^D or /quit exit{RESET}")
+    print(f"{DIM}  /help <command> for command-specific help{RESET}")
+
+
 MAX_AUTO_STEPS = 8
 # SAINT extracts volatile per-turn context placed after this marker in the system prompt
 # and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
@@ -3296,7 +3359,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /sidebar /location /think /clear /new · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /goal /plan /build /jobs /sidebar /location /think /clear /new · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -3847,6 +3910,8 @@ def repl():
             else:
                 _start_plan(arg)                          # bare "/plan <free text>" → new plan
             continue
+        if user in ("/help", "/?", "help") or user.startswith("/help "):
+            print_help(user.split(None, 1)[1] if " " in user else ""); continue
         if user == "/clear":
             history.clear(); thinks.clear()
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
