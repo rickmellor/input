@@ -517,8 +517,9 @@ GOAL = ""              # the session's exit criteria ("" = none)
 GOAL_SEAT = ""         # seat the goal loop is pinned to (set when the goal is HARD; "" = active seat)
 GOAL_BLOCKED = ""      # the precise need when the session is hard-blocked ("" = not blocked)
 GOAL_MAX_NUDGES = 4    # per turn: how many times we push the model back to work before pausing
-GOAL_MAX_ROUNDS = 40   # tool-round budget PER goal segment (vs MAX_TOOL_ROUNDS for a plain turn)
-GOAL_MAX_SEGMENTS = 6  # times we auto-continue a goal that's still working after a segment
+GOAL_MAX_ROUNDS = 40   # tool-round budget PER goal segment (a re-invocation boundary, not a cap)
+GOAL_STALL_LIMIT = 3   # consecutive no-progress segments before we abort a goal as stalled
+GOAL_HARD_MAX_SEGMENTS = 1000  # runaway backstop only (~40k rounds); stall detection is the real guard
 
 
 def reasoning_seat():
@@ -3152,9 +3153,11 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         n = sum(1 for l in recalled.splitlines() if l.startswith("- "))
         print(f"{DIM}⟐ memory: {n} recalled{RESET}")
 
+    seg_sig = []                                   # tool-call signatures for the CURRENT segment
     def on_tool(ev, tc, out):
         fn = tc.get("function") or {}
         if ev == "call":
+            seg_sig.append(f"{fn.get('name')}::{(fn.get('arguments') or '')[:200]}")
             print(f"{DIM}⚙ {fn.get('name')}({_fmt_args(fn.get('arguments'))}){RESET}"); return None
         tool = TOOLS.get(fn.get("name"))
         full = bool(out) and getattr(tool, "display", "compact") == "full"
@@ -3175,34 +3178,47 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         model, base = SEATS[GOAL_SEAT]         # hard goal → pin the loop to the capable seat
     maxr = GOAL_MAX_ROUNDS if GOAL else MAX_TOOL_ROUNDS
     try:
-        nxt, seg = user, 0
+        # A goal runs open-ended: keep going as long as it makes PROGRESS. Each segment is one
+        # run_thread call; between segments we check whether new tool work happened. Continue
+        # forever while progress continues; abort only when it STALLS (GOAL_STALL_LIMIT segments
+        # with no new work) — so a genuine 10k-step goal completes, a spinning one doesn't hang.
+        nxt, last_sig, stalls, seg, total_rounds = user, None, 0, 0, 0
         while True:
+            seg_sig.clear()
             terminate = goal_terminate(GOAL, GOAL_MAX_NUDGES) if GOAL else None
             res = run_thread(nxt, history=history, tools=tools, model=model, base=base, quiet=False,
                              stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True,
                              terminate=terminate, max_rounds=maxr)
-            # A goal still actively working (hit the round budget, no GOAL MET/BLOCKED yet) is NOT
-            # done — auto-continue instead of dying mid-task, bounded so it can't spin forever.
-            if (GOAL and res["stopped"] == "rounds" and not res.get("goal_met")
-                    and not res.get("blocked") and not res["error"] and seg < GOAL_MAX_SEGMENTS):
-                seg += 1
-                print(f"{DIM}  ↻ goal in progress — {res['rounds']} rounds this segment; "
-                      f"continuing ({seg}/{GOAL_MAX_SEGMENTS})…{RESET}")
-                nxt = ("You have not signalled completion. Keep working toward the goal. When the exit "
-                       "criteria are genuinely met end with `GOAL MET: <evidence>`; if hard-blocked, "
-                       "`BLOCKED: <need>`.")
-                recalled = None                   # don't re-recall memory on continuations
-                continue
-            break
+            total_rounds += res["rounds"]
+            if not GOAL or res["error"] or res.get("goal_met") or res.get("blocked"):
+                break
+            sig = tuple(seg_sig)                   # what this segment actually did
+            if sig and sig != last_sig:            # new tool work happened → real progress
+                stalls, last_sig = 0, sig
+            else:                                  # empty or an exact repeat of last segment
+                stalls += 1
+                last_sig = sig
+            if stalls >= GOAL_STALL_LIMIT:
+                res["goal_stalled"] = True; break
+            seg += 1
+            if seg >= GOAL_HARD_MAX_SEGMENTS:      # runaway backstop, far beyond any real goal
+                res["goal_stalled"] = True; break
+            print(f"{DIM}  ↻ goal working — {total_rounds} rounds so far, still progressing; continuing…{RESET}")
+            nxt = ("You have not signalled completion. Keep working toward the goal. When the exit "
+                   "criteria are genuinely met end with `GOAL MET: <evidence>`; if hard-blocked, "
+                   "`BLOCKED: <need>`.")
+            recalled = None                        # don't re-recall memory on continuations
     except KeyboardInterrupt:
         print(f"{RESET}\n(interrupted — goal still set; 'continue' resumes, /goal off clears)"); return
     if res.get("blocked"):
         notify_blocked("session goal", res["blocked"])
     elif res.get("goal_met"):
         print(f"{GREEN_BUILD}{BOLD}✔ GOAL MET{RESET}{DIM} — {GOAL[:80]}  (/goal off to clear){RESET}")
+    elif res.get("goal_stalled"):
+        print(f"{YEL}◑ goal stalled{RESET}{DIM} — no new progress over {GOAL_STALL_LIMIT} segments "
+              f"({total_rounds} rounds total); paused. Say 'continue' to retry · /goal off to stop.{RESET}")
     elif GOAL and (res["stopped"] == "rounds" or res.get("goal_paused")):
-        print(f"{YEL}◐ goal paused{RESET}{DIM} — worked {res['rounds']} rounds without a GOAL MET. "
-              f"Say 'continue' to push on · /goal off to stop · /goal shows status.{RESET}")
+        print(f"{YEL}◐ goal paused{RESET}{DIM} — say 'continue' to push on · /goal off to stop.{RESET}")
     elif res["stopped"] == "rounds":
         print(f"{DIM}(stopped after {maxr} tool rounds — say 'continue' to keep going){RESET}")
     if res["error"]:
