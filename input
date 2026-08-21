@@ -1022,11 +1022,16 @@ def _tool_spawn_agent(args):
 
     print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
     with _model_sem(m, b):                 # per-model concurrency cap (local=2, cloud=5)
+        t0 = time.monotonic()              # time generation only, not queue wait on the semaphore
         res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
                          budget_tokens=budget, on_tool=on_tool, gate=False)
+        dt = time.monotonic() - t0
     tag = "" if res["stopped"] == "done" else f" [{res['stopped']}]"
+    rate = res["tokens_out"] / dt if dt > 0 else 0
+    dur = f"{dt:.1f}s" if dt < 10 else _fmt_dur(dt)   # decimals for short agent runs
+    # this sub-agent's own metrics (kept OUT of the main stats, which stay the orchestrator's)
     print(f"{DIM}  ⟳ done[{label}] {res['rounds']}r · {res['tool_calls']} tools · "
-          f"{res['tokens_out']} out{tag}{RESET}")
+          f"↓{res['tokens_in']} ↑{res['tokens_out']} · {rate:.0f} tok/s · {dur}{tag}{RESET}")
     if res["error"]:
         return f"(sub-agent errored: {res['error']})"
     return res["text"] or f"(sub-agent produced no text; stopped={res['stopped']})"
