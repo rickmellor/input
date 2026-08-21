@@ -3180,7 +3180,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         # already saw it so it doesn't re-list the same content back
         return out + _SHOWN_NOTE if full else out
 
-    global GOAL_BLOCKED
+    global GOAL, GOAL_SEAT, GOAL_BLOCKED
     if GOAL_BLOCKED:                               # the user's message answers the block → resume
         user = f"(Answer to your BLOCKED need — {GOAL_BLOCKED!r}): {user}"
         GOAL_BLOCKED = ""
@@ -3224,7 +3224,8 @@ def _turn(history, thinks, user, stats, model=None, base=None):
     if res.get("blocked"):
         notify_blocked("session goal", res["blocked"])
     elif res.get("goal_met"):
-        print(f"{GREEN_BUILD}{BOLD}✔ GOAL MET{RESET}{DIM} — {GOAL[:80]}  (/goal off to clear){RESET}")
+        print(f"{GREEN_BUILD}{BOLD}✔ GOAL MET{RESET}{DIM} — {GOAL[:80]}  (goal cleared){RESET}")
+        GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""   # met → exit goal mode; prompt returns to normal
     elif res.get("goal_stalled"):
         print(f"{YEL}◑ goal stalled{RESET}{DIM} — no new progress over {GOAL_STALL_LIMIT} segments "
               f"({total_rounds} rounds total); paused. Say 'continue' to retry · /goal off to stop.{RESET}")
