@@ -2067,8 +2067,9 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
                 chunk = json.loads(line[6:])
+                if chunk.get("usage"):         # usage may ride a choices-bearing chunk (local
+                    usage = chunk["usage"]     # seats do this) or a dedicated tail chunk (cloud)
                 if not chunk.get("choices"):   # usage-only tail chunk (include_usage)
-                    usage = chunk.get("usage") or usage
                     continue
                 if not banner_done:  # first chunk carries the actually-served model name
                     served = chunk.get("model", "")
