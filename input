@@ -3456,7 +3456,13 @@ def list_jobs(include_done=True):
         m = _read_meta(j)
         if not m:
             continue
-        m.setdefault("id", j)          # backfill id from the dir name (partial/corrupt meta)
+        m.setdefault("id", j)          # backfill from the dir/file for partial/corrupt metas so
+        if not m.get("created"):       # no downstream field access can crash the whole REPL
+            try:
+                m["created"] = os.path.getmtime(os.path.join(_JOBS_DIR, j, "meta.json"))
+            except Exception:
+                m["created"] = 0.0
+        m.setdefault("state", "failed")
         js.append(m)
     if not include_done:
         js = [m for m in js if m.get("state") in ("queued", "running", "blocked")]
@@ -3917,7 +3923,8 @@ def repl():
                     print(f"{DIM}no jobs — /jobs build <plan-id> · /jobs run <goal…>{RESET}")
                 for m in js:
                     st = job_state(m); col = _JST.get(st, DIM)
-                    dur = _fmt_dur((m.get("ended") or time.time()) - (m.get("started") or m.get("created")))
+                    dur = _fmt_dur((m.get("ended") or time.time())
+                                   - (m.get("started") or m.get("created") or time.time()))
                     dn, tot, pct = _job_progress(m)
                     prog = f" {pct}% ({dn}/{tot})" if pct is not None else ""
                     toks = f" · {m.get('tokens_out', 0)}out" if m.get("tokens_out") else ""
