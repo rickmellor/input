@@ -570,6 +570,7 @@ def goal_terminate(goal, nudges_left):
 # CONCLUSION returns to the main thread (not the whole side transcript) — so a tangent doesn't
 # bloat the main history. A stack, so sidebars can nest.
 SIDEBARS = []   # stack of {"parent": [...main msgs at fork...], "plen": int, "label": str}
+_PREFILL = ""   # command line to hand back pre-filled on the next prompt (Tab from a picker)
 
 
 def sidebar_summarize(history, model, base):
@@ -1831,9 +1832,10 @@ def plan_browse(_arg=""):
         print(f"{DIM}  {mark} {p['id']:<34} {p.get('status', ''):<8} {pct}  {p.get('title', '')}{RESET}")
 
 
-def plan_pick(verb="select"):
+def plan_pick(verb="select", editable=False):
     """Show the plan list and arrow-select one. Returns the chosen plan id, or None
-    (empty store / cancel / error). Off-TTY, falls back to _pick's numbered prompt."""
+    (empty store / cancel / error). When editable, Tab returns ('edit', id) so the caller
+    can hand the command line back pre-filled. Off-TTY, falls back to _pick's numbered prompt."""
     rows = megaplan_call("list")
     if isinstance(rows, dict) and "error" in rows:
         print(f"{DIM}megaplan: {rows['error']}{RESET}"); return None
@@ -1846,8 +1848,12 @@ def plan_pick(verb="select"):
         mark = _PRIO_MARK.get(p.get("priority"), "·")
         labels.append(f"{mark} {p.get('status', ''):<8} {pct}  {p.get('title', '')}"
                       f"  {DIM}[{p['id']}]{RESET}")
-    res = _pick(labels, 0, hint=f"↑/↓ or j/k · enter {verb} · q cancel")
-    return rows[res[0]]["id"] if res else None
+    hint = f"↑/↓ or j/k · enter {verb}" + (" · tab edit on command line" if editable else "") + " · q cancel"
+    res = _pick(labels, 0, hint=hint, allow_edit=editable)
+    if not res:
+        return None
+    pid = rows[res[0]]["id"]
+    return ("edit", pid) if res[1] == "edit" else pid
 
 
 def plan_render(p):
@@ -2169,8 +2175,9 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
     return "".join(reply), tool_calls, {"prompt": prompt, "completion": completion, "rate": rate}
 
 
-def _pick(labels, start, hint=None):
-    """Selector; returns (index, make_default) or None. Falls back to numbers off-TTY.
+def _pick(labels, start, hint=None, allow_edit=False):
+    """Selector; returns (index, make_default) or None — or (index, "edit") when allow_edit
+    and Tab is pressed (hand the choice back to the command line). Falls back to numbers off-TTY.
 
     enter → use for the session; ctrl+enter (terminals that send LF) or 'd' → also
     persist as the launch default; q / bare-Esc → cancel. `hint` overrides the help line
@@ -2209,6 +2216,8 @@ def _pick(labels, start, hint=None):
                 return (sel, False)
             if ch in (b"\n", b"d", b"D"):    # Ctrl+Enter (LF) or 'd' → set as default
                 return (sel, True)
+            if ch == b"\t" and allow_edit:   # Tab → hand this choice back to the command line
+                return (sel, "edit")
             if ch in (b"q", b"\x03"):        # q / Ctrl-C
                 return None
             if ch == b"\x1b":                # ESC: arrow burst (ESC [ A/B) or bare ESC
@@ -2378,10 +2387,11 @@ def _prompt():
     return f"{color}{n}{RESET}{tag}{build}{goal}{aside} > "
 
 
-def read_line(prompt):
+def read_line(prompt, preset=""):
     """cbreak line reader: returns (text, mode). mode 'send' on Enter, 'pick' on
     Ctrl+Enter (terminals that send LF), None text with 'eof' on Ctrl-D. Falls back
-    to input() off-TTY. Up/down walk readline history; basic cursor editing."""
+    to input() off-TTY. Up/down walk readline history; basic cursor editing.
+    `preset` pre-fills the buffer (cursor at end) so a command can be handed back editable."""
     if not sys.stdin.isatty():
         try:
             return input(prompt), "send"
@@ -2394,7 +2404,7 @@ def read_line(prompt):
     new[3] &= ~(termios.ICANON | termios.ECHO)             # lflag: no line-buffer/echo (ISIG stays)
     new[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)  # keep CR (Enter) and NL (Ctrl+Enter) distinct
     new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
-    buf, pos = [], 0
+    buf, pos = list(preset), len(preset)
     hlen = _rl.get_current_history_length() if _rl else 0
     hidx, saved = hlen, ""
     crow = 0                                   # cursor's row offset from the line's start row
@@ -3222,8 +3232,10 @@ def repl():
     while True:
         poll_jobs_notify()                     # surface background jobs that finished / blocked
         print()  # blank line before each prompt
+        global _PREFILL
+        preset, _PREFILL = _PREFILL, ""        # a picker may hand back an editable command line
         try:
-            user, mode = read_line(_prompt())
+            user, mode = read_line(_prompt(), preset=preset)
         except KeyboardInterrupt:
             # ^C on the prompt: copy the last reply's code blocks (terminals that copy a
             # mouse selection on ^C never deliver this — so selection-copy still wins).
@@ -3455,7 +3467,12 @@ def repl():
                 else:
                     rerun = True
             arg = " ".join(words)
-            pid = arg or PLAN_ID or plan_pick("build")   # explicit id, the loaded plan, or pick
+            pid = arg or PLAN_ID
+            if not pid:                                  # no id given → arrow-pick (Tab = edit)
+                pick = plan_pick("build", editable=True)
+                if isinstance(pick, tuple) and pick[0] == "edit":   # Tab → fill the command line
+                    _PREFILL = f"/build {pick[1]} "; continue
+                pid = pick
             if not pid:
                 print(f"{DIM}usage: /build <id> [bg] [rerun]  (or /plan load one first){RESET}"); continue
             if bg:
