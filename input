@@ -3439,7 +3439,10 @@ def _read_meta(jid):
 
 def _write_meta(jid, **patch):
     d = _read_meta(jid) or {}
-    d.update(patch); d["updated"] = time.time()
+    d.update(patch)
+    d["id"] = jid                          # always stamp id + created so a meta can never end up
+    d.setdefault("created", time.time())   # id-less even if the base was missing/corrupt
+    d["updated"] = time.time()
     os.makedirs(_job_dir(jid), exist_ok=True)
     p = os.path.join(_job_dir(jid), "meta.json")
     with open(p + ".tmp", "w") as f:
