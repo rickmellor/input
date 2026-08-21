@@ -860,6 +860,8 @@ def _resolve_seat(name):
 # so the limit holds across every in-flight spawn regardless of which turn issued it.
 _MODEL_SEMS = {}
 _MODEL_SEMS_LK = threading.Lock()
+_AGENT_TLS = threading.local()   # per-worker handle to its ticker slot; spawn_agent flips it to
+                                 # "running" the instant it clears the per-model semaphore
 
 
 def _seat_kind(model, base):
@@ -966,7 +968,9 @@ def _agents_ticker(agents, stop):
         now = time.monotonic()
         done = sum(1 for a in agents if a["state"] == "done")
         run = sum(1 for a in agents if a["state"] == "running")
-        out = [f"{DIM}  {frame} {n} agents · {run} running · {done} done{RESET}"]
+        q = sum(1 for a in agents if a["state"] == "queued")
+        head = f"  {frame} {n} agents · {run} running" + (f" · {q} queued" if q else "") + f" · {done} done"
+        out = [f"{DIM}{head}{RESET}"]
         for a in agents:
             cell = f"{a['label'][:width]:<{width}}"
             if a["state"] == "done":
@@ -1030,6 +1034,9 @@ def _tool_spawn_agent(args):
 
     print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
     with _model_sem(m, b):                 # per-model concurrency cap (local=2, cloud=5)
+        slot = getattr(_AGENT_TLS, "slot", None)   # now holding a real slot → mark it running
+        if slot is not None:
+            slot["state"] = "running"; slot["start"] = time.monotonic()
         t0 = time.monotonic()              # time generation only, not queue wait on the semaphore
         res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
                          budget_tokens=budget, on_tool=on_tool, gate=False)
@@ -2808,8 +2815,15 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
 
             def _run_one(item, buffered, agents=None, idx=None):
                 tc, name, args, tool, allow, reason = item
-                if agents is not None:
-                    agents[idx]["state"] = "running"; agents[idx]["start"] = time.monotonic()
+                slot = agents[idx] if agents is not None else None
+                if slot is not None:
+                    # spawn_agent starts QUEUED and flips to "running" when it clears its model
+                    # semaphore; every other tool runs immediately, so mark it running now.
+                    if name == "spawn_agent" and allow:
+                        slot["state"] = "queued"
+                    else:
+                        slot["state"] = "running"; slot["start"] = time.monotonic()
+                _AGENT_TLS.slot = slot          # spawn_agent reports 'running' via this on acquire
                 buf = io.StringIO()
                 if buffered and _STDOUT is not None:
                     _STDOUT.capture(buf)
@@ -2825,11 +2839,12 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                             out = f"Error running {name}: {e}"
                     shown = on_tool("result", tc, out) if on_tool else None
                 finally:
+                    _AGENT_TLS.slot = None
                     if buffered and _STDOUT is not None:
                         _STDOUT.release()
-                    if agents is not None:
-                        agents[idx]["state"] = "done"
-                        agents[idx]["dur"] = time.monotonic() - (agents[idx]["start"] or time.monotonic())
+                    if slot is not None:
+                        slot["state"] = "done"
+                        slot["dur"] = time.monotonic() - (slot["start"] or time.monotonic())
                 return tc, out, shown, buf.getvalue()
 
             if len(decided) <= 1:
