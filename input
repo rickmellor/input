@@ -166,6 +166,32 @@ def _route_hint_lines():
     fn = "   ".join(f"{k.upper()} {_seat_short(v)}" for k, v in hk)
     return [f"{DIM}  ↵ send  ·  Ctrl+↵ seat picker  ·  Fn = one-shot this text to a seat:{RESET}",
             f"{DIM}  {fn}{RESET}"]
+
+
+# Per-command usage shown on Ctrl+R when the entry field holds a slash command.
+_CMD_HINTS = {
+    "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
+    "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
+    "/plan":    "<goal> new · load · show · archive   (authors in plan mode)",
+    "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
+    "/sidebar": "<topic> fork aside · merge (fold conclusion back) · drop (discard)",
+    "/skill":   "<name> load · off <name> unload · (bare) list",
+    "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
+    "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
+    "/context": "show the active AGENTS.md stack + loaded skills",
+}
+
+
+def _command_hint_lines(buf):
+    """Dim help for the slash command staged in the entry field (Ctrl+R peek): the specific
+    command's flags if recognised, else a compact index of the commands."""
+    text = "".join(buf).lstrip()
+    cmd = (text.split() or [""])[0].lower()
+    if cmd in _CMD_HINTS:
+        return [f"{DIM}  {cmd}  {_CMD_HINTS[cmd]}{RESET}"]
+    return [f"{DIM}  commands:{RESET}",
+            f"{DIM}  /build  /jobs  /plan  /goal  /sidebar  /skill  /context  /mcp  /tools  "
+            f"/models  /mode  /seats  /memory  /quit{RESET}"]
 MAX_AUTO_STEPS = 8
 # SAINT extracts volatile per-turn context placed after this marker in the system prompt
 # and relocates it past the cache breakpoints (cache-safe). Only SAINT understands it, so
@@ -2468,10 +2494,12 @@ def read_line(prompt, preset=""):
                 del buf[:pos]; pos = 0; redraw()
             elif ch == b"\x0b":                        # Ctrl-K kill to end
                 del buf[pos:]; redraw()
-            elif ch == b"\x12":                        # Ctrl+R (route) → peek routing shortcuts
-                if buf:                                # only when there's staged text to route
+            elif ch == b"\x12":                        # Ctrl+R → peek shortcuts: command help for
+                if buf:                                # a slash command, else how to route the text
                     sys.stdout.write("\r\n")
-                    for ln in _route_hint_lines():
+                    lines = (_command_hint_lines(buf) if "".join(buf).lstrip().startswith("/")
+                             else _route_hint_lines())
+                    for ln in lines:
                         sys.stdout.write(ln + "\r\n")
                     crow = 0
                     redraw()
@@ -3459,11 +3487,15 @@ def repl():
             if arg.lower() in ("off", "done", "stop", "exit"):
                 BUILD_ID = ""
                 print(f"{DIM}build mode off{RESET}"); continue
-            bg = rerun = False                         # trailing flags: bg → detached, rerun → reopen first
+            # trailing flags: bg → detached · rerun → reopen+build · reset → reopen only (no build)
+            bg = rerun = reset = False
             words = arg.split()
-            while words and words[-1].lower() in ("bg", "background", "rerun", "again", "rebuild"):
-                if words.pop().lower() in ("bg", "background"):
+            while words and words[-1].lower() in ("bg", "background", "rerun", "again", "rebuild", "reset"):
+                w = words.pop().lower()
+                if w in ("bg", "background"):
                     bg = True
+                elif w == "reset":
+                    reset = True
                 else:
                     rerun = True
             arg = " ".join(words)
@@ -3474,7 +3506,11 @@ def repl():
                     _PREFILL = f"/build {pick[1]} "; continue
                 pid = pick
             if not pid:
-                print(f"{DIM}usage: /build <id> [bg] [rerun]  (or /plan load one first){RESET}"); continue
+                print(f"{DIM}usage: /build <id> [bg] [rerun|reset]  (or /plan load one first){RESET}"); continue
+            if reset:                                    # mark undone but DON'T execute
+                ok, msg = _reopen_plan(pid)
+                print(f"{DIM}↻ {msg if ok else 'reopen failed: ' + msg} — not built (/build {pid} to run){RESET}")
+                continue
             if bg:
                 if rerun:                              # a detached job can't prompt — reopen now
                     ok, msg = _reopen_plan(pid)
