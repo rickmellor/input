@@ -183,6 +183,7 @@ _CMD_HINTS = {
     "/clear":   "clear the conversation history (keeps stats) and reset mode",
     "/help":    "list all capabilities · /help <command> for one command",
     "/gate":    "risk auto-run tolerance · /gate <level> · interactive|auto <level>",
+    "/footer":  "live bottom status line · /footer on|off",
 }
 
 
@@ -234,6 +235,7 @@ _HELP = [
         ("/tools", "toggle which tools are available"),
         ("/mcp", "add / list MCP servers"),
         ("/location", "set your location for grounding"),
+        ("/footer", "toggle the live bottom status line (mode · gate · job alerts)"),
     ]),
 ]
 
@@ -266,6 +268,13 @@ _HELP_TOPICS = {
         "  /gate interactive <level>   set the live-turn tolerance only\n"
         "  /gate auto <level>          set the dark-job tolerance only\n"
         "Level ∈ none | low | medium | high | critical. Persists in settings (gate.*)."
+    ),
+    "/footer": (
+        "Toggle a persistent bottom status line (Claude Code style): current mode, the /gate\n"
+        "tolerances, and LIVE background-job counts including how many are blocked awaiting\n"
+        "/jobs answer. It repaints about once a second and a scroll region keeps it pinned while\n"
+        "output streams and you type. Off by default (opt-in TUI).\n"
+        "  /footer on|off          show or hide it (persists in settings)"
     ),
     "/jobs": (
         "Run work in the background as DETACHED processes that survive quitting input. Each job\n"
@@ -1196,16 +1205,19 @@ class _StdoutRouter:
     def __init__(self, real):
         self._real = real
         self._loc = threading.local()
+        self._lock = threading.RLock()   # serialize writes so the footer thread can't interleave
 
     def _t(self):
         return getattr(self._loc, "buf", None) or self._real
 
     def write(self, s):
-        return self._t().write(s)
+        with self._lock:
+            return self._t().write(s)
 
     def flush(self):
         try:
-            return self._t().flush()
+            with self._lock:
+                return self._t().flush()
         except Exception:
             pass
 
@@ -1235,6 +1247,102 @@ def _install_stdout_router():
         _STDOUT = _StdoutRouter(sys.stdout)
         sys.stdout = _STDOUT
     return _STDOUT
+
+
+# --- footer status line: a persistent bottom row (mode · gate · live job alerts · ephemeral) ---
+# A scroll region (DECSTBM) reserves the last row; output/the line-editor live in rows 1..h-1,
+# the footer is repainted on row h via save/restore cursor so it never disturbs typing. A daemon
+# repaints ~1/s so job counts update live. footer_disable() (finally + atexit) always resets the
+# region, so a bug can never leave the terminal broken. Opt-in (settings "footer" / /footer on).
+_FOOTER_ACTIVE = False
+_footer_stop = threading.Event()
+_footer_flash = {"msg": "", "until": 0.0}
+
+
+def _footer_clip(s, width):
+    """Clip to `width` visible columns, keeping ANSI escapes (which take no columns)."""
+    out, vis, i = [], 0, 0
+    while i < len(s) and vis < width:
+        if s[i] == "\033":
+            j = s.find("m", i)
+            if j == -1:
+                break
+            out.append(s[i:j + 1]); i = j + 1; continue
+        out.append(s[i]); vis += 1; i += 1
+    return "".join(out)
+
+
+def footer_flash(msg, ttl=6.0):
+    """Show a transient message in the footer for `ttl` seconds (a background event)."""
+    _footer_flash["msg"], _footer_flash["until"] = msg, time.time() + ttl
+    render_footer()
+
+
+def _footer_text():
+    parts = [f"{BOLD}▸ {PERM_MODE}{RESET}{DIM}"]
+    g = load_settings().get("gate") or {}
+    parts.append(f"gate ≤{g.get('interactive', 'low')}/{g.get('autonomous', 'low')}")
+    try:
+        states = [job_state(j) for j in list_jobs()]
+    except Exception:
+        states = []
+    active = sum(1 for s in states if s in ("running", "queued"))
+    blocked = sum(1 for s in states if s == "blocked")
+    if active:
+        parts.append(f"{active} job{'s' if active != 1 else ''} running")
+    if blocked:
+        parts.append(f"{RED_VIVID}{blocked} ⛔ /jobs answer{RESET}{DIM}")
+    if _footer_flash["msg"] and time.time() < _footer_flash["until"]:
+        parts.append(_footer_flash["msg"])
+    return "  ·  ".join(parts)
+
+
+def render_footer():
+    """Repaint the footer on the reserved bottom row without moving the logical cursor."""
+    if not _FOOTER_ACTIVE or not sys.stdout.isatty():
+        return
+    try:
+        sz = shutil.get_terminal_size((80, 24))
+        h, w = sz.lines, sz.columns
+        txt = _footer_clip(_footer_text(), w - 1)
+        sys.stdout.write(f"\0337\033[{h};1H\033[2K{DIM}{txt}{RESET}\0338")  # save·go·clear·write·restore
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def footer_enable():
+    """Reserve the bottom row and start the repaint daemon (tty only, idempotent)."""
+    global _FOOTER_ACTIVE
+    if not sys.stdout.isatty() or _FOOTER_ACTIVE:
+        return
+    h = shutil.get_terminal_size((80, 24)).lines
+    sys.stdout.write(f"\033[1;{h - 1}r\033[{h - 1};1H")   # scroll region 1..h-1; cursor into it
+    sys.stdout.flush()
+    _FOOTER_ACTIVE = True
+    _footer_stop.clear()
+    render_footer()
+    threading.Thread(target=_footer_loop, daemon=True).start()
+
+
+def footer_disable():
+    """Reset the scroll region and clear the footer — restore a normal terminal."""
+    global _FOOTER_ACTIVE
+    _footer_stop.set()
+    if sys.stdout.isatty() and _FOOTER_ACTIVE:
+        h = shutil.get_terminal_size((80, 24)).lines
+        sys.stdout.write(f"\033[r\033[{h};1H\033[2K"); sys.stdout.flush()
+    _FOOTER_ACTIVE = False
+
+
+def _footer_loop():
+    last_h = None
+    while not _footer_stop.wait(1.0):
+        if _FOOTER_ACTIVE and sys.stdout.isatty():
+            h = shutil.get_terminal_size((80, 24)).lines
+            if h != last_h:                                   # terminal resized → re-assert region
+                sys.stdout.write(f"\0337\033[1;{h - 1}r\0338"); last_h = h
+        render_footer()
 
 
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -3611,7 +3719,7 @@ def repl():
 
     SESSION = "input-" + os.urandom(6).hex()
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /gate /goal /plan /build /jobs /sidebar /location /think /clear /new · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /gate /goal /plan /build /jobs /sidebar /location /think /clear /new /footer · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -3621,8 +3729,16 @@ def repl():
         print(f"{DIM}{mem_status}{RESET}")
     for _m in list_jobs():                     # don't shout about pre-existing jobs on startup
         _JOBS_SEEN[_m["id"]] = job_state(_m)
+    import atexit
+    atexit.register(footer_disable)            # always reset the scroll region, even on crash
+    if load_settings().get("footer"):
+        footer_enable()
+        print(f"{DIM}  footer on — /footer off to hide{RESET}")
+    else:
+        print(f"{DIM}  tip: /footer on for a live status line (mode · gate · job alerts){RESET}")
     while True:
         poll_jobs_notify()                     # surface background jobs that finished / blocked
+        render_footer()                        # keep the footer fresh at each prompt
         print()  # blank line before each prompt
         global _PREFILL
         preset, _PREFILL = _PREFILL, ""        # a picker may hand back an editable command line
@@ -4217,6 +4333,16 @@ def repl():
             continue
         if user in ("/help", "/?", "help") or user.startswith("/help "):
             print_help(user.split(None, 1)[1] if " " in user else ""); continue
+        if user == "/footer" or user.startswith("/footer "):
+            arg = user[len("/footer"):].strip().lower()
+            if arg in ("on", "off"):
+                st = load_settings(); st["footer"] = (arg == "on"); save_settings(st)
+                footer_enable() if arg == "on" else footer_disable()
+                print(f"{DIM}footer {arg}{RESET}")
+            else:
+                print(f"{DIM}footer is {'on' if _FOOTER_ACTIVE else 'off'} — a live bottom status line "
+                      f"(mode · gate · job alerts) · /footer on|off{RESET}")
+            continue
         if user == "/clear":
             history.clear(); thinks.clear()
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
