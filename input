@@ -282,7 +282,10 @@ _HELP_TOPICS = {
         "  /jobs review <path>         adversarially review a FILE or DIRECTORY (its code) with\n"
         "                              ACO in the background — a reviewers → killers → oracle\n"
         "                              pipeline across model families that returns\n"
-        "                              accepted/refuted findings and a verdict"
+        "                              accepted/refuted findings and a verdict\n"
+        "  /jobs load <id>             pull a job's task + result into THIS session (lightweight —\n"
+        "                              a path to the full history, not a fat prefill) so you can\n"
+        "                              act on its findings; the agent reads the history if it digs"
     ),
     "/build": (
         "Execute a MegaPlan to completion — the agent works its tasks one at a time, marking\n"
@@ -3759,8 +3762,33 @@ def repl():
                 jid = submit_job("goal", f"aco review {tgt}", goal, cwd=os.getcwd())
                 _JOBS_SEEN[jid] = "queued"
                 print(f"{DIM}● job {jid} — ACO review of {tgt} in the background · /jobs show {jid}{RESET}")
+            elif sub == "load" and rest:        # pull a job's task + result into THIS session
+                jid = rest.split()[0]
+                mj = _read_meta(jid)
+                if not mj:
+                    print(f"{DIM}no such job {jid}{RESET}"); continue
+                jd = _job_dir(jid); rp = os.path.join(jd, "result.md")
+                stj = job_state(mj)
+                result = open(rp).read() if os.path.exists(rp) else ""
+                # Lightweight orientation only — task + result (capped) + PATHS to the full
+                # artifacts. No 100K-token history prefill; the agent reads them if it needs to.
+                block = (f"[Loaded background job {jid} — {mj.get('title','')} · state: {stj}]\n\n"
+                         f"Its task:\n{mj.get('goal') or mj.get('title') or '(none)'}\n\n"
+                         f"Its result:\n{result[:8000] or f'(no result yet — job is {stj})'}"
+                         f"{'  …[truncated; read result.md in full]' if len(result) > 8000 else ''}\n\n"
+                         f"Full artifacts, if you need more than the summary above — read them with "
+                         f"your tools, don't assume:\n"
+                         f"  result: {rp}\n  history: {os.path.join(jd, 'history.json')}\n"
+                         f"  log:    {os.path.join(jd, 'log.jsonl')}\n\n"
+                         f"Act on this as I direct.")
+                history.append({"role": "user", "content": block})
+                history.append({"role": "assistant", "content":
+                                f"Loaded job {jid} ({stj}) — I have its task and result in view, and "
+                                "can read the full history/log if I need to dig. What should I do with it?"})
+                print(f"{DIM}● loaded job {jid} — {mj.get('title','')[:50]} ({stj}); task + result in "
+                      f"context, full history at {os.path.join(jd, 'history.json')}{RESET}")
             else:
-                print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · "
+                print(f"{DIM}/jobs [list] · show|log <id> · stop <id> · answer <id> <text> · load <id> · "
                       f"build <plan-id> [model] · run <goal…> · review <file|dir path>{RESET}")
             continue
         if user == "/goal" or user.startswith("/goal "):
