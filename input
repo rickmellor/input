@@ -3717,7 +3717,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
     tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
     if GOAL and GOAL_SEAT and GOAL_SEAT in SEATS and (model, base) == (None, None):
         model, base = SEATS[GOAL_SEAT]         # hard goal → pin the loop to the capable seat
-    maxr = GOAL_MAX_ROUNDS if GOAL else MAX_TOOL_ROUNDS
+    maxr = GOAL_MAX_ROUNDS   # generous per-segment budget for goals AND plain interactive turns
     try:
         # A goal runs open-ended: keep going as long as it makes PROGRESS. Each segment is one
         # run_thread call; between segments we check whether new tool work happened. Continue
@@ -3731,7 +3731,10 @@ def _turn(history, thinks, user, stats, model=None, base=None):
                              stats=stats, thinks=thinks, volatile=recalled, on_tool=on_tool, gate=True,
                              terminate=terminate, max_rounds=maxr)
             total_rounds += res["rounds"]
-            if not GOAL or res["error"] or res.get("goal_met") or res.get("blocked"):
+            # Finished (model gave its answer) or blocked/errored → stop. Keep going only when it
+            # hit the round cap MID-work — for goals AND plain turns — while still progressing.
+            if (res["error"] or res.get("goal_met") or res.get("blocked")
+                    or res.get("needs_approval") or res["stopped"] != "rounds"):
                 break
             sig = tuple(seg_sig)                   # what this segment actually did
             if sig and sig != last_sig:            # new tool work happened → real progress
@@ -3744,25 +3747,30 @@ def _turn(history, thinks, user, stats, model=None, base=None):
             seg += 1
             if seg >= GOAL_HARD_MAX_SEGMENTS:      # runaway backstop, far beyond any real goal
                 res["goal_stalled"] = True; break
-            print(f"{DIM}  ↻ goal working — {total_rounds} rounds so far, still progressing; continuing…{RESET}")
-            nxt = ("You have not signalled completion. Keep working toward the goal. When the exit "
-                   "criteria are genuinely met end with `GOAL MET: <evidence>`; if hard-blocked, "
-                   "`BLOCKED: <need>`.")
+            print(f"{DIM}  ↻ {'goal ' if GOAL else ''}working — {total_rounds} rounds so far, "
+                  f"still progressing; continuing…{RESET}")
+            nxt = (("You have not signalled completion. Keep working toward the goal. When the exit "
+                    "criteria are genuinely met end with `GOAL MET: <evidence>`; if hard-blocked, "
+                    "`BLOCKED: <need>`.") if GOAL else
+                   "Continue with the task until it is fully done, then give your final answer.")
             recalled = None                        # don't re-recall memory on continuations
     except KeyboardInterrupt:
-        print(f"{RESET}\n(interrupted — goal still set; 'continue' resumes, /goal off clears)"); return
+        tail = " goal still set; 'continue' resumes, /goal off clears" if GOAL else " 'continue' resumes"
+        print(f"{RESET}\n(interrupted —{tail})"); return
     if res.get("blocked"):
         notify_blocked("session goal", res["blocked"])
     elif res.get("goal_met"):
         print(f"{GREEN_BUILD}{BOLD}✔ GOAL MET{RESET}{DIM} — {GOAL[:80]}  (goal cleared){RESET}")
         GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""   # met → exit goal mode; prompt returns to normal
     elif res.get("goal_stalled"):
-        print(f"{YEL}◑ goal stalled{RESET}{DIM} — no new progress over {GOAL_STALL_LIMIT} segments "
-              f"({total_rounds} rounds total); paused. Say 'continue' to retry · /goal off to stop.{RESET}")
+        what = "goal stalled" if GOAL else "paused"
+        print(f"{YEL}◑ {what}{RESET}{DIM} — no new progress over {GOAL_STALL_LIMIT} segments "
+              f"({total_rounds} rounds total). Say 'continue' to retry"
+              f"{' · /goal off to stop' if GOAL else ''}.{RESET}")
     elif GOAL and (res["stopped"] == "rounds" or res.get("goal_paused")):
         print(f"{YEL}◐ goal paused{RESET}{DIM} — say 'continue' to push on · /goal off to stop.{RESET}")
     elif res["stopped"] == "rounds":
-        print(f"{DIM}(stopped after {maxr} tool rounds — say 'continue' to keep going){RESET}")
+        print(f"{DIM}(paused after {total_rounds} rounds — say 'continue' to keep going){RESET}")
     if res["error"]:
         print(f"[error: {res['error']}]")
     else:
