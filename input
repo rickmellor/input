@@ -3331,8 +3331,11 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                     cmd = args.get("command") if isinstance(args, dict) else None
                     if cmd and cmd != dark.get("approved"):       # a pre-approved cmd runs once
                         v = review(cmd)
-                        if v and _over_tolerance(v[0], dark.get("tol", "low")):
-                            raise _NeedsApproval(cmd, v[0], v[1] if v else "")
+                        # FAIL-CLOSED when dark: an unrateable command (rater down) parks for
+                        # approval rather than auto-running — the denylist floor still hard-blocks.
+                        if not v or _over_tolerance(v[0], dark.get("tol", "low")):
+                            raise _NeedsApproval(cmd, v[0] if v else "unrated",
+                                                 v[1] if v else "risk could not be rated (rater unavailable)")
                 decided.append((tc, name, args, tool, allow, reason))
             res["tool_calls"] += len(decided)
 
@@ -3439,18 +3442,24 @@ def _read_meta(jid):
         return None
 
 
+_META_LOCK = threading.Lock()   # serialize meta writes: parallel tool dispatch fires on_tool
+                                # from several threads, which raced on the shared meta.json.tmp
+
+
 def _write_meta(jid, **patch):
-    d = _read_meta(jid) or {}
-    d.update(patch)
-    d["id"] = jid                          # always stamp id + created so a meta can never end up
-    d.setdefault("created", time.time())   # id-less even if the base was missing/corrupt
-    d["updated"] = time.time()
-    os.makedirs(_job_dir(jid), exist_ok=True)
-    p = os.path.join(_job_dir(jid), "meta.json")
-    with open(p + ".tmp", "w") as f:
-        json.dump(d, f, indent=2)
-    os.replace(p + ".tmp", p)
-    return d
+    with _META_LOCK:                       # read-modify-write + tmp-rename must be atomic
+        d = _read_meta(jid) or {}
+        d.update(patch)
+        d["id"] = jid                      # always stamp id + created so a meta can never end up
+        d.setdefault("created", time.time())   # id-less even if the base was missing/corrupt
+        d["updated"] = time.time()
+        os.makedirs(_job_dir(jid), exist_ok=True)
+        p = os.path.join(_job_dir(jid), "meta.json")
+        tmp = p + f".tmp.{os.getpid()}.{threading.get_ident()}"   # unique tmp per writer too
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, p)
+        return d
 
 
 def list_jobs(include_done=True):
