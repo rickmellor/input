@@ -3200,15 +3200,34 @@ def tools_menu():
     off = f"  {DIM}(tools globally OFF — /tools on){RESET}" if not TOOLS_ON else ""
     print(f"{DIM}↑/↓ move · space/enter toggle · a all · n none · q done{RESET}{off}")
 
+    import shutil, textwrap
+    DETAIL = 3                                    # lines under the list: full description of the highlighted tool
+
     def draw(first=False):
+        cols = max(60, shutil.get_terminal_size((100, 24)).columns)
         if not first:
-            sys.stdout.write(f"\033[{len(names)}A")
+            sys.stdout.write(f"\033[{len(names) + DETAIL}A")
         for i, n in enumerate(names):
             t = TOOLS[n]
             box = f"{CODE_FG}[x]{RESET}" if t.enabled else f"{DIM}[ ]{RESET}"
             cur = f"{BOLD}❯{RESET} " if i == sel else "  "
-            sys.stdout.write(f"\r\033[K{cur}{box} {n:<18}{DIM}[{t.source}]  "
-                             f"{t.description[:42]}{RESET}\r\n")
+            head = f"{n:<18}[{t.source}]  "
+            room = cols - 8 - len(head)           # fit the description to the real terminal width
+            desc = " ".join(t.description.split())
+            if room > 8 and len(desc) > room:
+                desc = desc[: room - 1] + "…"
+            elif room <= 8:
+                desc = ""
+            sys.stdout.write(f"\r\033[K{cur}{box} {n:<18}{DIM}[{t.source}]  {desc}{RESET}\r\n")
+        # detail pane: the selected tool's full description, wrapped
+        t = TOOLS[names[sel]]
+        lines = textwrap.wrap(" ".join(t.description.split()), width=cols - 6) or [""]
+        if len(lines) > DETAIL:
+            lines = lines[: DETAIL - 1] + [lines[DETAIL - 1][: cols - 8] + "…"]
+        lines += [""] * (DETAIL - len(lines))
+        for j, ln in enumerate(lines):
+            pre = f"{DIM}  ▸ " if j == 0 else f"{DIM}    "
+            sys.stdout.write(f"\r\033[K{pre}{ln}{RESET}\r\n")
         sys.stdout.flush()
 
     try:
