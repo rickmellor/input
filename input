@@ -3208,15 +3208,17 @@ def tools_menu():
         if not first and drawn[0]:
             sys.stdout.write(f"\033[{drawn[0]}A")
         total = 0
+        name_w = max(18, max(len(n) for n in names))
+        src_w = max(len(f"[{TOOLS[n].source}]") for n in names)
+        indent = 6 + name_w + src_w + 2           # ONE description column for every row (aligned wraps)
+        width = max(20, cols - indent - 1)
         for i, n in enumerate(names):
             t = TOOLS[n]
             box = f"{CODE_FG}[x]{RESET}" if t.enabled else f"{DIM}[ ]{RESET}"
             cur = f"{BOLD}❯{RESET} " if i == sel else "  "
-            head = f"{n:<18}[{t.source}]  "
-            indent = 6 + len(head)                # hanging indent under the description column
-            width = max(20, cols - indent - 1)
+            src = f"[{t.source}]"
             lines = textwrap.wrap(" ".join(t.description.split()), width=width) or [""]
-            sys.stdout.write(f"\r\033[K{cur}{box} {n:<18}{DIM}[{t.source}]  {lines[0]}{RESET}\r\n")
+            sys.stdout.write(f"\r\033[K{cur}{box} {n:<{name_w}}{DIM}{src:<{src_w}}  {lines[0]}{RESET}\r\n")
             for ln in lines[1:]:
                 sys.stdout.write(f"\r\033[K{' ' * indent}{DIM}{ln}{RESET}\r\n")
             total += len(lines)
