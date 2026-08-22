@@ -380,9 +380,11 @@ _HELP_TOPICS = {
         "  /update (or /sidebar update)  post a brief INTERIM update to main, keep the sidebar open\n"
         "  /drop   (or /sidebar drop)    discard it (nothing merged)\n"
         "  /return (or /sidebar return)  PARK it (keep it alive) and drop back toward main\n"
-        "  /sidebar list           show active + parked sidebars\n"
-        "  /sidebar resume [#id]   re-enter a parked sidebar (Tab cycles ids; Enter with several\n"
-        "                          parked opens a picker; a lone parked one resumes directly)"
+        "  /sidebar list  (or /list)     show active + parked sidebars\n"
+        "  /sidebar resume [#id] (/resume)  re-enter a parked sidebar (Tab cycles ids; Enter with\n"
+        "                          several parked opens a picker; a lone parked one resumes directly).\n"
+        "  The bare forms (/merge /update /return /drop /list /resume) work only when relevant —\n"
+        "  otherwise they're just normal text."
     ),
     "/think": (
         "Toggle whether the model's reasoning is shown. On, a dim [think] block streams before\n"
@@ -4035,12 +4037,15 @@ def repl():
             continue
         if user in ("/quit", "exit"):
             break
-        if ((user in ("/merge", "/drop", "/done", "/return", "/update") and SIDEBARS)  # bare op: only in a sidebar
-                or user == "/sidebar" or user.startswith("/sidebar ")
-                or user == "/aside" or user.startswith("/aside ")):
-            if user.startswith("/sidebar") or user.startswith("/aside"):
+        _sb_prefixed = (user == "/sidebar" or user.startswith("/sidebar ")
+                        or user == "/aside" or user.startswith("/aside "))
+        _sb_bare = ((user in ("/merge", "/drop", "/done", "/return", "/update") and SIDEBARS)  # in-sidebar ops
+                    or (user == "/list" and (SIDEBARS or _SB_PAUSED))                          # list any sidebars
+                    or ((user == "/resume" or user.startswith("/resume ")) and _SB_PAUSED))    # resume a parked one
+        if _sb_prefixed or _sb_bare:
+            if _sb_prefixed:
                 arg = user.split(None, 1)[1].strip() if " " in user else ""
-            else:                                          # bare /merge · /drop · /done · /return
+            else:                                          # bare /merge /drop /done /return /update /list /resume
                 arg = user[1:]
             sub = arg.split()[0].lower() if arg else ""
             tok = arg.split(None, 1)[1].strip() if len(arg.split()) > 1 else ""
