@@ -176,7 +176,7 @@ _CMD_HINTS = {
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
     "/sidebar": "[topic] fork · /merge fold back · /update post interim · /return park · /drop discard · list · resume [#id]",
     "/skill":   "<name> load · off <name> unload · (bare) list",
-    "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
+    "/mcp":     "add <name> <url> · add <name> -- <cmd> · remove <name> · hide|show · (bare) list",
     "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
     "/cd":      "<dir> change working directory (re-keys context stack + skills); bare = home",
     "/context": "show the active AGENTS.md stack + loaded skills",
@@ -401,6 +401,9 @@ _HELP_TOPICS = {
         "  /mcp                    list registered servers and their tools\n"
         "  /mcp add <name> <url>       add an HTTP (streamable) server\n"
         "  /mcp add <name> -- <cmd>    add a stdio server (runs the command as a subprocess)\n"
+        "  /mcp remove <name>          remove an added server (unregister tools, stop subprocess)\n"
+        "  /mcp hide|show <server[:tool]>   suppress / restore a server's tools (works on\n"
+        "                              discovered servers too, which /mcp remove can't touch)\n"
         "Their tools auto-register disabled; enable them in /tools."
     ),
     "/models": (
@@ -4512,6 +4515,35 @@ def repl():
                     st["mcp_exclude"] = [x for x in ex if x != m]
                     save_settings(st); reload_mcp_tools()
                     print(f"{DIM}shown: {m}  (re-registered disabled — /tools to enable){RESET}")
+            elif arg.startswith("remove ") or arg.startswith("rm ") or arg.startswith("delete "):
+                name = arg.split(None, 1)[1].strip()
+                st = load_settings()
+                added = st.get("mcp_servers", [])
+                gone = [s for s in added if (s.get("name") or "") == name]
+                if not gone:                       # not an input-added server
+                    disc = any(s.get("name") == name and s.get("source") == "discovered"
+                               for s in mcp_servers())
+                    if disc:
+                        print(f"{DIM}{name!r} is discovered from ~/.claude.json — can't remove here; "
+                              f"/mcp hide {name} to suppress its tools{RESET}")
+                    else:
+                        print(f"{DIM}no added MCP server named {name!r} — /mcp to list{RESET}")
+                    continue
+                st["mcp_servers"] = [s for s in added if (s.get("name") or "") != name]
+                save_settings(st)
+                for n in [n for n, t in list(TOOLS.items()) if t.source.startswith(f"mcp:{name}·")]:
+                    del TOOLS[n]                    # unregister its live tools
+                for s in gone:                      # close pooled client + stop the subprocess
+                    c = _MCP_CLIENTS.pop(_server_key(s), None)
+                    proc = getattr(c, "proc", None)
+                    if proc is not None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                apply_tools_state()
+                print(f"{DIM}removed mcp {name} — dropped from settings, tools unregistered"
+                      f"{', subprocess stopped' if any('command' in s for s in gone) else ''}{RESET}")
             else:
                 servers = mcp_servers()
                 if not servers:
@@ -4528,7 +4560,7 @@ def repl():
                 ex = load_settings().get("mcp_exclude") or []
                 if ex:
                     print(f"{DIM}  excluded: {', '.join(ex)}{RESET}")
-                print(f"{DIM}  /mcp add <name> <url> · /mcp add <name> -- <cmd…> · /mcp hide|show <server[:tool]>{RESET}")
+                print(f"{DIM}  /mcp add <name> <url> · /mcp add <name> -- <cmd…> · /mcp remove <name> · /mcp hide|show <server[:tool]>{RESET}")
             continue
         if user == "/memory" or user.startswith("/memory "):
             arg = user[len("/memory"):].strip()
