@@ -4019,16 +4019,20 @@ def repl():
             sub = arg.split()[0].lower() if arg else ""
             tok = arg.split(None, 1)[1].strip() if len(arg.split()) > 1 else ""
 
-            if sub in ("list", "ls"):                      # show active + paused sidebars
+            if sub in ("list", "ls"):                      # show the active nesting tree + parked ones
                 if not SIDEBARS and not _SB_PAUSED:
-                    print(f"{DIM}no sidebars — /sidebar [topic] starts one{RESET}")
-                else:
-                    for i, f in enumerate(SIDEBARS):
-                        here = "  (here)" if i == len(SIDEBARS) - 1 else ""
-                        print(f"{DIM}  {CODE_FG}●{DIM} active  #{f['id']}  {f['label']}{here}{RESET}")
+                    print(f"{DIM}no sidebars — /sidebar [topic] starts one{RESET}"); continue
+                root_here = f"{CODE_FG}  ◂ you are here{RESET}" if not SIDEBARS else ""
+                print(f"{DIM}  ▸ main thread{root_here}{RESET}")
+                for i, f in enumerate(SIDEBARS):           # active stack = live nesting, root→current
+                    indent = "   " + "   " * i
+                    here = f"{CODE_FG}  ◂ you are here{RESET}" if i == len(SIDEBARS) - 1 else ""
+                    print(f"{DIM}{indent}└▸ #{f['id']} {f['label']}  (L{i + 1}){here}{RESET}")
+                if _SB_PAUSED:                             # parked = detached branches, not in the tree
+                    print(f"{DIM}  ⏸ parked (resume to re-enter):{RESET}")
                     for f in _SB_PAUSED:
-                        print(f"{DIM}  ⏸ paused  #{f['id']}  {f['label']}  ({len(f['branch'])} msgs){RESET}")
-                    print(f"{DIM}  /sidebar resume [#id|label] · /merge · /drop · /return{RESET}")
+                        print(f"{DIM}      #{f['id']} {f['label']}  ({len(f['branch'])} msgs){RESET}")
+                print(f"{DIM}  /sidebar resume [#id|label] · /merge · /update · /return · /drop{RESET}")
                 continue
             if sub == "resume":                            # re-enter a paused sidebar
                 if not _SB_PAUSED:
