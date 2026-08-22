@@ -1344,6 +1344,8 @@ def _install_stdout_router():
 _FOOTER_ACTIVE = False
 _footer_stop = threading.Event()
 _footer_flash = {"msg": "", "until": 0.0}
+_SAINT_RETRAIN = None          # x-saint-retrain reason (classifier drift) from the last SAINT response, or None
+_SAINT_RETRAIN_NOTED = False   # printed the one-time session notice yet?
 
 
 def _footer_clip(s, width):
@@ -1379,6 +1381,8 @@ def _footer_text():
         parts.append(f"{active} job{'s' if active != 1 else ''} running")
     if blocked:
         parts.append(f"{RED_VIVID}{blocked} ⛔ /jobs answer{RESET}{DIM}")
+    if _SAINT_RETRAIN:
+        parts.append(f"{YEL}⚠ saint retrain{RESET}{DIM}")
     if _footer_flash["msg"] and time.time() < _footer_flash["until"]:
         parts.append(_footer_flash["msg"])
     return "  ·  ".join(parts)
@@ -2599,6 +2603,11 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
             saint_b = r.headers.get("x-saint-backend")  # only SAINT sets x-saint-*
             dom, cx = r.headers.get("x-saint-domain", ""), r.headers.get("x-saint-complexity", "")
             cls, state = r.headers.get("x-saint-classifier", ""), r.headers.get("x-saint-state", "")
+            global _SAINT_RETRAIN, _SAINT_RETRAIN_NOTED
+            _SAINT_RETRAIN = r.headers.get("x-saint-retrain") or None
+            if _SAINT_RETRAIN and not _SAINT_RETRAIN_NOTED and not quiet:
+                print(f"{YEL}⚠ saint: {_SAINT_RETRAIN}{RESET}")
+                _SAINT_RETRAIN_NOTED = True
             _meta = []
             if dom:
                 _meta.append(f"class: {dom}/{cx}")
