@@ -188,7 +188,7 @@ _CMD_HINTS = {
     "/help":    "list all capabilities · /help <command> for one command",
     "/gate":    "risk auto-run tolerance · /gate <level> · interactive|auto <level>",
     "/footer":  "live bottom status line · /footer on|off",
-    "/memory":  "on|off · user <id> · browse [q] · facts [subject|/q] · profile · remember|correct <s> <p> = <v> · "
+    "/memory":  "on|off · apply|discard (pending LLM-resolved correction) · user <id> · browse [q] · facts [subject|/q] · profile · remember|correct <s> <p> = <v> · "
                 "retract <s> <p> [v] · forget <id|q> [hard] · history <s> <p> · as-of <date> [s p] · why <id> · "
                 "health · staging · approve <id>",
 }
@@ -2566,6 +2566,70 @@ def mem_store(user_input, agent_response):
     if isinstance(det, dict) and det.get("op"):
         print(f"{DIM}⟐ memory: {det['op']} {det.get('subject', '')} {det.get('predicate', '')}"
               f" → {det.get('value') or '∅'}{RESET}")
+        return
+    # The regex detector missed, but the text smells like a correction/forget → ask Astoria's LLM
+    # target-resolver WHICH fact is meant (one LLM call); execution stays deterministic. Unambiguous
+    # plans apply immediately; ambiguous ones are held for `/memory apply` (or `/memory discard`).
+    if _mem_correction_hint(user_input):
+        _mem_resolve_and_maybe_apply(user_input)
+
+
+_MEM_HINT_RE = re.compile(r"\b(actually|correction|i meant|instead|no longer|not .{0,40}? ?anymore|forget (about|the|that|my)|"
+                          r"delete (the|that|my)|remove (the|that|my)|i (now|moved|switched|changed))\b", re.I)
+_MEM_PENDING_PLAN = None
+
+
+def _mem_correction_hint(text):
+    return bool(text) and len(text) >= 8 and bool(_MEM_HINT_RE.search(text))
+
+
+def _mem_plan_lines(plan):
+    out = [f"{plan.get('intent', '?')} — {plan.get('explanation', '')} (conf {plan.get('confidence', 0):.2f})"]
+    for t in plan.get("targets") or []:
+        out.append(f"  target {str(t.get('id', ''))[:8]} {t.get('subject', '')} {t.get('predicate', '')}: {str(t.get('value', ''))[:70]}")
+    nf = plan.get("new_fact")
+    if nf:
+        out.append(f"  new    {nf.get('subject', '')} {nf.get('predicate', '')}: {str(nf.get('value', ''))[:70]}")
+    return out
+
+
+def _mem_resolve_and_maybe_apply(text):
+    global _MEM_PENDING_PLAN
+    cfg = mem_config()
+    try:
+        plan = _mem_rest("POST", "/resolve", {"user_id": cfg["user"], "text": text}, timeout=20)
+    except Exception:
+        return                                     # LLM down / 503: cognify will catch it later
+    if not isinstance(plan, dict) or plan.get("intent") in (None, "none") or plan.get("error"):
+        return
+    if not plan.get("requires_confirmation"):
+        try:
+            res = _mem_rest("POST", "/resolve/apply", {"user_id": cfg["user"], "plan": plan}, timeout=20)
+        except Exception as e:
+            print(f"{DIM}⟐ memory: resolve-apply failed ({e}){RESET}")
+            return
+        ch = res.get("changed") if isinstance(res, dict) else None
+        print(f"{DIM}⟐ memory: {plan.get('intent')} applied — {plan.get('explanation', '')}"
+              f"{' · ' + str(len(ch)) + ' fact(s)' if isinstance(ch, list) else ''}{RESET}")
+        return
+    _MEM_PENDING_PLAN = plan
+    print(f"{DIM}⟐ memory: proposed " + "\n   ".join(_mem_plan_lines(plan)) + f"\n   → /memory apply  or  /memory discard{RESET}")
+
+
+def _mem_apply_pending(arg):
+    global _MEM_PENDING_PLAN
+    if arg == "discard":
+        _MEM_PENDING_PLAN = None
+        print("memory: pending plan discarded"); return
+    if not _MEM_PENDING_PLAN:
+        print("memory: nothing pending"); return
+    cfg = mem_config()
+    try:
+        res = _mem_rest("POST", "/resolve/apply", {"user_id": cfg["user"], "plan": _MEM_PENDING_PLAN}, timeout=20)
+    except Exception as e:
+        print(f"memory: apply failed: {e}"); return
+    _MEM_PENDING_PLAN = None
+    print(f"memory: applied {res.get('intent')} — changed {len(res.get('changed') or [])} fact(s)" if isinstance(res, dict) else f"memory: {res}")
 
 
 def _fact_line(f, ids=True):
@@ -2653,6 +2717,8 @@ def _print_facts(rows, empty="(none)"):
 
 def memory_command(arg):
     """The deterministic /memory subcommands beyond on|off|user|browse (all plain REST)."""
+    if arg in ("apply", "discard"):
+        return _mem_apply_pending(arg)
     cfg = mem_config(); uid = cfg["user"]
     verb, _, rest = arg.partition(" ")
     rest = rest.strip()
