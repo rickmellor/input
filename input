@@ -174,7 +174,7 @@ _CMD_HINTS = {
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
     "/plan":    "<goal> new · load · show · archive   (authors in plan mode)",
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
-    "/sidebar": "[topic] fork aside (topic optional) · /merge folds conclusion back · /drop discards",
+    "/sidebar": "[topic] fork · /merge fold back · /drop discard · /return park · list · resume [#id]",
     "/skill":   "<name> load · off <name> unload · (bare) list",
     "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
     "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
@@ -232,7 +232,7 @@ _HELP = [
         ("/new", "fresh session — wipe history, stats, goal, skills, sidebars, mode"),
         ("/clear", "clear the conversation history (keeps stats)"),
         ("/mode", "cautious · unrestricted · plan   (Shift+Tab cycles)"),
-        ("/sidebar", "fork an aside; merge folds only its conclusion back"),
+        ("/sidebar", "fork an aside; /merge folds its conclusion back, /return parks it, resume returns"),
         ("/think", "toggle showing the model's reasoning"),
         ("/tools", "toggle which tools are available"),
         ("/mcp", "add / list MCP servers"),
@@ -374,9 +374,14 @@ _HELP_TOPICS = {
         "Fork the conversation into an ASIDE — a side discussion that shares the context up to\n"
         "the fork point, then diverges. When you finish, only the CONCLUSION folds back into the\n"
         "main thread (not the whole tangent), so a detour doesn't bloat the main history. Nestable.\n"
+        "You can also PARK a sidebar and pick it back up later — several can be open at once.\n"
         "  /sidebar [topic]        start an aside (topic optional; defaults to \"sidebar\")\n"
         "  /merge  (or /sidebar merge)   fold its conclusion back into the main thread\n"
-        "  /drop   (or /sidebar drop)    discard it (nothing merged)"
+        "  /drop   (or /sidebar drop)    discard it (nothing merged)\n"
+        "  /return (or /sidebar return)  PARK it (keep it alive) and drop back toward main\n"
+        "  /sidebar list           show active + parked sidebars\n"
+        "  /sidebar resume [#id]   re-enter a parked sidebar (Tab cycles ids; Enter with several\n"
+        "                          parked opens a picker; a lone parked one resumes directly)"
     ),
     "/think": (
         "Toggle whether the model's reasoning is shown. On, a dim [think] block streams before\n"
@@ -876,7 +881,13 @@ def goal_terminate(goal, nudges_left):
 # A sidebar shares the context up to the fork point, then diverges. On merge, only a CONCISE
 # CONCLUSION returns to the main thread (not the whole side transcript) — so a tangent doesn't
 # bloat the main history. A stack, so sidebars can nest.
-SIDEBARS = []   # stack of {"parent": [...main msgs at fork...], "plen": int, "label": str}
+SIDEBARS = []   # ACTIVE (entered) sidebars; a stack so they nest. Each: {"label","id"}. The live
+                # `history` IS the top sidebar's branch (or the main thread when this list is empty).
+_SB_UNDER = []  # parallel to SIDEBARS: the saved history of the layer BENEATH each active sidebar,
+                # restored AS IT STANDS NOW (never a stale fork snapshot) on merge/drop/return — so
+                # you can /return to main, work there, /resume, and /merge without clobbering main.
+_SB_PAUSED = [] # suspended sidebars kept alive to resume later: {"label","id","branch":[...msgs...]}.
+_SB_SEQ = 0     # monotonic id source so paused sidebars get stable, pickable handles (#1, #2 …).
 _PREFILL = ""   # command line to hand back pre-filled on the next prompt (Tab from a picker)
 
 
@@ -887,6 +898,50 @@ def sidebar_summarize(history, model, base):
         "decisions reached, findings, anything to carry back. No preamble, just the conclusion.",
         history=list(history), model=model, base=base, quiet=True, max_rounds=1)
     return (res.get("text") or "").strip()
+
+
+def _sb_fork(history, label):
+    """Enter a NEW sidebar branching from the current thread (main or an outer sidebar)."""
+    global _SB_SEQ
+    _SB_SEQ += 1
+    _SB_UNDER.append(list(history))                # remember the layer we're diverging from
+    SIDEBARS.append({"label": label[:60], "id": _SB_SEQ})
+    history.append({"role": "user", "content": f"[Entering a SIDEBAR about: {label}] The main task is "
+                    "paused. Explore this side thread; when we finish I'll fold the conclusions back."})
+    history.append({"role": "assistant", "content": f"In a sidebar on '{label}'. What would you like to explore?"})
+    return SIDEBARS[-1]
+
+
+def _sb_leave(history):
+    """Pop the active sidebar and restore the layer beneath it (as it stands NOW). Returns the frame."""
+    history[:] = _SB_UNDER.pop()
+    return SIDEBARS.pop()
+
+
+def _sb_pause(history):
+    """/return — suspend the active sidebar (keeping its branch) and drop to the layer beneath."""
+    branch = list(history)
+    frame = _sb_leave(history)
+    _SB_PAUSED.append({"label": frame["label"], "id": frame["id"], "branch": branch})
+    return frame
+
+
+def _sb_resume(history, entry):
+    """Re-enter a paused sidebar: stash the current thread as its 'under', make its branch live."""
+    _SB_UNDER.append(list(history))                # the thread we're leaving is what merge returns to
+    history[:] = entry["branch"]
+    SIDEBARS.append({"label": entry["label"], "id": entry["id"]})
+    _SB_PAUSED.remove(entry)
+    return entry
+
+
+def _sb_match_paused(tok):
+    """Find a paused sidebar by #id / id / label-substring; None if no match."""
+    t = tok.strip().lstrip("#").lower()
+    for f in _SB_PAUSED:
+        if str(f["id"]) == t:
+            return f
+    return next((f for f in _SB_PAUSED if t and t in f["label"].lower()), None)
 
 
 def notify_blocked(source, need):
@@ -2834,6 +2889,8 @@ def _prompt():
     goal = (f"{RED_VIVID}{BOLD} ⛔blocked▸{RESET}" if GOAL_BLOCKED else
             (f"{DIM} goal▸{RESET}" if GOAL else ""))
     aside = f"{CODE_FG} aside{'▸' * len(SIDEBARS)}{RESET}" if SIDEBARS else ""
+    if _SB_PAUSED:                                  # paused sidebars persist even on the main thread
+        aside += f"{DIM} ⏸{len(_SB_PAUSED)}{RESET}"
     return f"{color}{n}{RESET}{tag}{build}{goal}{aside} > "
 
 
@@ -2854,6 +2911,8 @@ def _id_ctx(text):
     elif cmd == "/build":
         id_pos, src = 1, (lambda: [str(p.get("id")) for p in (megaplan_call("list") or [])
                                    if isinstance(p, dict) and p.get("id")])
+    elif cmd == "/sidebar" and len(toks) >= 2 and toks[1].lower() == "resume":
+        id_pos, src = 2, (lambda: [str(f["id"]) for f in _SB_PAUSED])   # Tab-cycle paused sidebar ids
     else:
         return None
     if len(toks) == id_pos and ends_space:              # cursor at a fresh id slot
@@ -3947,37 +4006,69 @@ def repl():
             continue
         if user in ("/quit", "exit"):
             break
-        if ((user in ("/merge", "/drop", "/done") and SIDEBARS)   # bare op: only a command inside a sidebar
+        if ((user in ("/merge", "/drop", "/done", "/return") and SIDEBARS)  # bare op: only inside a sidebar
                 or user == "/sidebar" or user.startswith("/sidebar ")
                 or user == "/aside" or user.startswith("/aside ")):
             if user.startswith("/sidebar") or user.startswith("/aside"):
                 arg = user.split(None, 1)[1].strip() if " " in user else ""
-            else:                                          # bare /merge · /drop · /done → sidebar op
+            else:                                          # bare /merge · /drop · /done · /return
                 arg = user[1:]
-            if arg in ("merge", "done", "close", "drop", "cancel"):
+            sub = arg.split()[0].lower() if arg else ""
+            tok = arg.split(None, 1)[1].strip() if len(arg.split()) > 1 else ""
+
+            if sub in ("list", "ls"):                      # show active + paused sidebars
+                if not SIDEBARS and not _SB_PAUSED:
+                    print(f"{DIM}no sidebars — /sidebar [topic] starts one{RESET}")
+                else:
+                    for i, f in enumerate(SIDEBARS):
+                        here = "  (here)" if i == len(SIDEBARS) - 1 else ""
+                        print(f"{DIM}  {CODE_FG}●{DIM} active  #{f['id']}  {f['label']}{here}{RESET}")
+                    for f in _SB_PAUSED:
+                        print(f"{DIM}  ⏸ paused  #{f['id']}  {f['label']}  ({len(f['branch'])} msgs){RESET}")
+                    print(f"{DIM}  /sidebar resume [#id|label] · /merge · /drop · /return{RESET}")
+                continue
+            if sub == "resume":                            # re-enter a paused sidebar
+                if not _SB_PAUSED:
+                    print(f"{DIM}no paused sidebars — /sidebar list{RESET}"); continue
+                entry = _sb_match_paused(tok) if tok else (_SB_PAUSED[0] if len(_SB_PAUSED) == 1 else None)
+                if entry is None and not tok:              # >1 paused, none named → picker
+                    labels = [f"#{f['id']}  {f['label']}  ({len(f['branch'])} msgs)" for f in _SB_PAUSED]
+                    res = _pick(labels, 0, hint="↑/↓ or j/k · enter resume · q cancel")
+                    if not res:
+                        print(f"{DIM}resume cancelled{RESET}"); continue
+                    entry = _SB_PAUSED[res[0]]
+                if entry is None:
+                    print(f"{DIM}no paused sidebar matches {tok!r} — /sidebar list{RESET}"); continue
+                _sb_resume(history, entry)
+                print(f"{DIM}▸ resumed sidebar #{entry['id']} '{entry['label']}'  ·  /merge · /drop · /return{RESET}")
+                continue
+
+            if sub in ("merge", "done", "close", "drop", "cancel", "return", "back", "pause"):
                 if not SIDEBARS:
                     print(f"{DIM}not in a sidebar — /sidebar [topic] starts one{RESET}"); continue
-                sb = SIDEBARS[-1]
-                if arg in ("drop", "cancel"):
-                    SIDEBARS.pop(); history[:] = sb["parent"]
-                    print(f"{DIM}sidebar '{sb['label']}' dropped — main thread restored (nothing merged){RESET}")
-                else:
-                    print(f"{DIM}⟲ folding sidebar '{sb['label']}' back into the main thread…{RESET}")
+                if sub in ("drop", "cancel"):
+                    f = _sb_leave(history)
+                    print(f"{DIM}sidebar '{f['label']}' dropped — nothing merged{RESET}")
+                elif sub in ("return", "back", "pause"):
+                    f = _sb_pause(history)
+                    where = "the main thread" if not SIDEBARS else f"sidebar '{SIDEBARS[-1]['label']}'"
+                    print(f"{DIM}⏸ sidebar '{f['label']}' parked — back on {where}  ·  /sidebar resume returns to it{RESET}")
+                else:                                      # merge / done / close
+                    f = SIDEBARS[-1]
+                    print(f"{DIM}⟲ folding sidebar '{f['label']}' back into the main thread…{RESET}")
                     summary = sidebar_summarize(history, MODEL, BASE) or "(no conclusion captured)"
-                    SIDEBARS.pop(); history[:] = sb["parent"]
+                    _sb_leave(history)
                     history.append({"role": "user",
-                                    "content": f"[Sidebar '{sb['label']}' concluded — carrying back:] {summary}"})
+                                    "content": f"[Sidebar '{f['label']}' concluded — carrying back:] {summary}"})
                     history.append({"role": "assistant", "content": f"Noted the sidebar's conclusion: {summary}"})
                     print(f"{DIM}  ↩ merged: {summary[:200]}{RESET}")
-            else:                                          # fork — topic optional, defaults to "sidebar"
-                label = arg or "sidebar"
-                SIDEBARS.append({"parent": list(history), "plen": len(history), "label": label[:60]})
-                history.append({"role": "user",
-                                "content": f"[Entering a SIDEBAR about: {label}] The main task is paused. "
-                                "Explore this side thread; when we finish I'll fold the conclusions back."})
-                history.append({"role": "assistant", "content": f"In a sidebar on '{label}'. What would you like to explore?"})
-                depth = "▸" * len(SIDEBARS)
-                print(f"{DIM}● sidebar {depth} {label}  (branch of the main thread; /merge folds its conclusion back, /drop discards){RESET}")
+                continue
+
+            label = arg.strip() or "sidebar"               # otherwise: fork a new sidebar (topic optional)
+            _sb_fork(history, label)
+            depth = "▸" * len(SIDEBARS)
+            print(f"{DIM}● sidebar {depth} {label}  (branch of the current thread; /merge folds back · "
+                  f"/drop discards · /return parks it){RESET}")
             continue
         if user == "/jobs" or user.startswith("/jobs "):
             parts = user.split(None, 2)
@@ -4547,6 +4638,7 @@ def repl():
             continue
         if user == "/clear":
             history.clear(); thinks.clear()
+            SIDEBARS.clear(); _SB_UNDER.clear(); _SB_PAUSED.clear()   # cleared thread → no dangling branches
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             clear_screen()
@@ -4554,7 +4646,7 @@ def repl():
         if user == "/new":                             # full reset — a brand-new session
             history.clear(); thinks.clear()
             stats = Stats()                            # zero the token/turn counters
-            SIDEBARS.clear(); LOADED_SKILLS.clear()    # drop sidebars + session-loaded skills
+            SIDEBARS.clear(); _SB_UNDER.clear(); _SB_PAUSED.clear(); LOADED_SKILLS.clear()  # drop sidebars + skills
             GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh SAINT affinity
