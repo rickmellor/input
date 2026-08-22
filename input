@@ -1638,7 +1638,7 @@ def _run_detached(cmd, timeout=None):
     The caller polls the log (run_command 'tail -n 40 <log>') or waits (run_command 'tail --pid=<pid> -f <log>'
     with a short timeout). A hard `timeout` (if given) is enforced by `timeout(1)`."""
     os.makedirs(_SHELL_JOBS_DIR, exist_ok=True)
-    jid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    jid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
     log = os.path.join(_SHELL_JOBS_DIR, jid + ".log")
     wrapped = f"timeout {int(timeout)} {SHELL} -c {shlex.quote(cmd)}" if timeout else cmd
     with open(log, "w") as fh:
