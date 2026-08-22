@@ -1034,6 +1034,7 @@ _TOOLS_DIR = os.path.expanduser("~/.config/input/tools")
 TOOLS = {}            # name -> Tool
 TOOLS_ON = True       # set from settings at REPL start; /tools toggles + persists
 MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't spin forever
+SUBAGENT_MAX_ROUNDS = 24   # sub-agents do real multi-step work (research, source digs); 8 starved them
 
 
 class Tool:
@@ -1515,7 +1516,7 @@ def _agents_ticker(agents, stop):
         sys.stdout.write(f"\033[{drawn}A\r\033[J"); sys.stdout.flush()
 
 
-def _subagent_system(cwd, skill, seat=None, model_id=None):
+def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_rounds=None):
     """A sub-agent's system prompt: grounding + the cwd's folder context + one skill brief +
     autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills.
     `seat`/`model_id` name the seat this agent runs on so it can self-report / a skill can
@@ -1537,6 +1538,19 @@ def _subagent_system(cwd, skill, seat=None, model_id=None):
         "the work; do NOT ask the user questions — make reasonable assumptions and note them. "
         "Your FINAL message is your entire deliverable back to the orchestrator: make it "
         "complete and self-contained (findings, what you did, any caveats).")
+    allowed = SANDBOX_DEV if write else SANDBOX_READONLY
+    parts.append(
+        "## Tool rules (sandbox)\n"
+        f"- Sandbox root: {cwd}. read/list/write paths must stay inside it.\n"
+        "- `bash` is SHELL-LESS: one command per call, argv-split, NO pipes, redirects, globs, heredocs, "
+        "`&&`/`;`. `~` IS expanded. Use `grep`/`find`/`head` flags instead of pipes; for code use a "
+        "single `python3 -c '…'`. " + ("`bash -c '…'` is available for real shell syntax." if write else
+        "`bash -c`, `git clone`, package installs and writes are NOT available in this read-only agent — "
+        "say what you would have run; ask the orchestrator for write=true if the task truly needs it.") + "\n"
+        f"- Allowed command prefixes: {', '.join(allowed)}.\n"
+        + (f"- Budget: {max_rounds} tool rounds. Plan to finish within it; write your final report as TEXT "
+           "(a message with no tool calls) — if the budget runs out you get one last no-tools turn to "
+           "summarize what you have, so keep notes in your own words as you go.\n" if max_rounds else ""))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -1548,15 +1562,17 @@ def _tool_spawn_agent(args):
     skill = (a.get("skill") or "").strip()
     if skill and skill not in SKILLS:
         return f"Error: no such skill {skill!r}. Available: {', '.join(SKILLS) or '(none)'}"
-    cwd = os.path.abspath(a.get("cwd") or os.getcwd())
+    cwd = os.path.abspath(os.path.expanduser(a.get("cwd") or os.getcwd()))
     write = bool(a.get("write"))
     budget = int(a.get("budget_tokens") or 200_000)
+    max_rounds = max(2, int(a.get("max_rounds") or SUBAGENT_MAX_ROUNDS))
     # model: explicit pin > skill's declared seat > (classify the brief) hard→reasoning_seat, else saint-auto
     model = (a.get("model") or "").strip() or (SKILLS.get(skill, {}).get("seat") or "")
     if not model:
         model = agentic_seat(task)
     m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
-    system = _subagent_system(cwd, skill, seat=(model if model in SEATS else None), model_id=m)
+    system = _subagent_system(cwd, skill, seat=(model if model in SEATS else None), model_id=m,
+                              write=write, max_rounds=max_rounds)
     sb = Sandbox(root=cwd, allow=(SANDBOX_DEV if write else SANDBOX_READONLY))
     tools = sandbox_tools(sb, write=write)
     label = skill or (m.split("-")[-1] if "-" in m else m)
@@ -1574,7 +1590,8 @@ def _tool_spawn_agent(args):
             slot["state"] = "running"; slot["start"] = time.monotonic()
         t0 = time.monotonic()              # time generation only, not queue wait on the semaphore
         res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
-                         budget_tokens=budget, on_tool=on_tool, gate=False)
+                         budget_tokens=budget, on_tool=on_tool, gate=False,
+                         max_rounds=max_rounds, finalize_on_cap=True)
         dt = time.monotonic() - t0
     tag = "" if res["stopped"] == "done" else f" [{res['stopped']}]"
     rate = res["tokens_out"] / res["decode_s"] if res.get("decode_s") else 0  # decode rate, not wall
@@ -1606,7 +1623,8 @@ register(Tool(
          "model": {"type": "string", "description": "optional seat/model pin (default saint-auto); e.g. cloud-flagship, cloud-large, coder"},
          "cwd": {"type": "string", "description": "working directory (default: current)"},
          "write": {"type": "boolean", "description": "grant write/edit + build tools (default: read-only)"},
-         "budget_tokens": {"type": "integer", "description": "token guardrail (default 200000)"}},
+         "budget_tokens": {"type": "integer", "description": "token guardrail (default 200000)"},
+         "max_rounds": {"type": "integer", "description": "tool-round budget (default 24); raise for long source digs / multi-page research"}},
      "required": ["task"]},
     _tool_spawn_agent))
 
@@ -3699,7 +3717,7 @@ class Sandbox:
             return "exit=-1\n(bash refused: empty command)"
         if danger(command):
             return "exit=-1\n(bash refused: matches the catastrophic denylist)"
-        workdir = self._resolve(cwd) if cwd else self.root
+        workdir = self._resolve(os.path.expanduser(cwd)) if cwd else self.root
         if workdir is None:
             return "exit=-1\n(bash refused: cwd escapes the sandbox root)"
         if self.unsafe_shell:
@@ -3708,6 +3726,7 @@ class Sandbox:
             argv = shlex.split(command)
         except ValueError as e:
             return f"exit=-1\n(bash refused: unparsable command: {e})"
+        argv = [os.path.expanduser(t) if t.startswith("~") else t for t in argv]   # no shell → expand ~ ourselves
         op = _shell_op_in(argv)
         if op:
             return (f"exit=-1\n(bash refused: no shell here — the operator {op!r} is NOT "
@@ -3828,7 +3847,8 @@ class _NeedsApproval(Exception):
 
 def run_thread(task, *, history=None, system=None, model=None, base=None, tools=None,
                max_rounds=MAX_TOOL_ROUNDS, quiet=True, stats=None, thinks=None, volatile=None,
-               terminate=None, budget_tokens=None, on_tool=None, session=None, gate=True, dark=None):
+               terminate=None, budget_tokens=None, on_tool=None, session=None, gate=True, dark=None,
+               finalize_on_cap=False):
     """Run one agent thread. `task` is appended as the user message to `history` (a list,
     mutated in place; new list if None). `tools` = list of Tool objects (thread-local).
     `system` overrides the system prompt (e.g. system_prompt(cwd) + a brief). `terminate`
@@ -3972,6 +3992,22 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                                  "content": shown if shown is not None else out})
         else:
             res["stopped"] = "rounds"
+            if finalize_on_cap and not (res["text"] or "").strip():
+                # one last NO-TOOLS turn so a capped agent still hands back what it learned
+                messages.append({"role": "user", "content":
+                    "Your tool budget is exhausted. Do not call tools. Write your final deliverable NOW "
+                    "from everything gathered so far: findings, evidence, what remains unknown."})
+                try:
+                    ftext, _ftcs, fusage = stream(messages, thinks, model=model, base=base, tools=None,
+                                                  volatile=volatile, system=system, quiet=quiet, session=session)
+                    if ftext:
+                        res["text"] = ftext
+                        messages.append({"role": "assistant", "content": ftext})
+                        if isinstance(fusage, dict):
+                            res["tokens_in"] += int(fusage.get("prompt_tokens") or 0)
+                            res["tokens_out"] += int(fusage.get("completion_tokens") or 0)
+                except Exception as e:  # finalize is best-effort
+                    res["text"] = res["text"] or f"(finalize failed: {type(e).__name__}: {e})"
     except KeyboardInterrupt:
         del messages[base_len:]; raise
     except _NeedsApproval as na:                    # dark run hit an over-tolerance command
