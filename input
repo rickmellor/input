@@ -24,10 +24,13 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       opens an arrow-key per-tool on/off menu (/tools on|off master switch). Tools from
       MCP servers auto-register DISABLED (enable via /tools); /mcp lists servers (added
       directly vs discovered from ~/.claude.json) and /mcp add <name> <url> adds one.
-      Memory: an MCP client wires MemoryOS (network memory service) as an ambient layer —
-      relevant memories are recalled before each turn and each exchange stored after;
-      /memory toggles/configures (user_id, url in settings.json); /memory browse [query]
-      inspects the stored profile, recent history, knowledge, and pages.
+      Memory: Astoria (the NAS memory service, REST :8933) is wired as an ambient layer —
+      relevant memory is recalled before each turn (the server's pre-rendered block) and
+      each exchange captured after; /memory toggles/configures (user_id, url in
+      settings.json); /memory browse|facts|profile|correct|remember|retract|forget|
+      history|as-of|why|health|staging|approve are deterministic REST ops; a built-in
+      `memory` tool lets the model persist an explicit correction (the astoria MCP
+      server itself stays claimed/hidden while ambient memory is on).
 Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
 import json, math, os, platform, re, shlex, shutil, subprocess, sys, threading, time, urllib.request, urllib.parse
@@ -185,6 +188,9 @@ _CMD_HINTS = {
     "/help":    "list all capabilities · /help <command> for one command",
     "/gate":    "risk auto-run tolerance · /gate <level> · interactive|auto <level>",
     "/footer":  "live bottom status line · /footer on|off",
+    "/memory":  "on|off · user <id> · browse [q] · facts [subject|/q] · profile · remember|correct <s> <p> = <v> · "
+                "retract <s> <p> [v] · forget <id|q> [hard] · history <s> <p> · as-of <date> [s p] · why <id> · "
+                "health · staging · approve <id>",
 }
 
 
@@ -226,7 +232,7 @@ _HELP = [
         ("/context", "show the AGENTS.md stack + loaded skills for the cwd"),
         ("/cd", "change working directory — re-keys the context stack, skills, and sandbox"),
         ("/system", "view / edit the system-prompt template"),
-        ("/memory", "MemoryOS ambient-memory status"),
+        ("/memory", "Astoria ambient-memory status · facts / correct / forget / why …"),
     ]),
     ("Session & modes", [
         ("/new", "fresh session — wipe history, stats, goal, skills, sidebars, mode"),
@@ -346,10 +352,26 @@ _HELP_TOPICS = {
         "  /system edit            open it in your editor"
     ),
     "/memory": (
-        "Show MemoryOS ambient-memory status — the NAS-hosted long-term memory that recalls\n"
-        "relevant facts before each turn and stores the exchange after. When it's on you'll see\n"
-        "a dim `⟐ memory: N recalled` line at the top of a turn; the recalled facts are placed\n"
-        "after the cache breakpoint so they don't invalidate the cached prefix."
+        "Astoria ambient memory — the NAS-hosted long-term memory (REST :8933) that recalls\n"
+        "relevant facts before each turn and captures the exchange after. When it's on you'll see\n"
+        "a dim `⟐ memory: N recalled` line at the top of a turn; the recalled block is placed\n"
+        "after the cache breakpoint so it doesn't invalidate the cached prefix. Facts are\n"
+        "(subject, predicate, value) triples with a confidence; `user` / `rick` / `my` = you.\n"
+        "  /memory                       status (health, budget, profile size)\n"
+        "  /memory on|off · user <id>    toggle · switch user_id\n"
+        "  /memory browse [query]        profile + recalled items grouped by layer\n"
+        "  /memory facts [subject|/q]    list facts (by subject, or /text search)\n"
+        "  /memory profile               the derived profile narrative + profile facts\n"
+        "  /memory remember <s> <p> = <v>   assert a durable fact (multi-word predicate → snake_case)\n"
+        "  /memory correct <s> <p> = <v>    supersede the current value\n"
+        "  /memory retract <s> <p> [v]      mark it no longer true (keeps history)\n"
+        "  /memory forget <id|query> [hard] delete a wrong fact (soft by default)\n"
+        "  /memory history <s> <p>       the value chain, newest first\n"
+        "  /memory as-of <date> [s p]    what was true then\n"
+        "  /memory why <id>              provenance: source, kind, evidence, origin episode, chain\n"
+        "  /memory health · staging · approve <id>   service health · gated facts · promote one\n"
+        "The model also has a small `memory` tool (remember/correct/retract/forget/recall) for\n"
+        "persisting an explicit correction; the astoria MCP server itself stays hidden."
     ),
     "/new": (
         "Start a completely fresh session without restarting input: wipes the conversation\n"
@@ -619,9 +641,9 @@ def discover_skills(cwd=None):
     gr = _git_root(cwd or os.getcwd())
     if gr:
         roots.append(os.path.join(gr, ".claude", "skills"))
-    # a skill for a capability an input subsystem owns (memoryos = ambient memory) would
-    # steer the model at suppressed tools — hide it, mirroring mcp_claims().
-    claimed = {"memoryos"} if mem_config().get("enabled") else set()
+    # a skill for a capability an input subsystem owns (astoria/memoryos = ambient memory)
+    # would steer the model at suppressed tools — hide it, mirroring mcp_claims().
+    claimed = {"memoryos", "astoria"} if mem_config().get("enabled") else set()
     found = {}
     for root in roots:
         if not os.path.isdir(root):
@@ -638,7 +660,7 @@ def discover_skills(cwd=None):
             name = (meta.get("name") or (entry[:-3] if entry.endswith(".md") else entry)).strip()
             if not name or name in found:        # first root wins (input's own > claude's > project)
                 continue
-            if name in claimed:                  # claimed by a subsystem (e.g. memoryos = ambient memory)
+            if name in claimed:                  # claimed by a subsystem (e.g. astoria = ambient memory)
                 continue
             found[name] = {"name": name, "description": meta.get("description", "").strip(),
                            "path": path, "seat": (meta.get("model") or meta.get("seat") or "").strip()}
@@ -2160,7 +2182,8 @@ def _norm_url(u):
 def mcp_claims():
     """MCP servers consumed directly by an input subsystem, so their tools must NOT be
     re-exposed to the model. Maps normalized url -> owner label. Extend as subsystems grow;
-    today the ambient memory layer claims the MemoryOS server."""
+    today the ambient memory layer claims the Astoria MCP server (memory_url) — the model
+    gets the small built-in `memory` tool instead of the full MCP surface."""
     claims = {}
     cfg = mem_config()
     if cfg["enabled"]:
@@ -2392,112 +2415,447 @@ def plan_render(p):
         print(f"{DIM}    [{box}] {t.get('text', '')}{est}{flag}{RESET}")
 
 
-_MEM = None            # connected MCPClient for MemoryOS, or None
-_MEM_PROFILE = ""      # cached user profile (stable → system prompt)
+# --- ambient memory (Astoria on the NAS) -------------------------------------------------
+# The ambient layer talks to Astoria's REST surface directly (deterministic, no model
+# round-trip): GET /health + /profile on connect, POST /recall before each turn (the server
+# pre-renders the `context` block we inject verbatim), POST /capture after each exchange.
+# memory_url stays the MCP url (…/mcp/) so mcp_claims() keeps hiding the astoria MCP tools
+# from the model while ambient memory is on; the REST base is derived by stripping /mcp/.
+_MEM = None            # last /health dict while connected (truthy = on), or None
+_MEM_PROFILE = ""      # cached profile narrative (stable → system prompt)
+_MEM_FAILS = 0         # consecutive recall/capture failures; trips the layer off at _MEM_TRIP
+_MEM_TRIP = 3
 
 
 def mem_config():
     st = load_settings()
+    url = st.get("memory_url", "http://192.168.1.134:8933/mcp/")
+    rest = st.get("memory_rest") or re.sub(r"/mcp/?$", "", url.rstrip("/") + "/")
     return {"enabled": st.get("memory", True),
-            "url": st.get("memory_url", "http://192.168.1.134:8930/mcp/"),
-            "user": st.get("memory_user", "rick")}
+            "url": url,                                    # MCP url (claimed → tools hidden)
+            "rest": rest.rstrip("/"),                      # REST base, e.g. http://host:8933
+            "user": st.get("memory_user", "rick"),
+            "budget": int(st.get("memory_budget", 600)),   # recall max_tokens per turn
+            "source": st.get("memory_source", "input"),    # fact `source` / client name
+            "token": st.get("memory_token", "")}
+
+
+def _mem_rest(method, path, body=None, timeout=4):
+    """One Astoria REST call (urllib, like megaplan_call but plain HTTP). Returns the parsed
+    JSON; raises on transport/HTTP failure (HTTP errors carry the server's {"error"} text)."""
+    cfg = mem_config()
+    data = json.dumps(body).encode() if body is not None else None
+    hdr = {"Accept": "application/json", "X-Astoria-Client": cfg["source"]}
+    if data is not None:
+        hdr["Content-Type"] = "application/json"
+    if cfg["token"]:
+        hdr["Authorization"] = "Bearer " + cfg["token"]
+    req = urllib.request.Request(cfg["rest"] + path, data=data, headers=hdr, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error") or str(e)
+        except Exception:
+            msg = str(e)
+        raise RuntimeError(f"{e.code}: {msg}") from None
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _mem_try(method, path, body=None, timeout=6):
+    """_mem_rest that never raises: returns the result or {"error": ...} (for /memory cmds)."""
+    try:
+        return _mem_rest(method, path, body, timeout)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _mem_q(**kw):
+    """?k=v query string from the non-empty kwargs."""
+    q = {k: v for k, v in kw.items() if v not in (None, "")}
+    return ("?" + urllib.parse.urlencode(q)) if q else ""
 
 
 def mem_connect():
-    """Connect MemoryOS if enabled+reachable; cache the profile. Returns a status string."""
-    global _MEM, _MEM_PROFILE
-    _MEM, _MEM_PROFILE, cfg = None, "", mem_config()
+    """Connect Astoria if enabled+reachable (GET /health); cache the profile narrative.
+    Returns a status string."""
+    global _MEM, _MEM_PROFILE, _MEM_FAILS
+    _MEM, _MEM_PROFILE, _MEM_FAILS, cfg = None, "", 0, mem_config()
     if not cfg["enabled"]:
         return "memory off"
     try:
-        _MEM = MCPClient(cfg["url"]).connect()
+        h = _mem_rest("GET", "/health")
+        if not isinstance(h, dict) or h.get("status") not in (None, "ok"):
+            raise RuntimeError(f"status {h.get('status') if isinstance(h, dict) else h!r}")
+        _MEM = h or {"status": "ok"}
     except Exception as e:
         return f"memory unreachable ({e}) — off this session"
     try:
-        d = json.loads(_MEM.call("get_user_profile", {"user_id": cfg["user"]}))
-        p = d.get("user_profile") if isinstance(d, dict) else None
-        _MEM_PROFILE = p if p and p != "None" else ""
+        p = _mem_rest("GET", "/profile" + _mem_q(user_id=cfg["user"]))
+        _MEM_PROFILE = (p.get("narrative") or "").strip() if isinstance(p, dict) else ""
     except Exception:
         _MEM_PROFILE = ""
-    return f"memory on · {cfg['user']} @ {cfg['url']}" + ("" if _MEM_PROFILE else " · no profile yet")
+    return f"memory on · {cfg['user']} @ {cfg['rest']}" + _mem_health_str(_MEM) + \
+        ("" if _MEM_PROFILE else " · no profile yet")
 
 
-def _mem_item(x):
-    return x if isinstance(x, str) else (x.get("content") or x.get("text") or json.dumps(x))
+def _mem_health_str(h):
+    """' · tei ok · llm down (cognify queued)' from a /health dict ('' if it has no detail)."""
+    if not isinstance(h, dict):
+        return ""
+    bits = []
+    tei = h.get("tei")
+    if isinstance(tei, dict):
+        bits.append("tei ok" if tei.get("ok") else "tei down (bm25 only)")
+    llm = h.get("llm")
+    if isinstance(llm, dict):
+        up = bool(llm.get("saint")) or bool(llm.get("fallback"))
+        bits.append("llm ok" if up else "llm down (cognify queued)")
+    q = h.get("queue")
+    if isinstance(q, dict) and (q.get("pending") or q.get("dead")):
+        bits.append(f"queue {q.get('pending', 0)} pending" + (f"/{q['dead']} dead" if q.get("dead") else ""))
+    return "".join(" · " + b for b in bits)
+
+
+def _mem_trip(e):
+    """Count a failed ambient call; after _MEM_TRIP in a row, drop the layer (one line, no spam)."""
+    global _MEM, _MEM_FAILS
+    _MEM_FAILS += 1
+    if _MEM and _MEM_FAILS >= _MEM_TRIP:
+        _MEM = None
+        print(f"{DIM}⟐ memory: unreachable ({e}) — off until /memory on{RESET}")
 
 
 def mem_recall(query):
-    """Best-effort compact context block of relevant memories for this turn, or ''."""
+    """Best-effort compact context block of relevant memories for this turn, or ''.
+    Astoria pre-renders the block (`context`); we inject it verbatim."""
+    global _MEM_FAILS
     if not _MEM:
         return ""
+    cfg = mem_config()
     try:
-        d = json.loads(_MEM.call("retrieve_memory", {"user_id": mem_config()["user"], "query": query}))
-    except Exception:
+        d = _mem_rest("POST", "/recall", {
+            "user_id": cfg["user"], "query": query, "session_id": SESSION,
+            "max_tokens": cfg["budget"], "limit": 8,
+            "layers": ["profile", "semantic", "procedural", "episodic"]})
+    except Exception as e:
+        _mem_trip(e)
         return ""
-    lines = []
-    for e in (d.get("short_term_history") or [])[-4:]:
-        u, a = e.get("user_input", ""), (e.get("agent_response") or "")[:200]
-        if u or a:
-            lines.append(f"- earlier you and the user discussed: {u!r} → {a!r}")
-    for k in (d.get("retrieved_user_knowledge") or [])[:5]:
-        lines.append(f"- about the user: {_mem_item(k)[:200]}")
-    for k in (d.get("retrieved_assistant_knowledge") or [])[:3]:
-        lines.append(f"- established: {_mem_item(k)[:200]}")
-    for pg in (d.get("retrieved_pages") or [])[:2]:
-        lines.append(f"- from a past session: {_mem_item(pg)[:200]}")
-    if not lines:
-        return ""
-    return ("Relevant memory from earlier sessions (use if helpful; don't mention it unless "
-            "asked):\n" + "\n".join(lines))
+    _MEM_FAILS = 0
+    ctx = d.get("context") if isinstance(d, dict) else None
+    return ctx.strip() if isinstance(ctx, str) and ctx.strip() else ""
 
 
 def mem_store(user_input, agent_response):
-    """Best-effort persist of one exchange; never raises into the chat loop."""
+    """Best-effort persist of one exchange (kind=turn; the server gates, detects explicit
+    corrections, and queues cognify); never raises into the chat loop."""
+    global _MEM_FAILS
     if not _MEM or not agent_response:
         return
+    cfg = mem_config()
     try:
-        _MEM.call("add_memory", {"user_id": mem_config()["user"],
-                                 "user_input": user_input, "agent_response": agent_response})
-    except Exception:
-        pass
+        d = _mem_rest("POST", "/capture", {
+            "user_id": cfg["user"], "kind": "turn", "user_input": user_input,
+            "agent_response": agent_response, "source": cfg["source"], "session_id": SESSION})
+    except Exception as e:
+        _mem_trip(e)
+        return
+    _MEM_FAILS = 0
+    det = d.get("detector") if isinstance(d, dict) else None
+    if isinstance(det, dict) and det.get("op"):
+        print(f"{DIM}⟐ memory: {det['op']} {det.get('subject', '')} {det.get('predicate', '')}"
+              f" → {det.get('value') or '∅'}{RESET}")
+
+
+def _fact_line(f, ids=True):
+    """One compact fact row: `id8 subject predicate: value  [layer · conf · status]`."""
+    if not isinstance(f, dict):
+        return str(f)
+    fid = (str(f.get("id") or ""))[:8]
+    conf = f.get("confidence")
+    tail = [f.get("layer") or "", f"{conf:.2f}" if isinstance(conf, (int, float)) else "",
+            f.get("status") if f.get("status") not in (None, "active") else "",
+            f"from {f['valid_from'][:10]}" if f.get("valid_from") else "",
+            f"until {f['valid_to'][:10]}" if f.get("valid_to") else "",
+            "belief" if f.get("is_belief") else ""]
+    tail = " · ".join(t for t in tail if t)
+    head = f"{DIM}{fid}{RESET} " if ids and fid else ""
+    return (f"{head}{f.get('subject', '')} {f.get('predicate', '')}: {f.get('value', '')}"
+            + (f"  {DIM}[{tail}]{RESET}" if tail else ""))
 
 
 def memory_browse(query):
-    """Inspect MemoryOS contents: profile + recent history + knowledge + pages for a query."""
+    """Inspect Astoria for a query: profile narrative, then recalled items grouped by layer
+    (short ids + confidence) and the session's working turns."""
     if not _MEM:
         print(f"{DIM}memory off — /memory on to connect{RESET}")
         return
     cfg = mem_config()
-    try:
-        prof = json.loads(_MEM.call("get_user_profile", {"user_id": cfg["user"]}))
-        d = json.loads(_MEM.call("retrieve_memory", {"user_id": cfg["user"], "query": query}))
-    except Exception as e:
-        print(f"{DIM}memory query failed: {e}{RESET}")
+    d = _mem_try("POST", "/recall", {
+        "user_id": cfg["user"], "query": query, "session_id": SESSION, "include_profile": True,
+        "max_tokens": 2000, "limit": 16,
+        "layers": ["profile", "semantic", "procedural", "episodic"]})
+    if "error" in d:
+        print(f"{DIM}memory query failed: {d['error']}{RESET}")
         return
-    profile = prof.get("user_profile") if isinstance(prof, dict) else None
-    print(f"{BOLD}{ULINE}MemoryOS · {cfg['user']}{RESET}  {DIM}(query: {query}){RESET}")
-    print(f"{DIM}profile:{RESET} " + (profile if profile and profile != "None"
-                                      else f"{DIM}(none yet — builds as extraction runs){RESET}"))
-    hist = d.get("short_term_history") or []
-    if hist:
-        print(f"\n{DIM}recent ({len(hist)}):{RESET}")
-        for e in hist[-8:]:
-            ts = (e.get("timestamp") or "")[:16].replace("T", " ")
-            print(f"  {DIM}{ts}{RESET} {e.get('user_input','')[:78]}")
-            resp = (e.get("agent_response") or "")[:78]
-            if resp:
-                print(f"  {DIM}{' ' * 16} → {resp}{RESET}")
-    for label, key in (("user knowledge", "retrieved_user_knowledge"),
-                       ("assistant knowledge", "retrieved_assistant_knowledge"),
-                       ("pages", "retrieved_pages")):
-        items = d.get(key) or []
-        if items:
-            print(f"\n{DIM}{label} ({len(items)}):{RESET}")
-            for it in items[:8]:
-                print(f"  {DIM}·{RESET} {_mem_item(it)[:120]}")
-    if not hist and not any(d.get(k) for k in
-                            ("retrieved_user_knowledge", "retrieved_assistant_knowledge", "retrieved_pages")):
+    print(f"{BOLD}{ULINE}Astoria · {cfg['user']}{RESET}  {DIM}(query: {query}){RESET}")
+    prof = d.get("profile") or {}
+    narrative = (prof.get("narrative") or _MEM_PROFILE or "").strip() if isinstance(prof, dict) else ""
+    print(f"{DIM}profile:{RESET} " + (narrative if narrative
+                                      else f"{DIM}(none yet — derives as facts accumulate){RESET}"))
+    items = d.get("items") or []
+    by = {}
+    for it in items:
+        by.setdefault(it.get("layer") or "other", []).append(it)
+    for layer in ("profile", "semantic", "procedural", "episodic", "other"):
+        rows = by.get(layer)
+        if not rows:
+            continue
+        print(f"\n{DIM}{layer} ({len(rows)}):{RESET}")
+        for it in rows:
+            if it.get("kind") == "episode" or not it.get("predicate"):
+                when = (it.get("occurred_at") or "")[:10]
+                print(f"  {DIM}{(str(it.get('id') or ''))[:8]}{RESET} {DIM}{when}{RESET} "
+                      f"{(it.get('text') or '')[:140]}")
+            else:
+                print("  " + _fact_line(it))
+    work = d.get("working") or []
+    if work:
+        print(f"\n{DIM}this session ({len(work)}):{RESET}")
+        for w in work[-4:]:
+            print(f"  {DIM}·{RESET} {(w.get('user_input') or '')[:70]} {DIM}→ {(w.get('agent_response') or '')[:60]}{RESET}")
+    if not items and not work:
         print(f"{DIM}(no matching memories){RESET}")
+    h = d.get("health")
+    if isinstance(h, dict) and h.get("degraded"):
+        print(f"{DIM}(degraded: TEI down — lexical recall only){RESET}")
+
+
+def _mem_parse_triple(arg):
+    """'<subject> <predicate…> = <value>' → (subject, predicate, value); multi-word predicates
+    join with '_' (favorite beer → favorite_beer). value '' when there's no '='."""
+    left, _, value = arg.partition("=")
+    toks = left.split()
+    if len(toks) < 2:
+        return None
+    return toks[0], "_".join(toks[1:]), value.strip()
+
+
+def _print_facts(rows, empty="(none)"):
+    if isinstance(rows, dict) and "error" in rows:
+        print(f"{DIM}memory: {rows['error']}{RESET}"); return
+    if not rows:
+        print(f"{DIM}{empty}{RESET}"); return
+    for f in rows:
+        print("  " + _fact_line(f))
+
+
+def memory_command(arg):
+    """The deterministic /memory subcommands beyond on|off|user|browse (all plain REST)."""
+    cfg = mem_config(); uid = cfg["user"]
+    verb, _, rest = arg.partition(" ")
+    rest = rest.strip()
+    if verb == "health":
+        h = _mem_try("GET", "/health")
+        if "error" in h:
+            print(f"{DIM}memory: {h['error']}{RESET}"); return
+        print(f"{DIM}{cfg['rest']} · status {h.get('status')}{_mem_health_str(h)}"
+              f"{' · v' + str(h['version']) if h.get('version') else ''}{RESET}")
+        return
+    if verb == "profile":
+        p = _mem_try("GET", "/profile" + _mem_q(user_id=uid))
+        if "error" in p:
+            print(f"{DIM}memory: {p['error']}{RESET}"); return
+        print(f"{BOLD}profile · {uid}{RESET}" + (f"  {DIM}v{p['version']}{RESET}" if p.get("version") else ""))
+        print((p.get("narrative") or "").strip() or f"{DIM}(no narrative yet){RESET}")
+        if p.get("facts"):
+            print(f"{DIM}facts ({len(p['facts'])}):{RESET}")
+            _print_facts(p["facts"])
+        return
+    if verb == "facts":
+        q = {"user_id": uid, "limit": 50}
+        if rest.startswith("/"):
+            q["q"] = rest[1:].strip()
+        elif rest:
+            q["subject"] = rest
+        _print_facts(_mem_try("GET", "/facts" + _mem_q(**q)), "(no facts)")
+        return
+    if verb == "staging":
+        _print_facts(_mem_try("GET", "/facts" + _mem_q(user_id=uid, status="staging", limit=50)),
+                     "(nothing staged)")
+        return
+    if verb in ("correct", "remember"):
+        t = _mem_parse_triple(rest)
+        if not t or not t[2]:
+            print(f"{DIM}usage: /memory {verb} <subject> <predicate> = <value>{RESET}"); return
+        path = "/correct" if verb == "correct" else "/facts"
+        r = _mem_try("POST", path, {"user_id": uid, "subject": t[0], "predicate": t[1], "value": t[2]})
+        if "error" in r:
+            print(f"{DIM}memory: {r['error']}{RESET}"); return
+        print(f"{DIM}{r.get('action', verb)}:{RESET} " + _fact_line(r.get("fact") or {}))
+        if r.get("superseded"):
+            print(f"{DIM}  superseded {len(r['superseded'])}: {', '.join(str(s)[:8] for s in r['superseded'])}{RESET}")
+        return
+    if verb == "retract":
+        t = _mem_parse_triple(rest) if "=" in rest else None
+        if not t:
+            toks = rest.split()
+            if len(toks) < 2:
+                print(f"{DIM}usage: /memory retract <subject> <predicate> [value]{RESET}"); return
+            t = (toks[0], toks[1], " ".join(toks[2:]))
+        body = {"user_id": uid, "subject": t[0], "predicate": t[1]}
+        if t[2]:
+            body["value"] = t[2]
+        r = _mem_try("POST", "/retract", body)
+        if "error" in r:
+            print(f"{DIM}memory: {r['error']}{RESET}"); return
+        ids = r.get("retracted") or []
+        print(f"{DIM}retracted {len(ids)}: {', '.join(str(i)[:8] for i in ids) or '—'}{RESET}")
+        return
+    if verb == "forget":
+        toks = rest.split()
+        if not toks:
+            print(f"{DIM}usage: /memory forget <id|query> [hard]{RESET}"); return
+        mode = "hard" if toks[-1] == "hard" and len(toks) > 1 else "soft"
+        target = " ".join(toks[:-1] if mode == "hard" else toks)
+        body = {"user_id": uid, "mode": mode}
+        body["fact_id" if re.fullmatch(r"[0-9a-fA-F-]{8,}", target) else "query"] = target
+        r = _mem_try("POST", "/forget", body)
+        if "error" in r:
+            print(f"{DIM}memory: {r['error']}{RESET}"); return
+        gone = r.get("forgotten") or []
+        print(f"{DIM}forgot ({mode}) {len(gone)}:{RESET}")
+        for g in gone:
+            print("  " + (_fact_line(g) if isinstance(g, dict) else str(g)[:8]))
+        return
+    if verb == "approve":
+        if not rest:
+            print(f"{DIM}usage: /memory approve <id>{RESET}"); return
+        r = _mem_try("POST", "/approve", {"user_id": uid, "fact_id": rest})
+        if "error" in r:
+            print(f"{DIM}memory: {r['error']}{RESET}"); return
+        print(f"{DIM}approved:{RESET} " + _fact_line(r.get("fact") or r))
+        return
+    if verb == "history":
+        toks = rest.split()
+        if len(toks) < 2:
+            print(f"{DIM}usage: /memory history <subject> <predicate>{RESET}"); return
+        _print_facts(_mem_try("GET", "/history" + _mem_q(user_id=uid, subject=toks[0], predicate="_".join(toks[1:]))),
+                     "(no history)")
+        return
+    if verb == "as-of":
+        toks = rest.split()
+        if not toks:
+            print(f"{DIM}usage: /memory as-of <date> [subject predicate]{RESET}"); return
+        body = {"user_id": uid, "at": toks[0]}
+        if len(toks) >= 2:
+            body["subject"] = toks[1]
+        if len(toks) >= 3:
+            body["predicate"] = "_".join(toks[2:])
+        _print_facts(_mem_try("POST", "/as_of", body), f"(nothing believed as of {toks[0]})")
+        return
+    if verb == "why":
+        if not rest:
+            print(f"{DIM}usage: /memory why <id>{RESET}"); return
+        f = _mem_try("GET", f"/facts/{rest}" + _mem_q(user_id=uid))
+        if "error" in f:
+            print(f"{DIM}memory: {f['error']}{RESET}"); return
+        print("  " + _fact_line(f))
+        for k in ("source", "source_kind", "confidence", "source_trust", "asserted_at", "valid_from",
+                  "valid_to", "origin_episode", "evidence", "tags", "status"):
+            if f.get(k) not in (None, "", [], {}):
+                print(f"  {DIM}{k:<15}{RESET} {f[k]}")
+        if f.get("subject") and f.get("predicate"):
+            chain = _mem_try("GET", "/history" + _mem_q(user_id=uid, subject=f["subject"], predicate=f["predicate"]))
+            if isinstance(chain, list) and len(chain) > 1:
+                print(f"  {DIM}chain ({len(chain)}, newest first):{RESET}")
+                for c in chain:
+                    mark = "▸" if str(c.get("id")) == str(f.get("id")) else "·"
+                    print(f"    {DIM}{mark}{RESET} " + _fact_line(c))
+        return
+    print(f"{DIM}/memory: unknown subcommand {verb!r} — /help /memory{RESET}")
+
+
+def _tool_memory(args):
+    """The model-facing `memory` tool: the few explicit memory ops (the ambient recall/capture
+    loop runs anyway; this is for persisting a user's explicit correction or looking
+    something up on purpose). Plain REST — the astoria MCP server stays claimed/hidden."""
+    a = args or {}
+    act = (a.get("action") or "").strip().lower()
+    cfg = mem_config()
+    if not cfg["enabled"]:
+        return "Error: ambient memory is off (/memory on)"
+    uid, sub, pred, val = cfg["user"], (a.get("subject") or "").strip(), (a.get("predicate") or "").strip(), a.get("value")
+    val = str(val).strip() if val is not None else ""
+    try:
+        if act == "recall":
+            d = _mem_rest("POST", "/recall", {"user_id": uid, "query": a.get("query") or "", "session_id": SESSION,
+                                              "max_tokens": 800, "limit": 10})
+            return d.get("context") or "No matching memories."
+        if act in ("remember", "correct"):
+            if not (sub and pred and val):
+                return "Error: remember/correct need subject, predicate, value"
+            d = _mem_rest("POST", "/correct" if act == "correct" else "/facts",
+                          {"user_id": uid, "subject": sub, "predicate": pred, "value": val})
+            f = d.get("fact") or {}
+            return (f"{d.get('action', act)}: {f.get('subject')} {f.get('predicate')} = {f.get('value')}"
+                    + (f" (superseded {len(d['superseded'])})" if d.get("superseded") else ""))
+        if act == "retract":
+            if not (sub and pred):
+                return "Error: retract needs subject and predicate (value optional)"
+            body = {"user_id": uid, "subject": sub, "predicate": pred}
+            if val:
+                body["value"] = val
+            d = _mem_rest("POST", "/retract", body)
+            return f"retracted {len(d.get('retracted') or [])} fact(s)"
+        if act == "forget":
+            body = {"user_id": uid, "mode": "hard" if (a.get("mode") == "hard") else "soft"}
+            if a.get("fact_id"):
+                body["fact_id"] = a["fact_id"]
+            elif a.get("query"):
+                body["query"] = a["query"]
+            else:
+                return "Error: forget needs fact_id or query"
+            d = _mem_rest("POST", "/forget", body)
+            return f"forgot {len(d.get('forgotten') or [])} fact(s)"
+        if act == "facts":
+            rows = _mem_rest("GET", "/facts" + _mem_q(user_id=uid, subject=sub, predicate=pred, q=a.get("query"), limit=30))
+            return "\n".join(f"{str(f.get('id'))[:8]} {f.get('subject')} {f.get('predicate')}: {f.get('value')} "
+                             f"[{f.get('layer')} · {f.get('confidence')}]" for f in rows) or "No facts."
+        if act == "history":
+            if not (sub and pred):
+                return "Error: history needs subject and predicate"
+            rows = _mem_rest("GET", "/history" + _mem_q(user_id=uid, subject=sub, predicate=pred))
+            return "\n".join(f"{str(f.get('id'))[:8]} {f.get('value')} [{f.get('status')} · from {f.get('valid_from')} "
+                             f"to {f.get('valid_to') or 'now'}]" for f in rows) or "No history."
+        return f"Error: unknown action {act!r}"
+    except Exception as e:
+        return f"Error: memory service: {e}"
+
+
+register(Tool(
+    "memory",
+    "Shared long-term memory about the user (Astoria). Relevant memory is ALREADY recalled "
+    "into your context each turn — use this only on purpose: `remember` to persist a durable "
+    "fact the user states explicitly (subject, predicate, value — e.g. rick / favorite_beer / "
+    "IPA; use the user's id as subject for first-person facts), `correct` when the user "
+    "corrects a previously known value (supersedes it), `retract` when something stopped being "
+    "true, `forget` to delete a wrong/unwanted fact (by fact_id or query), `recall` for a "
+    "targeted lookup, `facts`/`history` to inspect. Never store secrets or anything the user "
+    "asked to keep off the record.",
+    {"type": "object",
+     "properties": {
+         "action": {"type": "string",
+                    "enum": ["recall", "remember", "correct", "retract", "forget", "facts", "history"]},
+         "query": {"type": "string", "description": "recall/facts/forget: free-text query"},
+         "subject": {"type": "string", "description": "who/what the fact is about (user id for the user)"},
+         "predicate": {"type": "string", "description": "snake_case relation, e.g. favorite_beer, uses_tool"},
+         "value": {"type": "string"},
+         "fact_id": {"type": "string", "description": "forget: the fact id"},
+         "mode": {"type": "string", "enum": ["soft", "hard"], "description": "forget: soft (default) or hard"}},
+     "required": ["action"]},
+    _tool_memory, confirm="review"))
 
 
 # --- session stats + status line ------------------------------------------------
@@ -4582,13 +4940,18 @@ def repl():
                 print(f"{DIM}{mem_connect()}{RESET}")
             elif arg == "browse" or arg.startswith("browse "):
                 memory_browse(arg[len("browse"):].strip() or "recent conversation and preferences")
+            elif arg.split(None, 1)[0:1] and arg.split(None, 1)[0] in (
+                    "facts", "profile", "correct", "remember", "retract", "forget", "history",
+                    "as-of", "why", "health", "staging", "approve"):
+                memory_command(arg)                # deterministic REST subcommands
+            elif arg:
+                print(f"{DIM}/memory: unknown subcommand — {_CMD_HINTS['/memory']}{RESET}")
             else:
                 cfg = mem_config()
-                tools_n = len(_MEM.tools) if _MEM else 0
                 prof = f"{len(_MEM_PROFILE)} chars" if _MEM_PROFILE else "none yet"
-                print(f"{DIM}memory {'on' if _MEM else 'off'} · user {cfg['user']} · {cfg['url']} · "
-                      f"{tools_n} tools · profile {prof}\n  /memory on|off · /memory user <id> · "
-                      f"/memory browse [query]{RESET}")
+                print(f"{DIM}memory {'on' if _MEM else 'off'} · user {cfg['user']} · {cfg['rest']} "
+                      f"(mcp {cfg['url']} claimed){_mem_health_str(_MEM)} · budget {cfg['budget']} tok · "
+                      f"profile {prof}\n  {_CMD_HINTS['/memory']}{RESET}")
             continue
         if user == "/system" or user.startswith("/system "):
             arg = user[len("/system"):].strip()
