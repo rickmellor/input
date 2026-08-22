@@ -1629,6 +1629,30 @@ register(Tool(
     _tool_spawn_agent))
 
 
+RUN_INLINE_CAP = 300   # seconds; longer run_command calls are detached (see _run_detached)
+_SHELL_JOBS_DIR = os.path.expanduser("~/.config/input/shell-jobs")
+
+
+def _run_detached(cmd, timeout=None):
+    """Start `cmd` in its own session with stdout+stderr → a log file; return immediately.
+    The caller polls the log (run_command 'tail -n 40 <log>') or waits (run_command 'tail --pid=<pid> -f <log>'
+    with a short timeout). A hard `timeout` (if given) is enforced by `timeout(1)`."""
+    os.makedirs(_SHELL_JOBS_DIR, exist_ok=True)
+    jid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    log = os.path.join(_SHELL_JOBS_DIR, jid + ".log")
+    wrapped = f"timeout {int(timeout)} {SHELL} -c {shlex.quote(cmd)}" if timeout else cmd
+    with open(log, "w") as fh:
+        fh.write(f"$ {cmd}\n")
+        fh.flush()
+        p = subprocess.Popen(wrapped, shell=True, executable=SHELL, stdout=fh, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True, cwd=os.getcwd())
+    return (f"started in BACKGROUND (inline cap is {RUN_INLINE_CAP}s): pid={p.pid} log={log}\n"
+            f"It keeps running. Poll with run_command(\"tail -n 40 {log}\"); check liveness with "
+            f"run_command(\"kill -0 {p.pid} && echo running || echo finished\"); wait for it with "
+            f"run_command(\"tail --pid={p.pid} -f {log} | tail -n 60\", timeout={RUN_INLINE_CAP}). "
+            f"Stop it with run_command(\"kill {p.pid}\"). Do other useful work while you wait.")
+
+
 def _tool_run_command(args):
     cmd = ((args or {}).get("command") or "").strip()
     if not cmd:
@@ -1639,6 +1663,13 @@ def _tool_run_command(args):
                 f"(matched {hit!r}). This safety floor cannot be bypassed; if it's a false "
                 "positive, run the specific safe subcommand instead.")
     timeout = (args or {}).get("timeout")
+    background = bool((args or {}).get("background"))
+    # Anything that would block the turn for more than RUN_INLINE_CAP runs DETACHED instead: the
+    # command keeps going under its own session, output streams to a log file, and the tool returns
+    # at once with how to poll it — so a 20-minute docker test can't wedge the conversation (or die
+    # with a Ctrl-C meant for the prompt).
+    if background or (timeout and int(timeout) > RUN_INLINE_CAP):
+        return _run_detached(cmd, timeout)
     try:
         p = subprocess.run(cmd, shell=True, executable=SHELL, capture_output=True,
                            text=True, timeout=timeout)
@@ -1662,7 +1693,8 @@ register(Tool(
     {"type": "object",
      "properties": {
          "command": {"type": "string", "description": "The shell command to run"},
-         "timeout": {"type": "integer", "description": "Optional timeout in seconds"}},
+         "timeout": {"type": "integer", "description": "Optional timeout in seconds (> 300 → the command runs detached in the background and you poll its log)"},
+         "background": {"type": "boolean", "description": "run detached now (pid + log file returned); for anything that takes minutes"}},
      "required": ["command"]},
     _tool_run_command,
     confirm="review"))   # gemma rates risk: none/low auto-run, medium+ prompts; denylist warns
