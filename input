@@ -3201,33 +3201,26 @@ def tools_menu():
     print(f"{DIM}↑/↓ move · space/enter toggle · a all · n none · q done{RESET}{off}")
 
     import shutil, textwrap
-    DETAIL = 3                                    # lines under the list: full description of the highlighted tool
+    drawn = [0]                                   # lines painted by the last draw (rows wrap → variable height)
 
     def draw(first=False):
         cols = max(60, shutil.get_terminal_size((100, 24)).columns)
-        if not first:
-            sys.stdout.write(f"\033[{len(names) + DETAIL}A")
+        if not first and drawn[0]:
+            sys.stdout.write(f"\033[{drawn[0]}A")
+        total = 0
         for i, n in enumerate(names):
             t = TOOLS[n]
             box = f"{CODE_FG}[x]{RESET}" if t.enabled else f"{DIM}[ ]{RESET}"
             cur = f"{BOLD}❯{RESET} " if i == sel else "  "
             head = f"{n:<18}[{t.source}]  "
-            room = cols - 8 - len(head)           # fit the description to the real terminal width
-            desc = " ".join(t.description.split())
-            if room > 8 and len(desc) > room:
-                desc = desc[: room - 1] + "…"
-            elif room <= 8:
-                desc = ""
-            sys.stdout.write(f"\r\033[K{cur}{box} {n:<18}{DIM}[{t.source}]  {desc}{RESET}\r\n")
-        # detail pane: the selected tool's full description, wrapped
-        t = TOOLS[names[sel]]
-        lines = textwrap.wrap(" ".join(t.description.split()), width=cols - 6) or [""]
-        if len(lines) > DETAIL:
-            lines = lines[: DETAIL - 1] + [lines[DETAIL - 1][: cols - 8] + "…"]
-        lines += [""] * (DETAIL - len(lines))
-        for j, ln in enumerate(lines):
-            pre = f"{DIM}  ▸ " if j == 0 else f"{DIM}    "
-            sys.stdout.write(f"\r\033[K{pre}{ln}{RESET}\r\n")
+            indent = 6 + len(head)                # hanging indent under the description column
+            width = max(20, cols - indent - 1)
+            lines = textwrap.wrap(" ".join(t.description.split()), width=width) or [""]
+            sys.stdout.write(f"\r\033[K{cur}{box} {n:<18}{DIM}[{t.source}]  {lines[0]}{RESET}\r\n")
+            for ln in lines[1:]:
+                sys.stdout.write(f"\r\033[K{' ' * indent}{DIM}{ln}{RESET}\r\n")
+            total += len(lines)
+        drawn[0] = total
         sys.stdout.flush()
 
     try:
