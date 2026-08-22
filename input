@@ -2931,6 +2931,10 @@ def _id_ctx(text):
     return prefix, partial, ids
 
 
+_TA_BUF = bytearray()   # type-ahead drained at read_line entry; its newlines SEND (not pick), and
+                        # leftover (multiple queued lines) persists across calls so nothing is lost.
+
+
 def read_line(prompt, preset=""):
     """cbreak line reader: returns (text, mode). mode 'send' on Enter, 'pick' on
     Ctrl+Enter (terminals that send LF), None text with 'eof' on Ctrl-D. Falls back
@@ -2985,12 +2989,34 @@ def read_line(prompt, preset=""):
 
     try:
         termios.tcsetattr(fd, termios.TCSANOW, new)
+        # Pull any type-ahead entered during the prior (cooked-mode) output. A buffered Enter
+        # arrives as '\n', which the loop would misread as Ctrl+Enter → seat/id picker; mark
+        # these bytes (from_ta) so their newlines SEND. Leftover persists in _TA_BUF so multiple
+        # queued lines aren't dropped.
+        try:
+            import fcntl
+            _fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, _fl | os.O_NONBLOCK)
+            try:
+                _extra = os.read(fd, 4096)
+                if _extra:
+                    _TA_BUF.extend(_extra)
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                fcntl.fcntl(fd, fcntl.F_SETFL, _fl)
+        except Exception:
+            pass
         redraw()
         while True:
-            ch = os.read(fd, 1)
+            if _TA_BUF:
+                ch, from_ta = bytes([_TA_BUF.pop(0)]), True
+            else:
+                ch, from_ta = os.read(fd, 1), False
             if ch in (b"\r", b"\n"):
-                # Ctrl+Enter (LF) while positioned at an <id> arg → arrow-pick an id, keep editing.
-                if ch == b"\n":
+                # Ctrl+Enter (live LF) while positioned at an <id> arg → arrow-pick an id, keep
+                # editing. A type-ahead '\n' (from_ta) is a buffered Enter, so skip the picker.
+                if ch == b"\n" and not from_ta:
                     ctx = _id_ctx("".join(buf))
                     if ctx and ctx[2]:
                         prefix, _partial, ids = ctx
@@ -3008,7 +3034,7 @@ def read_line(prompt, preset=""):
                 if endrow > crow:
                     sys.stdout.write(f"\033[{endrow - crow}B")
                 sys.stdout.write("\r\n")
-                return "".join(buf), ("send" if ch == b"\r" else "pick")
+                return "".join(buf), ("send" if (ch == b"\r" or from_ta) else "pick")
             if ch == b"\t":                            # Tab → cycle valid ids at an <id> arg
                 cur = "".join(buf)
                 if tabs["ids"] and cur == tabs["last"]:            # continue an established cycle
@@ -3970,8 +3996,8 @@ def repl():
         user = user.strip()
         if user and _rl:                       # every submitted line joins input history
             _safe(lambda: _rl.add_history(user))
-        if mode == "pick":                     # Ctrl+Enter → one-shot to a chosen seat
-            if not user:
+        if mode == "pick" and not user.startswith("/"):   # Ctrl+Enter one-shot only for messages,
+            if not user:                                   # never a slash-command (run it normally)
                 continue
             seat = choose_seat()
             if not seat:
@@ -4022,11 +4048,11 @@ def repl():
             if sub in ("list", "ls"):                      # show the active nesting tree + parked ones
                 if not SIDEBARS and not _SB_PAUSED:
                     print(f"{DIM}no sidebars — /sidebar [topic] starts one{RESET}"); continue
-                root_here = f"{CODE_FG}  ◂ you are here{RESET}" if not SIDEBARS else ""
+                root_here = f"{CODE_FG}  ★ you are here{RESET}" if not SIDEBARS else ""
                 print(f"{DIM}  ▸ main thread{root_here}{RESET}")
                 for i, f in enumerate(SIDEBARS):           # active stack = live nesting, root→current
                     indent = "   " + "   " * i
-                    here = f"{CODE_FG}  ◂ you are here{RESET}" if i == len(SIDEBARS) - 1 else ""
+                    here = f"{CODE_FG}  ★ you are here{RESET}" if i == len(SIDEBARS) - 1 else ""
                     print(f"{DIM}{indent}└▸ #{f['id']} {f['label']}  (L{i + 1}){here}{RESET}")
                 if _SB_PAUSED:                             # parked = detached branches, not in the tree
                     print(f"{DIM}  ⏸ parked (resume to re-enter):{RESET}")
