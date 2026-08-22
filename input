@@ -33,7 +33,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       server itself stays claimed/hidden while ambient memory is on).
 Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
-import json, math, os, platform, re, shlex, shutil, subprocess, sys, threading, time, urllib.request, urllib.parse
+import json, math, os, platform, re, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request, urllib.parse
 import io, concurrent.futures
 from datetime import datetime
 
@@ -2150,7 +2150,17 @@ class MCPClient:
         return self
 
     def call(self, name, arguments):
-        res = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        try:
+            res = self._rpc("tools/call", {"name": name, "arguments": arguments})
+        except urllib.error.HTTPError as e:
+            # 404/400 with a session id = the server forgot our session (it restarted / expired it):
+            # re-initialize transparently and retry once instead of failing every call until /mcp reconnect.
+            if e.code in (400, 404) and self.sid:
+                self.sid = None
+                self.connect()
+                res = self._rpc("tools/call", {"name": name, "arguments": arguments})
+            else:
+                raise
         if not res or "result" not in res:
             raise RuntimeError((res or {}).get("error", "call failed"))
         return "\n".join(c.get("text", "") for c in res["result"].get("content", [])
