@@ -174,7 +174,7 @@ _CMD_HINTS = {
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
     "/plan":    "<goal> new · load · show · archive   (authors in plan mode)",
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
-    "/sidebar": "<topic> fork aside · merge (fold conclusion back) · drop (discard)",
+    "/sidebar": "[topic] fork aside (topic optional) · /merge folds conclusion back · /drop discards",
     "/skill":   "<name> load · off <name> unload · (bare) list",
     "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
     "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
@@ -374,9 +374,9 @@ _HELP_TOPICS = {
         "Fork the conversation into an ASIDE — a side discussion that shares the context up to\n"
         "the fork point, then diverges. When you finish, only the CONCLUSION folds back into the\n"
         "main thread (not the whole tangent), so a detour doesn't bloat the main history. Nestable.\n"
-        "  /sidebar <topic>        start an aside about <topic>\n"
-        "  /sidebar merge          fold its conclusion back into the main thread\n"
-        "  /sidebar drop           discard it (nothing merged)"
+        "  /sidebar [topic]        start an aside (topic optional; defaults to \"sidebar\")\n"
+        "  /merge  (or /sidebar merge)   fold its conclusion back into the main thread\n"
+        "  /drop   (or /sidebar drop)    discard it (nothing merged)"
     ),
     "/think": (
         "Toggle whether the model's reasoning is shown. On, a dim [think] block streams before\n"
@@ -3947,11 +3947,16 @@ def repl():
             continue
         if user in ("/quit", "exit"):
             break
-        if user == "/sidebar" or user.startswith("/sidebar ") or user == "/aside" or user.startswith("/aside "):
-            arg = user.split(None, 1)[1].strip() if " " in user else ""
+        if ((user in ("/merge", "/drop", "/done") and SIDEBARS)   # bare op: only a command inside a sidebar
+                or user == "/sidebar" or user.startswith("/sidebar ")
+                or user == "/aside" or user.startswith("/aside ")):
+            if user.startswith("/sidebar") or user.startswith("/aside"):
+                arg = user.split(None, 1)[1].strip() if " " in user else ""
+            else:                                          # bare /merge · /drop · /done → sidebar op
+                arg = user[1:]
             if arg in ("merge", "done", "close", "drop", "cancel"):
                 if not SIDEBARS:
-                    print(f"{DIM}not in a sidebar{RESET}"); continue
+                    print(f"{DIM}not in a sidebar — /sidebar [topic] starts one{RESET}"); continue
                 sb = SIDEBARS[-1]
                 if arg in ("drop", "cancel"):
                     SIDEBARS.pop(); history[:] = sb["parent"]
@@ -3964,18 +3969,15 @@ def repl():
                                     "content": f"[Sidebar '{sb['label']}' concluded — carrying back:] {summary}"})
                     history.append({"role": "assistant", "content": f"Noted the sidebar's conclusion: {summary}"})
                     print(f"{DIM}  ↩ merged: {summary[:200]}{RESET}")
-            elif arg:
-                SIDEBARS.append({"parent": list(history), "plen": len(history), "label": arg[:60]})
+            else:                                          # fork — topic optional, defaults to "sidebar"
+                label = arg or "sidebar"
+                SIDEBARS.append({"parent": list(history), "plen": len(history), "label": label[:60]})
                 history.append({"role": "user",
-                                "content": f"[Entering a SIDEBAR about: {arg}] The main task is paused. "
+                                "content": f"[Entering a SIDEBAR about: {label}] The main task is paused. "
                                 "Explore this side thread; when we finish I'll fold the conclusions back."})
-                history.append({"role": "assistant", "content": f"In a sidebar on '{arg}'. What would you like to explore?"})
-                print(f"{DIM}● sidebar — {arg}  (branch of the main thread; /sidebar merge to fold conclusions back, /sidebar drop to discard){RESET}")
-            else:
-                if SIDEBARS:
-                    print(f"{DIM}in sidebar: {' › '.join(s['label'] for s in SIDEBARS)}  ·  /sidebar merge | drop{RESET}")
-                else:
-                    print(f"{DIM}no sidebar — /sidebar <topic> forks a side discussion; merge folds its conclusion back{RESET}")
+                history.append({"role": "assistant", "content": f"In a sidebar on '{label}'. What would you like to explore?"})
+                depth = "▸" * len(SIDEBARS)
+                print(f"{DIM}● sidebar {depth} {label}  (branch of the main thread; /merge folds its conclusion back, /drop discards){RESET}")
             continue
         if user == "/jobs" or user.startswith("/jobs "):
             parts = user.split(None, 2)
