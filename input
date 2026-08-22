@@ -1034,7 +1034,7 @@ _TOOLS_DIR = os.path.expanduser("~/.config/input/tools")
 TOOLS = {}            # name -> Tool
 TOOLS_ON = True       # set from settings at REPL start; /tools toggles + persists
 MAX_TOOL_ROUNDS = 8   # cap the call→result→call loop so a stuck model can't spin forever
-SUBAGENT_MAX_ROUNDS = 24   # sub-agents do real multi-step work (research, source digs); 8 starved them
+SUBAGENT_MAX_ROUNDS = 200  # sub-agents do real multi-step work; stall detection + budget_tokens are the real guards
 
 
 class Tool:
@@ -1548,7 +1548,7 @@ def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_roun
         "`bash -c`, `git clone`, package installs and writes are NOT available in this read-only agent — "
         "say what you would have run; ask the orchestrator for write=true if the task truly needs it.") + "\n"
         f"- Allowed command prefixes: {', '.join(allowed)}.\n"
-        + (f"- Budget: {max_rounds} tool rounds. Plan to finish within it; write your final report as TEXT "
+        + (f"- Budget: {max_rounds} tool rounds (repeating the exact same calls 4× counts as a stall). Write your final report as TEXT "
            "(a message with no tool calls) — if the budget runs out you get one last no-tools turn to "
            "summarize what you have, so keep notes in your own words as you go.\n" if max_rounds else ""))
     return "\n\n".join(p for p in parts if p)
@@ -3863,6 +3863,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
     schemas = [t.schema() for t in toolmap.values()] or None
     res = {"text": "", "history": messages, "rounds": 0, "tool_calls": 0,
            "tokens_in": 0, "tokens_out": 0, "decode_s": 0.0, "stopped": "done", "error": None}
+    _last_fp, _repeat = None, 0      # stall detector: identical tool-call rounds back-to-back
     try:
         for _ in range(max_rounds):
             text, tcs, usage = stream(messages, thinks, model=model, base=base, tools=schemas,
@@ -3876,6 +3877,13 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
             res["text"] = text or res["text"]
             msg = {"role": "assistant", "content": text}
             if tcs:
+                fp = tuple(sorted(((tc.get("function") or {}).get("name", ""),
+                                   (tc.get("function") or {}).get("arguments", "")) for tc in tcs))
+                _repeat = _repeat + 1 if fp == _last_fp else 0
+                _last_fp = fp
+                if _repeat >= 3:         # 4 identical rounds in a row = the model is looping
+                    res["stopped"] = "stalled"
+                    break
                 msg["tool_calls"] = tcs
                 if not (text or "").strip():
                     msg["content"] = None      # tool-call-only turn: send null, not "" — the
@@ -3992,22 +4000,22 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                                  "content": shown if shown is not None else out})
         else:
             res["stopped"] = "rounds"
-            if finalize_on_cap and not (res["text"] or "").strip():
-                # one last NO-TOOLS turn so a capped agent still hands back what it learned
-                messages.append({"role": "user", "content":
-                    "Your tool budget is exhausted. Do not call tools. Write your final deliverable NOW "
-                    "from everything gathered so far: findings, evidence, what remains unknown."})
-                try:
-                    ftext, _ftcs, fusage = stream(messages, thinks, model=model, base=base, tools=None,
-                                                  volatile=volatile, system=system, quiet=quiet, session=session)
-                    if ftext:
-                        res["text"] = ftext
-                        messages.append({"role": "assistant", "content": ftext})
-                        if isinstance(fusage, dict):
-                            res["tokens_in"] += int(fusage.get("prompt_tokens") or 0)
-                            res["tokens_out"] += int(fusage.get("completion_tokens") or 0)
-                except Exception as e:  # finalize is best-effort
-                    res["text"] = res["text"] or f"(finalize failed: {type(e).__name__}: {e})"
+        if res["stopped"] in ("rounds", "stalled") and finalize_on_cap and not (res["text"] or "").strip():
+            # one last NO-TOOLS turn so a capped agent still hands back what it learned
+            messages.append({"role": "user", "content":
+                "Your tool budget is exhausted (or you were looping). Do not call tools. Write your final deliverable NOW "
+                "from everything gathered so far: findings, evidence, what remains unknown."})
+            try:
+                ftext, _ftcs, fusage = stream(messages, thinks, model=model, base=base, tools=None,
+                                              volatile=volatile, system=system, quiet=quiet, session=session)
+                if ftext:
+                    res["text"] = ftext
+                    messages.append({"role": "assistant", "content": ftext})
+                    if isinstance(fusage, dict):
+                        res["tokens_in"] += int(fusage.get("prompt") or 0)
+                        res["tokens_out"] += int(fusage.get("completion") or 0)
+            except Exception as e:  # finalize is best-effort
+                res["text"] = res["text"] or f"(finalize failed: {type(e).__name__}: {e})"
     except KeyboardInterrupt:
         del messages[base_len:]; raise
     except _NeedsApproval as na:                    # dark run hit an over-tolerance command
@@ -4031,7 +4039,7 @@ _JOBS_DIR = os.path.expanduser("~/.config/input/jobs")
 _JOB_HANG_S = 180          # idle this long BETWEEN tool calls while 'running' → maybe-hung
 _JOB_TOOL_HANG_S = 1800     # a single tool call in flight this long (30m) → maybe-hung. Higher
                            # because tools like aco_review legitimately run for many minutes.
-_JOB_MAX_ROUNDS = 80
+_JOB_MAX_ROUNDS = 400   # jobs have hang/idle detection; rounds are a runaway backstop, not a budget
 
 
 def _job_dir(jid):
