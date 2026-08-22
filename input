@@ -174,7 +174,7 @@ _CMD_HINTS = {
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
     "/plan":    "<goal> new · load · show · archive   (authors in plan mode)",
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
-    "/sidebar": "[topic] fork · /merge fold back · /drop discard · /return park · list · resume [#id]",
+    "/sidebar": "[topic] fork · /merge fold back · /update post interim · /return park · /drop discard · list · resume [#id]",
     "/skill":   "<name> load · off <name> unload · (bare) list",
     "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
     "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
@@ -376,7 +376,8 @@ _HELP_TOPICS = {
         "main thread (not the whole tangent), so a detour doesn't bloat the main history. Nestable.\n"
         "You can also PARK a sidebar and pick it back up later — several can be open at once.\n"
         "  /sidebar [topic]        start an aside (topic optional; defaults to \"sidebar\")\n"
-        "  /merge  (or /sidebar merge)   fold its conclusion back into the main thread\n"
+        "  /merge  (or /sidebar merge)   fold its conclusion back into the main thread (closes it)\n"
+        "  /update (or /sidebar update)  post a brief INTERIM update to main, keep the sidebar open\n"
         "  /drop   (or /sidebar drop)    discard it (nothing merged)\n"
         "  /return (or /sidebar return)  PARK it (keep it alive) and drop back toward main\n"
         "  /sidebar list           show active + parked sidebars\n"
@@ -891,12 +892,14 @@ _SB_SEQ = 0     # monotonic id source so paused sidebars get stable, pickable ha
 _PREFILL = ""   # command line to hand back pre-filled on the next prompt (Tab from a picker)
 
 
-def sidebar_summarize(history, model, base):
-    """Ask the model for a concise carry-back conclusion of the current (branch) discussion."""
-    res = run_thread(
-        "Summarize the CONCLUSIONS of this side discussion for the main thread in 2–5 sentences: "
-        "decisions reached, findings, anything to carry back. No preamble, just the conclusion.",
-        history=list(history), model=model, base=base, quiet=True, max_rounds=1)
+def sidebar_summarize(history, model, base, incremental=False):
+    """Ask the model to distill the branch discussion for the main thread. `incremental` gives a
+    brief interim status (for /update, sidebar stays open); otherwise a full carry-back conclusion."""
+    ask = ("Give a BRIEF interim update from this side discussion for the main thread in 1–3 "
+           "sentences: the latest state, findings, or decisions so far. No preamble." if incremental else
+           "Summarize the CONCLUSIONS of this side discussion for the main thread in 2–5 sentences: "
+           "decisions reached, findings, anything to carry back. No preamble, just the conclusion.")
+    res = run_thread(ask, history=list(history), model=model, base=base, quiet=True, max_rounds=1)
     return (res.get("text") or "").strip()
 
 
@@ -4006,7 +4009,7 @@ def repl():
             continue
         if user in ("/quit", "exit"):
             break
-        if ((user in ("/merge", "/drop", "/done", "/return") and SIDEBARS)  # bare op: only inside a sidebar
+        if ((user in ("/merge", "/drop", "/done", "/return", "/update") and SIDEBARS)  # bare op: only in a sidebar
                 or user == "/sidebar" or user.startswith("/sidebar ")
                 or user == "/aside" or user.startswith("/aside ")):
             if user.startswith("/sidebar") or user.startswith("/aside"):
@@ -4041,6 +4044,19 @@ def repl():
                     print(f"{DIM}no paused sidebar matches {tok!r} — /sidebar list{RESET}"); continue
                 _sb_resume(history, entry)
                 print(f"{DIM}▸ resumed sidebar #{entry['id']} '{entry['label']}'  ·  /merge · /drop · /return{RESET}")
+                continue
+
+            if sub in ("update", "sync"):                  # post an interim update to main, stay in sidebar
+                if not SIDEBARS:
+                    print(f"{DIM}not in a sidebar — /sidebar [topic] starts one{RESET}"); continue
+                f = SIDEBARS[-1]
+                where = "the main thread" if len(SIDEBARS) == 1 else f"sidebar '{SIDEBARS[-2]['label']}'"
+                print(f"{DIM}⇡ posting an interim update from '{f['label']}' to {where}…{RESET}")
+                upd = sidebar_summarize(history, MODEL, BASE, incremental=True) or "(no update captured)"
+                _SB_UNDER[-1].append({"role": "user",
+                                      "content": f"[Interim update from sidebar '{f['label']}' (still open):] {upd}"})
+                _SB_UNDER[-1].append({"role": "assistant", "content": f"Noted the sidebar's interim update: {upd}"})
+                print(f"{DIM}  ⇡ update posted (sidebar stays open): {upd[:200]}{RESET}")
                 continue
 
             if sub in ("merge", "done", "close", "drop", "cancel", "return", "back", "pause"):
