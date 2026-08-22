@@ -178,6 +178,7 @@ _CMD_HINTS = {
     "/skill":   "<name> load · off <name> unload · (bare) list",
     "/mcp":     "add <name> <url> · add <name> -- <cmd> · (bare) list servers",
     "/mode":    "cautious · unrestricted · plan   (or Shift+Tab to cycle)",
+    "/cd":      "<dir> change working directory (re-keys context stack + skills); bare = home",
     "/context": "show the active AGENTS.md stack + loaded skills",
     "/new":     "start a fresh session — wipe history, stats, goal, skills, sidebars, mode",
     "/clear":   "clear the conversation history (keeps stats) and reset mode",
@@ -195,7 +196,7 @@ def _command_hint_lines(buf):
     if cmd in _CMD_HINTS:
         return [f"{DIM}  {cmd}  {_CMD_HINTS[cmd]}{RESET}"]
     return [f"{DIM}  commands:{RESET}",
-            f"{DIM}  /help  /new  /clear  /build  /jobs  /gate  /plan  /goal  /sidebar  /skill  /context  "
+            f"{DIM}  /help  /new  /clear  /build  /jobs  /gate  /plan  /goal  /sidebar  /skill  /context  /cd  "
             f"/mcp  /tools  /models  /mode  /seats  /memory  /quit{RESET}"]
 
 
@@ -223,6 +224,7 @@ _HELP = [
     ("Context & memory", [
         ("/skill", "load a skill playbook (SKILL.md) into the prompt"),
         ("/context", "show the AGENTS.md stack + loaded skills for the cwd"),
+        ("/cd", "change working directory — re-keys the context stack, skills, and sandbox"),
         ("/system", "view / edit the system-prompt template"),
         ("/memory", "MemoryOS ambient-memory status"),
     ]),
@@ -824,6 +826,25 @@ _GOAL_DELEGATE = (
 )
 _GOAL_MET_RE = re.compile(r"^\s*GOAL MET\b", re.M)
 _GOAL_BLOCKED_RE = re.compile(r"^\s*BLOCKED:\s*(.+)$", re.M)
+_GOAL_ABANDON_RE = re.compile(
+    r"\b(stop(?:\s+(?:here|now|it))?|abandon|cancel|give\s+up|drop\s+(?:it|this|the\s+goal)|"
+    r"forget\s+(?:it|this|the\s+goal)|leave\s+it|never\s*mind|quit(?:\s+the\s+goal)?|"
+    r"call\s+it(?:\s+(?:off|quits))?|that'?s\s+enough|end\s+the\s+goal)\b", re.I)
+
+
+def _looks_like_abandon(text):
+    """True when a reply to a BLOCKED goal is a stop/abandon directive rather than unblocking
+    info — so we clear the goal instead of resuming its loop (a met goal already self-clears;
+    this gives an abandoned one the same one-step exit). Tight on purpose: a short message, an
+    abandon phrase, and neither a 'do something else instead' redirect nor a 'keep going' resume."""
+    t = (text or "").strip()
+    if not t or len(t) > 100:                      # a long reply is almost certainly real content
+        return False
+    if re.search(r"\b(instead|rather|and then|then do|but (?:first|also|do)|next)\b", t, re.I):
+        return False                               # a redirect ("stop X and do Y") is not abandon
+    if re.search(r"\b(don'?t|do not|keep (?:going|at)|continue|carry on|resume|proceed)\b", t, re.I):
+        return False                               # an explicit resume, not abandon
+    return bool(_GOAL_ABANDON_RE.search(t))
 
 
 def goal_terminate(goal, nudges_left):
@@ -1405,10 +1426,16 @@ def _agents_ticker(agents, stop):
         sys.stdout.write(f"\033[{drawn}A\r\033[J"); sys.stdout.flush()
 
 
-def _subagent_system(cwd, skill):
+def _subagent_system(cwd, skill, seat=None, model_id=None):
     """A sub-agent's system prompt: grounding + the cwd's folder context + one skill brief +
-    autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills."""
+    autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills.
+    `seat`/`model_id` name the seat this agent runs on so it can self-report / a skill can
+    verify its own model pin (the harness otherwise never tells a sub-agent its own model)."""
     parts = [stable_context()]
+    if seat or model_id:
+        which = f"the {seat} seat" if seat else "the assigned seat"
+        mid = f" (model {model_id})" if model_id else ""
+        parts.append(f"You are running on {which}{mid}.")
     fc = folder_context(cwd)
     if fc:
         parts.append(fc)
@@ -1440,7 +1467,7 @@ def _tool_spawn_agent(args):
     if not model:
         model = agentic_seat(task)
     m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
-    system = _subagent_system(cwd, skill)
+    system = _subagent_system(cwd, skill, seat=(model if model in SEATS else None), model_id=m)
     sb = Sandbox(root=cwd, allow=(SANDBOX_DEV if write else SANDBOX_READONLY))
     tools = sandbox_tools(sb, write=write)
     label = skill or (m.split("-")[-1] if "-" in m else m)
@@ -3712,6 +3739,12 @@ def _turn(history, thinks, user, stats, model=None, base=None):
 
     global GOAL, GOAL_SEAT, GOAL_BLOCKED
     if GOAL_BLOCKED:                               # the user's message answers the block → resume
+        if _looks_like_abandon(user):             # …unless it's "stop here" → clear, don't re-loop
+            cleared = GOAL
+            GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
+            print(f"{YEL}◌ goal abandoned{RESET}{DIM} — {cleared[:80]}  "
+                  f"(/goal <criteria> to set a new one){RESET}")
+            return
         user = f"(Answer to your BLOCKED need — {GOAL_BLOCKED!r}): {user}"
         GOAL_BLOCKED = ""
     tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
@@ -4249,6 +4282,27 @@ def repl():
                     seat = f"  {DIM}[seat {s['seat']}]{RESET}" if s.get("seat") else ""
                     print(f"  {mark} {n:<22} {DIM}{(s['description'] or '')[:70]}{RESET}{seat}")
                 print(f"{DIM}  /skill <name> load · /skill off [name|all] · /skill reload  (● = loaded){RESET}")
+            continue
+        if user == "/cd" or user.startswith("/cd "):   # change cwd → re-keys context stack, skills, sandbox
+            arg = user[3:].strip()
+            dest = os.path.expanduser(arg) if arg else os.path.expanduser("~")
+            if not os.path.isabs(dest):
+                dest = os.path.join(os.getcwd(), dest)
+            dest = os.path.abspath(dest)
+            if not os.path.isdir(dest):
+                print(f"{DIM}/cd: not a directory: {dest}{RESET}")
+                continue
+            try:
+                os.chdir(dest)
+            except OSError as e:
+                print(f"{DIM}/cd: {e}{RESET}")
+                continue
+            discover_skills()                         # pick up the new project's .claude/skills
+            root = _git_root(os.getcwd()) or os.getcwd()
+            fc = folder_context()
+            heads = [l[4:] for l in fc.splitlines() if l.startswith("### ")] if fc else []
+            note = f"  ·  folder instructions ({len(heads)}): {', '.join(heads)}" if heads else ""
+            print(f"{DIM}cwd → {os.getcwd()}  ·  project root {root}{note}{RESET}")
             continue
         if user == "/context" or user == "/ctx":   # what instruction context is active for this cwd
             fc = folder_context()
