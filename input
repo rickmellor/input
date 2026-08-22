@@ -2855,7 +2855,7 @@ register(Tool(
          "fact_id": {"type": "string", "description": "forget: the fact id"},
          "mode": {"type": "string", "enum": ["soft", "hard"], "description": "forget: soft (default) or hard"}},
      "required": ["action"]},
-    _tool_memory, confirm="review"))
+    _tool_memory, confirm="never"))
 
 
 # --- session stats + status line ------------------------------------------------
