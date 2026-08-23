@@ -4619,7 +4619,7 @@ def repl():
     history, thinks = [], []
     stats = Stats()
     _SESS["history"], _SESS["thinks"], _SESS["started"] = history, thinks, time.time()
-    atexit.register(lambda: _safe(lambda: _session_save()))   # last-chance snapshot on exit
+    __import__("atexit").register(lambda: _safe(lambda: _session_save()))   # last-chance snapshot on exit (atexit is imported later in this function → would be a local)
 
     def _enter_build(pid, kickoff=True, rerun=False):   # load a plan and drop into BUILD mode
         global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
