@@ -188,6 +188,7 @@ _CMD_HINTS = {
     "/help":    "list all capabilities · /help <command> for one command",
     "/gate":    "risk auto-run tolerance · /gate <level> · interactive|auto <level>",
     "/footer":  "live bottom status line · /footer on|off",
+    "/sessions": "list · resume <id|last> · save — the thread is snapshotted every turn; `input --resume` reloads it",
     "/memory":  "on|off · apply|discard (pending LLM-resolved correction) · user <id> · browse [q] · facts [subject|/q] · profile · remember|correct <s> <p> = <v> · "
                 "retract <s> <p> [v] · forget <id|q> [hard] · history <s> <p> · as-of <date> [s p] · why <id> · "
                 "health · staging · approve <id>",
@@ -233,6 +234,7 @@ _HELP = [
         ("/cd", "change working directory — re-keys the context stack, skills, and sandbox"),
         ("/system", "view / edit the system-prompt template"),
         ("/memory", "Astoria ambient-memory status · facts / correct / forget / why …"),
+        ("/sessions", "saved sessions: list · resume <id|last> · save  (also: input --resume, input --sessions)"),
     ]),
     ("Session & modes", [
         ("/new", "fresh session — wipe history, stats, goal, skills, sidebars, mode"),
@@ -4339,6 +4341,175 @@ def poll_jobs_notify():
             print(f"\n{RED_VIVID}● job {jid} {st}{RESET}{DIM} — {m.get('title','')}  (/jobs show {jid}){RESET}")
 
 
+# ---------------------------------------------------------------------------------------------
+# Session persistence — the conversation thread survives exit/restart.
+#   snapshot: ~/.config/input/sessions/<SESSION>.json (after every turn, on /goal changes, at exit)
+#   resume:   `input --resume [id|last]`, `input --sessions`, in-REPL /sessions [list|resume <id>|save]
+_SESSIONS_DIR = os.path.expanduser("~/.config/input/sessions")
+_SESS = {"history": None, "thinks": None, "title": "", "started": None}
+RESUME_ID = None           # set from argv (--resume)
+
+
+def _session_path(sid):
+    return os.path.join(_SESSIONS_DIR, sid + ".json")
+
+
+def _session_title(h):
+    for m in h or []:
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].strip():
+            t = " ".join(m["content"].split())
+            return t[:90]
+    return ""
+
+
+def _session_save(history=None, thinks=None):
+    """Snapshot the live thread + mode/goal/sidebars. Cheap (one JSON write); never raises."""
+    h = history if history is not None else _SESS.get("history")
+    if not SESSION or h is None:
+        return
+    try:
+        os.makedirs(_SESSIONS_DIR, exist_ok=True)
+        _SESS["title"] = _SESS.get("title") or _session_title(h)
+        snap = {"version": 1, "session": SESSION, "title": _SESS["title"],
+                "started": _SESS.get("started") or time.time(), "updated": time.time(),
+                "cwd": os.getcwd(), "model": MODEL, "base": BASE, "seat": active_name(),
+                "perm_mode": PERM_MODE, "goal": GOAL, "goal_seat": GOAL_SEAT, "goal_blocked": GOAL_BLOCKED,
+                "plan_goal": PLAN_GOAL, "plan_id": PLAN_ID, "build_id": BUILD_ID,
+                "history": h, "thinks": (thinks if thinks is not None else _SESS.get("thinks")) or [],
+                "sidebars": SIDEBARS, "sb_under": _SB_UNDER, "sb_paused": _SB_PAUSED, "sb_seq": _SB_SEQ,
+                "loaded_skills": sorted(LOADED_SKILLS) if LOADED_SKILLS else []}
+        tmp = _session_path(SESSION) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snap, f, default=str)
+        os.replace(tmp, _session_path(SESSION))
+        with open(os.path.join(_SESSIONS_DIR, "last"), "w") as f:
+            f.write(SESSION)
+        _session_prune()
+    except Exception as e:   # persistence is best-effort; never break the turn
+        _SESS["last_error"] = f"{type(e).__name__}: {e}"
+
+
+def _session_prune(keep=60):
+    try:
+        files = sorted((f for f in os.listdir(_SESSIONS_DIR) if f.endswith(".json")),
+                       key=lambda f: os.path.getmtime(os.path.join(_SESSIONS_DIR, f)), reverse=True)
+        for f in files[keep:]:
+            os.remove(os.path.join(_SESSIONS_DIR, f))
+    except Exception:
+        pass
+
+
+def _session_list(limit=20):
+    out = []
+    try:
+        for f in os.listdir(_SESSIONS_DIR):
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(_SESSIONS_DIR, f)) as fh:
+                    d = json.load(fh)
+                out.append({"session": d.get("session", f[:-5]), "title": d.get("title", ""),
+                            "updated": d.get("updated", 0), "turns": sum(1 for m in d.get("history", []) if m.get("role") == "user"),
+                            "goal": d.get("goal", ""), "cwd": d.get("cwd", ""), "seat": d.get("seat", "")})
+            except Exception:
+                continue
+    except FileNotFoundError:
+        return []
+    out.sort(key=lambda x: x["updated"], reverse=True)
+    return out[:limit]
+
+
+def _session_load(sid):
+    """'last' → pointer file; else exact id or unique prefix (with or without the 'input-' prefix)."""
+    try:
+        if sid in ("", "last"):
+            with open(os.path.join(_SESSIONS_DIR, "last")) as f:
+                sid = f.read().strip()
+        if not os.path.exists(_session_path(sid)):
+            cands = [f[:-5] for f in os.listdir(_SESSIONS_DIR) if f.endswith(".json")
+                     and (f[:-5].startswith(sid) or f[:-5].startswith("input-" + sid))]
+            if len(cands) != 1:
+                return None
+            sid = cands[0]
+        with open(_session_path(sid)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _session_restore(snap, history, thinks):
+    """Load a snapshot INTO the live REPL state (lists mutated in place; globals re-set)."""
+    global SESSION, MODEL, BASE, PERM_MODE, GOAL, GOAL_SEAT, GOAL_BLOCKED, PLAN_GOAL, PLAN_ID, BUILD_ID, _SB_SEQ
+    history[:] = snap.get("history") or []
+    thinks[:] = snap.get("thinks") or []
+    SIDEBARS[:] = snap.get("sidebars") or []
+    _SB_UNDER[:] = snap.get("sb_under") or []
+    _SB_PAUSED[:] = snap.get("sb_paused") or []
+    _SB_SEQ = int(snap.get("sb_seq") or 0)
+    SESSION = snap.get("session") or SESSION          # same id → Astoria working memory + SAINT affinity continue
+    PERM_MODE = snap.get("perm_mode") or PERM_MODE
+    GOAL, GOAL_SEAT, GOAL_BLOCKED = snap.get("goal", ""), snap.get("goal_seat", ""), snap.get("goal_blocked", "")
+    PLAN_GOAL, PLAN_ID, BUILD_ID = snap.get("plan_goal", ""), snap.get("plan_id", ""), snap.get("build_id", "")
+    seat = snap.get("seat")
+    if seat in SEATS:
+        MODEL, BASE = SEATS[seat]
+    elif snap.get("model") and snap.get("base"):
+        MODEL, BASE = snap["model"], snap["base"]
+    cwd = snap.get("cwd")
+    if cwd and os.path.isdir(cwd):
+        try:
+            os.chdir(cwd)
+        except OSError:
+            pass
+    _SESS["title"], _SESS["started"] = snap.get("title", ""), snap.get("started") or time.time()
+    _SESS["history"], _SESS["thinks"] = history, thinks
+    turns = sum(1 for m in history if m.get("role") == "user")
+    last_user = next((m["content"] for m in reversed(history) if m.get("role") == "user" and isinstance(m.get("content"), str)), "")
+    age = time.time() - float(snap.get("updated") or time.time())
+    print(f"{DIM}↺ resumed {SESSION} — {turns} turn(s), last active {_fmt_dur(age)} ago · seat {active_name()} · cwd {os.getcwd()}")
+    if _SESS["title"]:
+        print(f"  ⌁ {_SESS['title'][:100]}")
+    if last_user:
+        print(f"  last prompt: {' '.join(last_user.split())[:110]}")
+    if GOAL:
+        print(f"  ● goal restored (say 'continue' to resume it · /goal off to drop): {GOAL[:100]}")
+    if _SB_PAUSED or SIDEBARS:
+        print(f"  sidebars: {len(SIDEBARS)} active · {len(_SB_PAUSED)} parked")
+    print(f"  (tool outputs in the restored thread may be stale; re-check anything that matters){RESET}")
+
+
+def _sessions_command(arg, history, thinks):
+    arg = (arg or "").strip()
+    if not arg or arg == "list":
+        rows = _session_list()
+        if not rows:
+            print("(no saved sessions)"); return
+        for r in rows:
+            mark = "●" if r["session"] == SESSION else " "
+            age = _fmt_dur(time.time() - float(r["updated"] or time.time()))
+            g = f"  [goal: {r['goal'][:40]}]" if r.get("goal") else ""
+            print(f"{mark} {r['session']}  {age:>7} ago  {r['turns']:>3}t  {r['seat'] or '':<8} {r['title'][:70]}{g}")
+        print(f"{DIM}/sessions resume <id|last> · /sessions save · input --resume [id]{RESET}")
+        return
+    if arg.startswith("resume"):
+        sid = arg[6:].strip() or "last"
+        snap = _session_load(sid)
+        if not snap:
+            print(f"no such session: {sid!r} (/sessions to list)"); return
+        if snap.get("session") == SESSION:
+            print("that is the current session"); return
+        if any(m.get("role") == "user" for m in history):
+            _session_save(history, thinks)           # don't lose the current thread
+            print(f"{DIM}(current session saved as {SESSION}){RESET}")
+        _session_restore(snap, history, thinks)
+        return
+    if arg == "save":
+        _session_save(history, thinks)
+        print(f"saved → {_session_path(SESSION)}" + (f"  (error: {_SESS['last_error']})" if _SESS.get("last_error") else ""))
+        return
+    print("usage: /sessions [list] · /sessions resume <id|last> · /sessions save")
+
+
 def _turn(history, thinks, user, stats, model=None, base=None):
     """One interactive REPL turn = run_thread with printing, memory recall/store, gating."""
     stats.turns += 1
@@ -4434,6 +4605,7 @@ def _turn(history, thinks, user, stats, model=None, base=None):
         print(f"[error: {res['error']}]")
     else:
         mem_store(user, res["text"])               # normal completion → persist the exchange
+    _session_save(history, thinks)                 # snapshot the thread (resume survives exit/crash)
 
 
 def repl():
@@ -4446,6 +4618,8 @@ def repl():
     discover_skills()                                 # skills index (bodies load on trigger)
     history, thinks = [], []
     stats = Stats()
+    _SESS["history"], _SESS["thinks"], _SESS["started"] = history, thinks, time.time()
+    atexit.register(lambda: _safe(lambda: _session_save()))   # last-chance snapshot on exit
 
     def _enter_build(pid, kickoff=True, rerun=False):   # load a plan and drop into BUILD mode
         global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
@@ -4490,6 +4664,12 @@ def repl():
             _enter_build(pid)
 
     SESSION = "input-" + os.urandom(6).hex()
+    if RESUME_ID:                                      # input --resume [id|last]
+        _snap = _session_load(RESUME_ID)
+        if _snap:
+            _session_restore(_snap, history, thinks)
+        else:
+            print(f"{YEL}(no saved session matching {RESUME_ID!r} — starting fresh; /sessions lists them){RESET}")
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
           f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /gate /goal /plan /build /jobs /sidebar /location /think /clear /new /footer · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
@@ -4817,6 +4997,7 @@ def repl():
             arg = user[len("/goal"):].strip()
             if arg.lower() in ("off", "clear", "done"):
                 GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
+                _session_save(history, thinks)
                 print(f"{DIM}goal cleared{RESET}")
             elif arg.lower().startswith("answer "):
                 if not GOAL_BLOCKED:
@@ -5262,6 +5443,7 @@ def repl():
             SIDEBARS.clear(); _SB_UNDER.clear(); _SB_PAUSED.clear()   # cleared thread → no dangling branches
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
+            _SESS["title"], _SESS["started"] = "", time.time()
             clear_screen()
             print("(history cleared)"); continue
         if user == "/new":                             # full reset — a brand-new session
@@ -5271,9 +5453,12 @@ def repl():
             GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
             PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh SAINT affinity
+            _SESS["title"], _SESS["started"] = "", time.time()
             clear_screen()
             print(f"{DIM}(new session — context, stats, goal, skills, sidebars and mode all reset){RESET}")
             continue
+        if user == "/sessions" or user.startswith("/sessions "):
+            _sessions_command(user[len("/sessions"):], history, thinks); continue
         _turn(history, thinks, user, stats)
         print(_status_line(stats))
         _offer_build()                             # if the model just saved a plan, offer to build it
@@ -5282,6 +5467,15 @@ def repl():
 # --- arg parsing ----------------------------------------------------------------
 argv = sys.argv[1:]
 MODE, task_words, JOB_ID = None, None, None
+if "--sessions" in argv:                       # list saved sessions and exit
+    for r in _session_list(40):
+        print(f"{r['session']}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['updated'] or 0))}  {r['turns']:>3}t  {r['seat'] or '':<8} {r['title'][:80]}")
+    sys.exit(0)
+if "--resume" in argv:                         # input --resume [id|last]
+    i = argv.index("--resume"); rest = argv[i + 1:]
+    take = bool(rest) and not rest[0].startswith("-") and rest[0] not in SEATS
+    RESUME_ID = rest[0] if take else "last"
+    argv = argv[:i] + rest[1 if take else 0:]
 if "--job" in argv:                            # detached job runner: input --job <id>
     i = argv.index("--job")
     MODE, JOB_ID, argv = "--job", (argv[i + 1] if len(argv) > i + 1 else ""), argv[:i]
