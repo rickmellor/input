@@ -175,8 +175,11 @@ def _route_hint_lines():
 _CMD_HINTS = {
     "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
-    "/megaplan":    "<goal> · new · browse · load · show · save · rename · remove · close|off|exit   (authors in plan mode; alias: /plan)",
+    "/megaplan":    "<goal> · new · browse · load · show · save · work · complete · uncomplete · block · add · rename · remove · close   (alias: /plan)",
     "/plan":        "alias of /megaplan",
+    "/work":        "[tN] [go] focus a task of the loaded plan (picker if no id; go = build just it) · off",
+    "/complete":    "[tN] tick a task of the loaded plan (picker if no id)",
+    "/uncomplete":  "[tN] untick a task of the loaded plan (picker if no id)",
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
     "/sidebar": "[topic] fork · /merge fold back · /update post interim · /return park · /drop discard · list · resume [#id]",
     "/skill":   "<name> load · off <name> unload · (bare) list",
@@ -228,6 +231,8 @@ _HELP = [
     ("Plans (MegaPlan)", [
         ("/megaplan", "author a plan — research → discuss → persist  (alias: /plan)"),
         ("/build", "execute a plan · bg = detached · rerun|reset a completed one"),
+        ("/work", "focus one task of the loaded plan (/work tN go builds just it)"),
+        ("/complete", "tick a task · /uncomplete unticks (picker when no id)"),
     ]),
     ("Context & memory", [
         ("/skill", "load a skill playbook (SKILL.md) into the prompt"),
@@ -316,6 +321,7 @@ _HELP_TOPICS = {
         "each done and respecting dependencies, until the whole plan is complete.\n"
         "  /build                  pick a plan (Tab in the picker fills the command line to edit)\n"
         "  /build <id>             build it in the FOREGROUND (drops into BUILD mode)\n"
+        "  /build tN               build ONLY task tN of the loaded plan (same as /work tN go)\n"
         "  /build <id> bg          build it as a detached background job instead\n"
         "  /build <id> rerun       reopen a completed plan's tasks, then build again\n"
         "  /build <id> reset       reopen a completed plan WITHOUT building (mark undone only)\n"
@@ -329,6 +335,7 @@ _HELP_TOPICS = {
         "  /megaplan                   enter plan mode\n"
         "  /megaplan <goal>            enter plan mode aimed at a specific goal\n"
         "  /megaplan load|show|archive manage saved plans\n"
+        "  /work, /complete, /uncomplete [tN]   interact with the loaded plan's tasks (arrow picker when no id)\n"
         "  /megaplan close|off|exit    leave plan mode (also Shift+Tab)\n"
         "Once a plan is saved, /build executes it."
     ),
@@ -775,6 +782,7 @@ MODES = ("cautious", "unrestricted", "plan")
 PERM_MODE = "cautious"
 PLAN_GOAL = ""
 PLAN_ID = ""        # the plan currently loaded into the session (for save/show/close)
+PLAN_TASK = ""      # focused task id (tN) within PLAN_ID — /work; scopes /build, shown in the prompt
 BUILD_ID = ""       # the plan currently being BUILT (executed); "" = not building
 _BUILD_DIRECTIVE = (
     "You are in BUILD mode — executing a MegaPlan to completion. Work the plan, don't "
@@ -1016,6 +1024,9 @@ def system_prompt(cwd=None):
         s = (s + "\n\n" + d) if s else d
     if BUILD_ID:                              # building (mutually exclusive with plan mode)
         b = _BUILD_DIRECTIVE + f"\n\nBuilding MegaPlan: {BUILD_ID}"
+        if PLAN_TASK and PLAN_ID == BUILD_ID:
+            b += (f"\n\nSCOPE: work ONLY task {PLAN_TASK} of this plan. When it is done (marked "
+                  f"complete), stop and report — do NOT continue to other tasks.")
         s = (s + "\n\n" + b) if s else b
     if GOAL:                                  # exit-criteria contract (stable → cache-safe)
         g = _GOAL_DIRECTIVE.format(goal=GOAL)
@@ -2462,6 +2473,42 @@ def plan_pick(verb="select", editable=False):
     return ("edit", pid) if res[1] == "edit" else pid
 
 
+def task_pick(p, verb="select", only=None, editable=False):
+    """Arrow-pick one task of plan dict `p` (only=None|"open"|"done" filters). Returns the task id,
+    ('edit', tid) on Tab when editable, or None. Cursor starts on the first open task."""
+    tasks = [t for t in (p.get("tasks") or [])
+             if only is None or (only == "done") == bool(t.get("done"))]
+    if not tasks:
+        print(f"{DIM}no {only + ' ' if only else ''}tasks in {p.get('id')}{RESET}"); return None
+    idw = max(len(str(t.get("id") or "")) for t in tasks)
+    labels = []
+    for t in tasks:
+        mark = f"{GREEN_BUILD}✔{RESET}" if t.get("done") else (f"{RED_VIVID}⊘{RESET}" if t.get("blocked") else "○")
+        text = " ".join(str(t.get("text") or "").split())
+        est = f" ({t['est_hours']:g}h)" if t.get("est_hours") else ""
+        lab = f"{mark} {DIM}{str(t.get('id')):<{idw}}{RESET}  {text}{est}"
+        labels.append(f"{DIM}{lab}{RESET}" if t.get("done") else lab)
+    start = next((i for i, t in enumerate(tasks) if not t.get("done")), 0)
+    hint = f"↑/↓ or j/k · enter {verb}" + (" · tab edit on command line" if editable else "") + " · q cancel"
+    res = _pick(labels, start, hint=hint, allow_edit=editable)
+    if not res:
+        return None
+    tid = str(tasks[res[0]]["id"])
+    return ("edit", tid) if res[1] == "edit" else tid
+
+
+def _task_of(p, tid):
+    return next((t for t in (p.get("tasks") or []) if str(t.get("id")) == str(tid)), None)
+
+
+def _task_line(t, width=100):
+    text = " ".join(str(t.get("text") or "").split())
+    est = f" ({t['est_hours']:g}h)" if t.get("est_hours") else ""
+    mark = f"{GREEN_BUILD}✔{RESET}" if t.get("done") else (f"{RED_VIVID}⊘{RESET}" if t.get("blocked") else "○")
+    s = f"{mark} {DIM}{t.get('id')}{RESET}  {text}{est}"
+    return s
+
+
 def _plan_body_sections(body):
     """Split a plan body's markdown into (heading, lines) sections, dropping the H1 title and
     the whole '## Tasks' checklist subtree (rendered structurally elsewhere) plus any stray
@@ -2506,7 +2553,7 @@ def plan_render(p, full=False, body_lines=18):
     cols = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
     pr = p.get("progress") or {}
     done, total = int(pr.get("done", 0) or 0), int(pr.get("total", 0) or 0)
-    pct = pr.get("percent")
+    pct = pr.get("pct", pr.get("percent"))
     if pct is None:
         pct = round(100 * done / total) if total else 0
     status = str(p.get("status") or "")
@@ -3557,7 +3604,10 @@ def _plan_tag(pid=None, width=28):
     if not name:
         return ""
     name = re.sub(r"\s+", " ", name).strip()
-    return (name[: width - 1] + "…") if len(name) > width else name
+    name = (name[: width - 1] + "…") if len(name) > width else name
+    if PLAN_TASK and (pid is None or pid == PLAN_ID):
+        name += f"/{PLAN_TASK}"
+    return name
 
 
 def _prompt():
@@ -4538,7 +4588,7 @@ def _session_save(history=None, thinks=None):
                 "started": _SESS.get("started") or time.time(), "updated": time.time(),
                 "cwd": os.getcwd(), "model": MODEL, "base": BASE, "seat": active_name(),
                 "perm_mode": PERM_MODE, "goal": GOAL, "goal_seat": GOAL_SEAT, "goal_blocked": GOAL_BLOCKED,
-                "plan_goal": PLAN_GOAL, "plan_id": PLAN_ID, "build_id": BUILD_ID,
+                "plan_goal": PLAN_GOAL, "plan_id": PLAN_ID, "build_id": BUILD_ID, "plan_task": PLAN_TASK,
                 "history": h, "thinks": (thinks if thinks is not None else _SESS.get("thinks")) or [],
                 "sidebars": SIDEBARS, "sb_under": _SB_UNDER, "sb_paused": _SB_PAUSED, "sb_seq": _SB_SEQ,
                 "loaded_skills": sorted(LOADED_SKILLS) if LOADED_SKILLS else []}
@@ -4603,7 +4653,7 @@ def _session_load(sid):
 
 def _session_restore(snap, history, thinks):
     """Load a snapshot INTO the live REPL state (lists mutated in place; globals re-set)."""
-    global SESSION, MODEL, BASE, PERM_MODE, GOAL, GOAL_SEAT, GOAL_BLOCKED, PLAN_GOAL, PLAN_ID, BUILD_ID, _SB_SEQ
+    global SESSION, MODEL, BASE, PERM_MODE, GOAL, GOAL_SEAT, GOAL_BLOCKED, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK, _SB_SEQ
     history[:] = snap.get("history") or []
     thinks[:] = snap.get("thinks") or []
     SIDEBARS[:] = snap.get("sidebars") or []
@@ -4614,6 +4664,7 @@ def _session_restore(snap, history, thinks):
     PERM_MODE = snap.get("perm_mode") or PERM_MODE
     GOAL, GOAL_SEAT, GOAL_BLOCKED = snap.get("goal", ""), snap.get("goal_seat", ""), snap.get("goal_blocked", "")
     PLAN_GOAL, PLAN_ID, BUILD_ID = snap.get("plan_goal", ""), snap.get("plan_id", ""), snap.get("build_id", "")
+    PLAN_TASK = snap.get("plan_task", "") if PLAN_ID else ""
     seat = snap.get("seat")
     if seat in SEATS:
         MODEL, BASE = SEATS[seat]
@@ -4776,7 +4827,7 @@ def _turn(history, thinks, user, stats, model=None, base=None, no_tools=False, m
 
 
 def repl():
-    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, GOAL, GOAL_SEAT, GOAL_BLOCKED
+    global SESSION, TOOLS_ON, PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK, GOAL, GOAL_SEAT, GOAL_BLOCKED
     _st = load_settings()
     TOOLS_ON = _st.get("tools", True)
     load_user_tools()
@@ -4789,7 +4840,7 @@ def repl():
     __import__("atexit").register(lambda: _safe(lambda: _session_save()))   # last-chance snapshot on exit (atexit is imported later in this function → would be a local)
 
     def _enter_build(pid, kickoff=True, rerun=False):   # load a plan and drop into BUILD mode
-        global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
+        global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK
         p = megaplan_call("get", id=pid)
         if isinstance(p, dict) and "error" in p:
             print(f"{DIM}megaplan: {p['error']}{RESET}"); return False
@@ -4809,15 +4860,101 @@ def repl():
             PERM_MODE = "cautious"
         PLAN_GOAL, PLAN_ID, BUILD_ID = (p.get("title", "") if isinstance(p, dict) else ""), pid, pid
         plan_render(p)
-        print(f"{DIM}● BUILD mode — executing {pid}   ({PERM_MODE}; Shift+Tab to change · "
+        t = _task_of(p, PLAN_TASK) if PLAN_TASK else None
+        if PLAN_TASK and t is None:
+            print(f"{DIM}(focused task {PLAN_TASK} not in this plan — building the whole plan){RESET}")
+            PLAN_TASK = ""
+        scope = f" · ONLY task {PLAN_TASK} (/work off to clear the focus)" if t else ""
+        print(f"{DIM}● BUILD mode — executing {pid}{scope}   ({PERM_MODE}; Shift+Tab to change · "
               f"/build off to stop){RESET}")
         if kickoff:
-            seed = (f"Build MegaPlan '{pid}'. Here is the plan:\n\n{p.get('body', '')}\n\n"
-                    f"Start with the first actionable task (dependencies satisfied): do the work, "
-                    f"then mark it complete via megaplan. Proceed.")
+            if t:
+                seed = (f"Build MegaPlan '{pid}' — ONLY task {PLAN_TASK}: "
+                        f"{' '.join(str(t.get('text') or '').split())}\n\nFor context, the plan:\n\n"
+                        f"{p.get('body', '')}\n\nDo the work for task {PLAN_TASK}, mark it complete via "
+                        f"megaplan(action=\"complete\", id=\"{pid}\", task_id=\"{PLAN_TASK}\"), then STOP "
+                        f"and report — do not start other tasks.")
+            else:
+                seed = (f"Build MegaPlan '{pid}'. Here is the plan:\n\n{p.get('body', '')}\n\n"
+                        f"Start with the first actionable task (dependencies satisfied): do the work, "
+                        f"then mark it complete via megaplan. Proceed.")
             _turn(history, thinks, seed, stats)
             print(_status_line(stats))
         return True
+
+    def _plan_task_cmd(verb, rest):
+        """Task-level interaction with the LOADED plan: work/focus · complete · uncomplete ·
+        block/unblock · add. No task id → arrow-pick (Tab hands '/<verb> tN ' back to edit)."""
+        global PLAN_TASK, _PREFILL
+        verb = {"focus": "work", "done": "complete", "undone": "uncomplete", "reopen": "uncomplete"}.get(verb, verb)
+        words = rest.split()
+        if verb == "work" and words and words[0].lower() in ("off", "none", "clear"):
+            PLAN_TASK = ""; print(f"{DIM}task focus cleared{RESET}"); return
+        if not PLAN_ID:
+            print(f"{DIM}no plan loaded — /megaplan load [id] first{RESET}"); return
+        p = megaplan_call("get", id=PLAN_ID)
+        if not isinstance(p, dict) or "error" in p:
+            print(f"{DIM}megaplan: {p.get('error') if isinstance(p, dict) else p}{RESET}"); return
+        if verb == "add":
+            text = rest.strip()
+            if not text:
+                print(f"{DIM}usage: /megaplan add <task text> [2h]{RESET}"); return
+            est = None
+            m = re.search(r"\s*\(?(?:est:?\s*)?(\d+(?:\.\d+)?)\s*h\)?\s*$", text)
+            if m:
+                est, text = float(m.group(1)), text[: m.start()].rstrip()
+            r = megaplan_call("add_task", id=PLAN_ID, text=text, est_hours=est)
+            if isinstance(r, dict) and "error" in r:
+                print(f"{DIM}megaplan: {r['error']}{RESET}"); return
+            new = (r.get("tasks") or [{}])[-1]
+            print(f"{DIM}added{RESET} {_task_line(new)}")
+            return
+        # resolve the task id: explicit tN, else picker (filtered by what makes sense)
+        tid = words[0] if words and re.fullmatch(r"t\d+", words[0].lower()) else ""
+        flags = [w.lower() for w in (words[1:] if tid else words)]
+        if not tid:
+            only = {"complete": "open", "uncomplete": "done"}.get(verb)
+            pick = task_pick(p, verb, only=only, editable=True)
+            if isinstance(pick, tuple) and pick[0] == "edit":
+                _PREFILL = f"/{verb} {pick[1]} "; return
+            tid = pick
+            if not tid:
+                return
+        t = _task_of(p, tid)
+        if t is None:
+            print(f"{DIM}no task {tid} in {PLAN_ID}{RESET}"); return
+        if verb == "complete":
+            r = megaplan_call("complete", id=PLAN_ID, task_id=tid)
+        elif verb == "uncomplete":
+            r = megaplan_call("update_task", id=PLAN_ID, task_id=tid, done=False)
+            if isinstance(r, dict) and r.get("status") == "done":     # plan was auto-closed → reopen it
+                r = megaplan_call("update", id=PLAN_ID, status="active")
+        elif verb in ("block", "unblock"):
+            r = megaplan_call("update_task", id=PLAN_ID, task_id=tid, blocked=(verb == "block"))
+        elif verb == "work":
+            PLAN_TASK = tid
+            print(f"{BLUE_ELECTRIC}▸ focus{RESET} {_task_line(t)}")
+            if any(f in ("go", "build", "run", "do") for f in flags):
+                _enter_build(PLAN_ID)                    # build ONLY this task (scoped by PLAN_TASK)
+                return
+            print(f"{DIM}  (/work {tid} go or /build to execute just this task · /work off to clear){RESET}")
+            seed = (f"Focus on task {tid} of MegaPlan '{p.get('title', PLAN_ID)}' ({PLAN_ID}):\n\n"
+                    f"{' '.join(str(t.get('text') or '').split())}\n\nIn a few lines: what does this task "
+                    f"entail, what does it depend on / unblock, and what concrete first step would you take? "
+                    f"Plain prose only — no tools on this reply, no action blocks. Then STOP and wait for "
+                    f"my direction; don't start executing anything until I say go.")
+            _turn(history, thinks, seed, stats, no_tools=True, max_rounds=1)
+            print(_status_line(stats))
+            return
+        else:
+            print(f"{DIM}unknown task verb {verb}{RESET}"); return
+        if isinstance(r, dict) and "error" in r:
+            print(f"{DIM}megaplan: {r['error']}{RESET}"); return
+        t2 = _task_of(r, tid) or t
+        pr = r.get("progress") or {}
+        print(f"{_task_line(t2)}   {DIM}{pr.get('done', 0)}/{pr.get('total', 0)} · plan {r.get('status')}{RESET}")
+        if verb == "complete" and PLAN_TASK == tid:
+            PLAN_TASK = ""                               # focus done → clear
 
     def _offer_build():                           # after a save, offer the one-key handoff
         pid = _take_saved()
@@ -5224,6 +5361,9 @@ def repl():
                 else:
                     print(f"{DIM}usage: /gate <level> · /gate interactive|auto <level>   [{_lv}]{RESET}")
             continue
+        if user.split(" ", 1)[0] in ("/work", "/complete", "/uncomplete"):   # task shortcuts (loaded plan)
+            verb, _, rest = user.partition(" ")
+            _plan_task_cmd(verb[1:], rest.strip()); continue
         if user == "/build" or user.startswith("/build "):
             arg = user[len("/build"):].strip()
             if arg.lower() in ("off", "done", "stop", "exit"):
@@ -5241,7 +5381,11 @@ def repl():
                 else:
                     rerun = True
             arg = " ".join(words)
+            if re.fullmatch(r"t\d+", arg) and PLAN_ID:      # /build tN → that task of the loaded plan
+                PLAN_TASK, arg = arg, ""
             pid = arg or PLAN_ID
+            if pid and arg and arg != PLAN_ID:
+                PLAN_TASK = ""                            # building a different plan → drop the focus
             if not pid:                                  # no id given → arrow-pick (Tab = edit)
                 pick = plan_pick("build", editable=True)
                 if isinstance(pick, tuple) and pick[0] == "edit":   # Tab → fill the command line
@@ -5507,8 +5651,8 @@ def repl():
             sub, rest = sub.lower(), rest.strip()
 
             def _start_plan(goal):                        # enter plan mode + kick off grounding turn
-                global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID
-                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", goal, "", ""
+                global PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK
+                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK = "plan", goal, "", "", ""
                 if not TOOLS_ON or "megaplan" not in TOOLS or not TOOLS["megaplan"].enabled:
                     print(f"{DIM}note: enable the `megaplan` tool (/tools) so the plan can be saved{RESET}")
                 print(f"{DIM}● MegaPlan mode — planning: {goal}   (/megaplan off|close|exit or Shift+Tab to leave){RESET}")
@@ -5525,9 +5669,16 @@ def repl():
                       f"  /megaplan show [id] [full]    pretty-print a plan (picker if no id; full = whole body)\n"
                       f"  /megaplan save                persist the current plan now\n"
                       f"  /build [id]               execute a ready plan task-by-task (picker if no id)\n"
+                      f"  /megaplan work [tN] [go]      focus a task (picker if no id; go = build just it)\n"
+                      f"  /megaplan complete|uncomplete [tN]   tick / untick a task (picker if no id)\n"
+                      f"  /megaplan block|unblock [tN]  flag / unflag a task as blocked\n"
+                      f"  /megaplan add <text> [2h]     add a task to the loaded plan\n"
                       f"  /megaplan close|off|exit      leave plan mode (also: done, stop)\n"
                       f"  /megaplan rename [id] [title] rename a plan (picker + prompt if omitted)\n"
                       f"  /megaplan remove [id]         archive a plan (picker if no id){RESET}")
+            elif sub in ("work", "focus", "complete", "done", "uncomplete", "undone", "reopen",
+                         "block", "unblock", "add"):
+                _plan_task_cmd(sub, rest)
             elif sub in ("browse", "list"):
                 plan_browse(rest)
             elif sub in ("show", "view"):
@@ -5547,6 +5698,7 @@ def repl():
                     print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
                 plan_render(p)
                 PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", p.get("title", ""), pid, ""
+                PLAN_TASK = ""
                 # Orientation ONLY: the user just opened the plan to look at it / talk about it.
                 # One short no-tools reply, then wait — nothing researches, edits or builds until
                 # the user says so (execution is /build; edits are an explicit megaplan save).
@@ -5572,7 +5724,7 @@ def repl():
                     print(_status_line(stats))
                     _offer_build()                 # one-key handoff: build it now?
             elif sub in ("close", "off", "done", "stop", "exit"):
-                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
+                PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK = "cautious", "", "", "", ""
                 print(f"{DIM}plan mode off{RESET}")
             elif sub in ("remove", "rm", "delete"):
                 pid = rest or plan_pick("archive")        # no id → arrow-pick from the list
@@ -5622,7 +5774,7 @@ def repl():
         if user == "/clear":
             history.clear(); thinks.clear()
             SIDEBARS.clear(); _SB_UNDER.clear(); _SB_PAUSED.clear()   # cleared thread → no dangling branches
-            PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
+            PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK = "cautious", "", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh affinity
             _SESS["title"], _SESS["started"] = "", time.time()
             clear_screen()
@@ -5632,7 +5784,7 @@ def repl():
             stats = Stats()                            # zero the token/turn counters
             SIDEBARS.clear(); _SB_UNDER.clear(); _SB_PAUSED.clear(); LOADED_SKILLS.clear()  # drop sidebars + skills
             GOAL, GOAL_SEAT, GOAL_BLOCKED = "", "", ""
-            PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "cautious", "", "", ""
+            PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID, PLAN_TASK = "cautious", "", "", "", ""
             SESSION = "input-" + os.urandom(6).hex()   # fresh conversation → fresh SAINT affinity
             _SESS["title"], _SESS["started"] = "", time.time()
             clear_screen()
