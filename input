@@ -175,7 +175,7 @@ def _route_hint_lines():
 _CMD_HINTS = {
     "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
-    "/megaplan":    "<goal> new · load · show · archive   (authors in plan mode; alias: /plan)",
+    "/megaplan":    "<goal> · new · browse · load · show · save · rename · remove · close|off|exit   (authors in plan mode; alias: /plan)",
     "/plan":        "alias of /megaplan",
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
     "/sidebar": "[topic] fork · /merge fold back · /update post interim · /return park · /drop discard · list · resume [#id]",
@@ -329,6 +329,7 @@ _HELP_TOPICS = {
         "  /megaplan                   enter plan mode\n"
         "  /megaplan <goal>            enter plan mode aimed at a specific goal\n"
         "  /megaplan load|show|archive manage saved plans\n"
+        "  /megaplan close|off|exit    leave plan mode (also Shift+Tab)\n"
         "Once a plan is saved, /build executes it."
     ),
     "/skill": (
@@ -5345,7 +5346,7 @@ def repl():
                 PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", goal, "", ""
                 if not TOOLS_ON or "megaplan" not in TOOLS or not TOOLS["megaplan"].enabled:
                     print(f"{DIM}note: enable the `megaplan` tool (/tools) so the plan can be saved{RESET}")
-                print(f"{DIM}● MegaPlan mode — planning: {goal}   (/megaplan off or Shift+Tab to exit){RESET}")
+                print(f"{DIM}● MegaPlan mode — planning: {goal}   (/megaplan off|close|exit or Shift+Tab to leave){RESET}")
                 _turn(history, thinks, f"Let's plan: {goal}", stats)
                 print(_status_line(stats))
 
@@ -5359,7 +5360,7 @@ def repl():
                       f"  /megaplan show [id]           print a plan (picker if no id)\n"
                       f"  /megaplan save                persist the current plan now\n"
                       f"  /build [id]               execute a ready plan task-by-task (picker if no id)\n"
-                      f"  /megaplan close               leave plan mode\n"
+                      f"  /megaplan close|off|exit      leave plan mode (also: done, stop)\n"
                       f"  /megaplan rename [id] [title] rename a plan (picker + prompt if omitted)\n"
                       f"  /megaplan remove [id]         archive a plan (picker if no id){RESET}")
             elif sub in ("browse", "list"):
