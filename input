@@ -2462,23 +2462,171 @@ def plan_pick(verb="select", editable=False):
     return ("edit", pid) if res[1] == "edit" else pid
 
 
-def plan_render(p):
-    """A readable view of one plan (from a `get`/`review` result)."""
+def _plan_body_sections(body):
+    """Split a plan body's markdown into (heading, lines) sections, dropping the H1 title and
+    the whole '## Tasks' checklist subtree (rendered structurally elsewhere) plus any stray
+    checklist lines / task-id comments."""
+    secs, head, buf, skip_lvl = [], "", [], 0
+    for ln in (body or "").splitlines():
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m:
+            lvl, text = len(m.group(1)), m.group(2).strip()
+            if skip_lvl and lvl > skip_lvl:           # sub-heading inside the Tasks subtree
+                continue
+            skip_lvl = 0
+            if head or buf:
+                secs.append((head, buf))
+            head, buf = text, []
+            if lvl == 1:                              # H1 = the title (already in the header)
+                head = ""
+            if text.lower() in ("tasks", "task"):
+                skip_lvl, head = lvl, ""
+                buf = None
+            continue
+        if buf is None:                               # inside Tasks → drop
+            continue
+        if re.match(r"^\s*[-*+]\s+\[[ xX]\]\s", ln):    # stray checklist line
+            continue
+        buf.append(re.sub(r"<!--.*?-->", "", ln).rstrip())
+    if buf and (head or buf):
+        secs.append((head, buf))
+    return [(h, b) for h, b in secs if b is not None and (h or "".join(b).strip())]
+
+
+def plan_render(p, full=False, body_lines=18):
+    """Pretty-print one plan (from a `get`/`review` result): header rule, status line,
+    progress bar, the task list with stable ids (✔ done / ○ open / ⊘ blocked, wrapped with a
+    hanging indent), then the non-task body sections (capped unless full=True)."""
+    import shutil, textwrap
     if isinstance(p, dict) and "plan" in p:              # a review payload
         p = p["plan"]
     if not isinstance(p, dict) or "error" in p:
         msg = p.get("error", "not found") if isinstance(p, dict) else p
         print(f"{DIM}megaplan: {msg}{RESET}"); return
+    cols = max(60, min(shutil.get_terminal_size((100, 24)).columns, 120))
     pr = p.get("progress") or {}
-    print(f"{CODE_FG}{p.get('title', '(untitled)')}{RESET}  {DIM}[{p.get('id')}]{RESET}")
-    deps = f" · deps: {', '.join(p.get('depends_on') or [])}" if p.get("depends_on") else ""
-    print(f"{DIM}  {p.get('status')} · {p.get('priority')} · "
-          f"{pr.get('done', 0)}/{pr.get('total', 0)} tasks{deps}{RESET}")
-    for t in p.get("tasks") or []:
-        box = "x" if t.get("done") else " "
-        est = f" (est {t['est_hours']}h)" if t.get("est_hours") else ""
-        flag = " @blocked" if t.get("blocked") else ""
-        print(f"{DIM}    [{box}] {t.get('text', '')}{est}{flag}{RESET}")
+    done, total = int(pr.get("done", 0) or 0), int(pr.get("total", 0) or 0)
+    pct = pr.get("percent")
+    if pct is None:
+        pct = round(100 * done / total) if total else 0
+    status = str(p.get("status") or "")
+    scol = {"done": GREEN_BUILD, "active": BLUE_ELECTRIC, "blocked": RED_VIVID,
+            "archived": DIM, "backlog": DIM}.get(status, "")
+    pcol = {"critical": RED_VIVID, "high": YEL}.get(str(p.get("priority") or ""), "")
+    title = p.get("title") or "(untitled)"
+    pid = p.get("id") or ""
+    # ── header rule: ━━ Title ━━━━━━━━  [id]
+    rule = max(0, cols - len(title) - len(pid) - 8)
+    print(f"{BLUE_ELECTRIC}━━ {BOLD}{title}{RESET}{BLUE_ELECTRIC} {'━' * rule}{RESET}  {DIM}[{pid}]{RESET}")
+    meta = [f"{scol}{status}{RESET}", f"{pcol}{p.get('priority')}{RESET}"]
+    if p.get("tags"):
+        meta.append(f"{DIM}tags: {', '.join(map(str, p['tags']))}{RESET}")
+    if p.get("depends_on"):
+        meta.append(f"{DIM}deps: {', '.join(map(str, p['depends_on']))}{RESET}")
+    tm = p.get("time") or {}
+    if tm.get("est_hours") or tm.get("spent_hours"):
+        meta.append(f"{DIM}time: {tm.get('spent_hours') or 0:g}h / est {tm.get('est_hours') or 0:g}h{RESET}")
+    if p.get("updated"):
+        meta.append(f"{DIM}updated {str(p['updated'])[:16].replace('T', ' ')}{RESET}")
+    print(f"   " + f"{DIM} · {RESET}".join(meta))
+    # ── progress bar
+    tasks = p.get("tasks") or []
+    open_est = sum(float(t.get("est_hours") or 0) for t in tasks if not t.get("done"))
+    barw = 30
+    fill = round(barw * pct / 100) if total else 0
+    bar = f"{GREEN_BUILD}{'█' * fill}{RESET}{DIM}{'░' * (barw - fill)}{RESET}"
+    est_txt = f"   {DIM}{open_est:g}h est open{RESET}" if open_est else ""
+    print(f"   {bar}  {done}/{total} tasks ({pct}%){est_txt}")
+    # ── tasks: "   ✔ t12  text … (12h) @blocked" with hanging indent
+    if tasks:
+        print()
+        idw = max((len(str(t.get("id") or "")) for t in tasks), default=2)
+        for t in tasks:
+            tid = str(t.get("id") or "")
+            if t.get("done"):
+                mark, col = "✔", GREEN_BUILD
+            elif t.get("blocked"):
+                mark, col = "⊘", RED_VIVID
+            else:
+                mark, col = "○", CODE_FG
+            text = " ".join(str(t.get("text") or "").split())
+            tail = ""
+            if t.get("est_hours"):
+                tail += f" ({t['est_hours']:g}h)"
+            if t.get("spent_hours"):
+                tail += f" [{t['spent_hours']:g}h spent]"
+            if t.get("blocked"):
+                tail += " @blocked"
+            if t.get("depends"):
+                tail += f" ← {t['depends']}"
+            lead = f"   {col}{mark}{RESET} {DIM}{tid:<{idw}}{RESET}  "
+            indent = " " * (3 + 1 + 1 + idw + 2)
+            body_col = DIM if t.get("done") else ""
+            lines = textwrap.wrap(text + (f"{tail}" if tail else ""), width=max(30, cols - len(indent))) or [""]
+            print(f"{lead}{body_col}{lines[0]}{RESET}")
+            for ln in lines[1:]:
+                print(f"{indent}{body_col}{ln}{RESET}")
+    # ── body: non-task sections, wrapped; capped unless full
+    secs = _plan_body_sections(p.get("body", ""))
+    if secs:
+        out = []
+        for head, blines in secs:
+            if head:
+                out.append(f"{BOLD}{head}{RESET}")
+            out.extend(_md_wrap(blines, cols - 3))
+            out.append("")
+        out = [ln for i, ln in enumerate(out) if ln or (i and out[i - 1])]   # collapse blank runs
+        while out and not out[-1]:
+            out.pop()
+        while out and not out[0]:
+            out.pop(0)
+        shown = out if full or len(out) <= body_lines else out[:body_lines]
+        print()
+        for ln in shown:
+            print(f"   {DIM}{ln}{RESET}" if not ln.startswith(BOLD) else f"   {ln}")
+        if shown is not out:
+            print(f"   {DIM}… {len(out) - len(shown)} more lines — /megaplan show {pid} full{RESET}")
+
+
+def _md_wrap(lines, width):
+    """Light markdown → terminal lines: paragraphs re-flowed, list items re-flowed with a
+    hanging indent (hard-wrapped continuation lines rejoin their item), code/table/quote
+    lines kept verbatim, blank lines collapsed to one. **bold** → bold."""
+    import textwrap
+    out, para, item = [], [], None          # item = (indent_str, [words]) for an open list item
+
+    def emph(t):
+        return re.sub(r"\*\*(.+?)\*\*", lambda m: f"{BOLD}{m.group(1)}{RESET}{DIM}", t)
+
+    def flush():
+        nonlocal item
+        if para:
+            out.extend(textwrap.wrap(emph(" ".join(para)), width=width) or [""]); para.clear()
+        if item:
+            ind, words = item
+            out.extend(textwrap.wrap(emph(" ".join(words)), width=width,
+                                     subsequent_indent=ind) or [""])
+            item = None
+    for ln in lines:
+        st = ln.strip()
+        if not st:
+            flush()
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        m = re.match(r"^([-*+]|\d+[.)])\s+", st)
+        if m:                                         # new list item
+            flush()
+            item = (" " * len(m.group(0)), [st])
+            continue
+        if st.startswith(("```", "|", ">")) or ln.startswith("    "):
+            flush(); out.append(ln.rstrip()[:width]); continue
+        if item is not None:                          # continuation of the open list item
+            item[1].append(st)
+        else:
+            para.append(st)
+    flush()
+    return out
 
 
 # --- ambient memory (Astoria on the NAS) -------------------------------------------------
@@ -5374,7 +5522,7 @@ def repl():
                       f"  /megaplan <goal>              start a new plan (ground → discuss → save)\n"
                       f"  /megaplan browse              list all plans\n"
                       f"  /megaplan load [id]           open a plan: render + brief orientation, then wait for you\n"
-                      f"  /megaplan show [id]           print a plan (picker if no id)\n"
+                      f"  /megaplan show [id] [full]    pretty-print a plan (picker if no id; full = whole body)\n"
                       f"  /megaplan save                persist the current plan now\n"
                       f"  /build [id]               execute a ready plan task-by-task (picker if no id)\n"
                       f"  /megaplan close|off|exit      leave plan mode (also: done, stop)\n"
@@ -5383,9 +5531,13 @@ def repl():
             elif sub in ("browse", "list"):
                 plan_browse(rest)
             elif sub in ("show", "view"):
-                pid = rest or plan_pick("show")           # no id → arrow-pick from the list
+                words = rest.split()
+                full = bool(words) and words[-1].lower() in ("full", "all", "-f", "--full")
+                if full:
+                    words = words[:-1]
+                pid = (words[0] if words else "") or plan_pick("show")   # no id → arrow-pick
                 if pid:
-                    plan_render(megaplan_call("get", id=pid))
+                    plan_render(megaplan_call("get", id=pid), full=full)
             elif sub in ("load", "open"):
                 pid = rest or plan_pick("load")           # no id → arrow-pick from the list
                 if not pid:
