@@ -995,7 +995,9 @@ _PLAN_DIRECTIVE = (
     "body=\"…markdown incl. a '## Tasks' checklist of '- [ ] task (est: 2h)' lines…\", "
     "priority=low|medium|high|critical, tags=[…], depends_on=[related plan ids]). (5) Report "
     "the saved plan id. The conversation IS the planning; the tool only grounds and persists "
-    "it. Prefer one rich save over many task calls."
+    "it. Prefer one rich save over many task calls. Plan mode is for THINKING, not doing: "
+    "never edit files, run mutating commands, or start executing plan tasks here — the user "
+    "runs /build for that. After orienting, wait for the user's direction each step."
 )
 
 
@@ -4512,8 +4514,11 @@ def _sessions_command(arg, history, thinks):
     print("usage: /sessions [list] · /sessions resume <id|last> · /sessions save")
 
 
-def _turn(history, thinks, user, stats, model=None, base=None):
-    """One interactive REPL turn = run_thread with printing, memory recall/store, gating."""
+def _turn(history, thinks, user, stats, model=None, base=None, no_tools=False, max_rounds=None):
+    """One interactive REPL turn = run_thread with printing, memory recall/store, gating.
+    no_tools=True → a pure conversational reply (no tool schemas offered); max_rounds caps the
+    agent loop for this turn (default GOAL_MAX_ROUNDS). Used by orientation turns like
+    /megaplan load that must inform, not act."""
     stats.turns += 1
     recalled = mem_recall(user)                    # ambient memory for this turn (best-effort)
     if recalled:
@@ -4546,10 +4551,10 @@ def _turn(history, thinks, user, stats, model=None, base=None):
             return
         user = f"(Answer to your BLOCKED need — {GOAL_BLOCKED!r}): {user}"
         GOAL_BLOCKED = ""
-    tools = [t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None
+    tools = None if no_tools else ([t for t in TOOLS.values() if t.enabled] if TOOLS_ON else None)
     if GOAL and GOAL_SEAT and GOAL_SEAT in SEATS and (model, base) == (None, None):
         model, base = SEATS[GOAL_SEAT]         # hard goal → pin the loop to the capable seat
-    maxr = GOAL_MAX_ROUNDS   # generous per-segment budget for goals AND plain interactive turns
+    maxr = max_rounds or GOAL_MAX_ROUNDS   # generous per-segment budget for goals AND plain turns
     try:
         # A goal runs open-ended: keep going as long as it makes PROGRESS. Each segment is one
         # run_thread call; between segments we check whether new tool work happened. Continue
@@ -5356,7 +5361,7 @@ def repl():
                 print(f"{DIM}plan mode {on}{loaded}\n"
                       f"  /megaplan <goal>              start a new plan (ground → discuss → save)\n"
                       f"  /megaplan browse              list all plans\n"
-                      f"  /megaplan load [id]           open a plan to continue it (picker if no id)\n"
+                      f"  /megaplan load [id]           open a plan: render + brief orientation, then wait for you\n"
                       f"  /megaplan show [id]           print a plan (picker if no id)\n"
                       f"  /megaplan save                persist the current plan now\n"
                       f"  /build [id]               execute a ready plan task-by-task (picker if no id)\n"
@@ -5378,10 +5383,15 @@ def repl():
                     print(f"{DIM}megaplan: {p['error']}{RESET}"); continue
                 plan_render(p)
                 PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", p.get("title", ""), pid, ""
+                # Orientation ONLY: the user just opened the plan to look at it / talk about it.
+                # One short no-tools reply, then wait — nothing researches, edits or builds until
+                # the user says so (execution is /build; edits are an explicit megaplan save).
                 seed = (f"We're continuing an existing MegaPlan (id: {pid}). Current state:\n\n"
-                        f"{p.get('body', '')}\n\nReview where it stands and propose next steps; "
-                        f"when we change it, persist with megaplan(action=\"save\", id=\"{pid}\", …).")
-                _turn(history, thinks, seed, stats)
+                        f"{p.get('body', '')}\n\nIn a few lines: where does it stand (done / open / "
+                        f"blocked) and what would you suggest next? Then STOP and wait for my direction "
+                        f"— do not research, change files or start executing anything until I ask. "
+                        f"When we do change the plan, persist with megaplan(action=\"save\", id=\"{pid}\", …).")
+                _turn(history, thinks, seed, stats, no_tools=True, max_rounds=1)
                 print(_status_line(stats))
             elif sub == "save":
                 if PERM_MODE != "plan" and not PLAN_ID:
