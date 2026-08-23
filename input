@@ -3400,13 +3400,25 @@ def active_name():
     return next((n for n, (m, b) in SEATS.items() if (m, b) == (MODEL, BASE)), MODEL)
 
 
+def _plan_tag(pid=None, width=28):
+    """Short plan label for the prompt: the plan title (or id), ellipsized — so you can see
+    WHICH plan is loaded/being built at a glance ('plan▸NOVA Stack >')."""
+    name = PLAN_GOAL or PLAN_ID or pid or ""
+    if pid and pid != PLAN_ID:                    # build tag for a plan other than the loaded one
+        name = pid
+    if not name:
+        return ""
+    name = re.sub(r"\s+", " ", name).strip()
+    return (name[: width - 1] + "…") if len(name) > width else name
+
+
 def _prompt():
     n = active_name()
     color = YEL if n == "saint" or n.startswith("cloud") else CODE_FG   # highlight routed/cloud seats
     tag = {"cautious": "",
            "unrestricted": f"{RED_VIVID}{BOLD} unrestricted▸{RESET}",
-           "plan": f"{BLUE_ELECTRIC} plan▸{RESET}"}.get(PERM_MODE, "")
-    build = f"{GREEN_BUILD} build▸{RESET}" if BUILD_ID else ""
+           "plan": f"{BLUE_ELECTRIC} plan▸{_plan_tag()}{RESET}"}.get(PERM_MODE, "")
+    build = f"{GREEN_BUILD} build▸{_plan_tag(BUILD_ID)}{RESET}" if BUILD_ID else ""
     goal = (f"{RED_VIVID}{BOLD} ⛔blocked▸{RESET}" if GOAL_BLOCKED else
             (f"{DIM} goal▸{RESET}" if GOAL else ""))
     aside = f"{CODE_FG} aside{'▸' * len(SIDEBARS)}{RESET}" if SIDEBARS else ""
@@ -4647,7 +4659,7 @@ def repl():
             p = megaplan_call("get", id=pid)          # refresh after reopening
         if PERM_MODE == "plan":                   # leave authoring; keep gating otherwise
             PERM_MODE = "cautious"
-        PLAN_GOAL, PLAN_ID, BUILD_ID = "", pid, pid
+        PLAN_GOAL, PLAN_ID, BUILD_ID = (p.get("title", "") if isinstance(p, dict) else ""), pid, pid
         plan_render(p)
         print(f"{DIM}● BUILD mode — executing {pid}   ({PERM_MODE}; Shift+Tab to change · "
               f"/build off to stop){RESET}")
@@ -5388,8 +5400,11 @@ def repl():
                 # the user says so (execution is /build; edits are an explicit megaplan save).
                 seed = (f"We're continuing an existing MegaPlan (id: {pid}). Current state:\n\n"
                         f"{p.get('body', '')}\n\nIn a few lines: where does it stand (done / open / "
-                        f"blocked) and what would you suggest next? Then STOP and wait for my direction "
-                        f"— do not research, change files or start executing anything until I ask. "
+                        f"blocked) and what would you suggest next? Plain prose only: NO tools are "
+                        f"available on this reply — do not emit tool calls, pseudo-calls or action "
+                        f"blocks, and skip the GROUND step (the plan text above IS the grounding). "
+                        f"Then STOP and wait for my direction — do not research, change files or "
+                        f"start executing anything until I ask. "
                         f"When we do change the plan, persist with megaplan(action=\"save\", id=\"{pid}\", …).")
                 _turn(history, thinks, seed, stats, no_tools=True, max_rounds=1)
                 print(_status_line(stats))
