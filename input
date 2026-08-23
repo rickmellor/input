@@ -175,7 +175,8 @@ def _route_hint_lines():
 _CMD_HINTS = {
     "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
-    "/plan":    "<goal> new · load · show · archive   (authors in plan mode)",
+    "/megaplan":    "<goal> new · load · show · archive   (authors in plan mode; alias: /plan)",
+    "/plan":        "alias of /megaplan",
     "/goal":    "<criteria> set exit-criteria the agent works toward · off to clear",
     "/sidebar": "[topic] fork · /merge fold back · /update post interim · /return park · /drop discard · list · resume [#id]",
     "/skill":   "<name> load · off <name> unload · (bare) list",
@@ -203,7 +204,7 @@ def _command_hint_lines(buf):
     if cmd in _CMD_HINTS:
         return [f"{DIM}  {cmd}  {_CMD_HINTS[cmd]}{RESET}"]
     return [f"{DIM}  commands:{RESET}",
-            f"{DIM}  /help  /new  /clear  /build  /jobs  /gate  /plan  /goal  /sidebar  /skill  /context  /cd  "
+            f"{DIM}  /help  /new  /clear  /build  /jobs  /gate  /megaplan  /goal  /sidebar  /skill  /context  /cd  "
             f"/mcp  /tools  /models  /mode  /seats  /memory  /quit{RESET}"]
 
 
@@ -225,7 +226,7 @@ _HELP = [
         ("mini-5s", "the agent delegates self-contained sub-tasks via sub-agents"),
     ]),
     ("Plans (MegaPlan)", [
-        ("/plan", "author a plan — research → discuss → persist"),
+        ("/megaplan", "author a plan — research → discuss → persist  (alias: /plan)"),
         ("/build", "execute a plan · bg = detached · rerun|reset a completed one"),
     ]),
     ("Context & memory", [
@@ -320,14 +321,14 @@ _HELP_TOPICS = {
         "  /build <id> reset       reopen a completed plan WITHOUT building (mark undone only)\n"
         "  /build off              leave BUILD mode"
     ),
-    "/plan": (
+    "/megaplan": (
         "Author a plan interactively: research the problem, discuss the approach, then persist\n"
         "it to MegaPlan (the shared, git-backed, memory-informed plan store on the NAS). Enters\n"
         "plan mode, where the agent proposes and refines a task breakdown before saving — and\n"
         "surfaces related prior plans and relevant memory as it goes.\n"
-        "  /plan                   enter plan mode\n"
-        "  /plan <goal>            enter plan mode aimed at a specific goal\n"
-        "  /plan load|show|archive manage saved plans\n"
+        "  /megaplan                   enter plan mode\n"
+        "  /megaplan <goal>            enter plan mode aimed at a specific goal\n"
+        "  /megaplan load|show|archive manage saved plans\n"
         "Once a plan is saved, /build executes it."
     ),
     "/skill": (
@@ -761,7 +762,7 @@ def instruction_layer(cwd=None):
 
 
 # --- permission modes ------------------------------------------------------------
-# Shift+Tab cycles them (also /mode, and /plan enters plan). They govern how tool calls
+# Shift+Tab cycles them (also /mode, and /megaplan enters plan). They govern how tool calls
 # that make changes are gated (see _gate):
 #   cautious     — YOU review risky actions (gemma rates; you confirm medium+ / denylist)
 #   unrestricted — a reviewer model gates; you're never prompted (denylist + high/critical
@@ -2374,7 +2375,7 @@ def reload_mcp_tools():
     apply_tools_state()
 
 
-# ---- MegaPlan client: direct tool calls for the /plan management commands --------
+# ---- MegaPlan client: direct tool calls for the /megaplan management commands --------
 
 def _megaplan_url():
     for s in mcp_servers():
@@ -2426,7 +2427,7 @@ def plan_browse(_arg=""):
     if isinstance(rows, dict) and "error" in rows:
         print(f"{DIM}megaplan: {rows['error']}{RESET}"); return
     if not rows:
-        print(f"{DIM}no plans yet — /plan <goal> to start one{RESET}"); return
+        print(f"{DIM}no plans yet — /megaplan <goal> to start one{RESET}"); return
     for p in rows:
         pr = p.get("progress") or {}
         pct = f"{pr.get('pct', 0):>3}%" if pr.get("total") else "  —"
@@ -2442,7 +2443,7 @@ def plan_pick(verb="select", editable=False):
     if isinstance(rows, dict) and "error" in rows:
         print(f"{DIM}megaplan: {rows['error']}{RESET}"); return None
     if not rows:
-        print(f"{DIM}no plans yet — /plan <goal> to start one{RESET}"); return None
+        print(f"{DIM}no plans yet — /megaplan <goal> to start one{RESET}"); return None
     labels = []
     for p in rows:
         pr = p.get("progress") or {}
@@ -4671,7 +4672,7 @@ def repl():
         else:
             print(f"{YEL}(no saved session matching {RESUME_ID!r} — starting fresh; /sessions lists them){RESET}")
     print(f"input → {MODEL} @ {BASE}  (enter send · ctrl+enter one-shot · ^R routing hint · Shift+Tab cycles mode · "
-          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /gate /goal /plan /build /jobs /sidebar /location /think /clear /new /footer · exit/^D quits · Esc aborts · ^C copies code)")
+          f"/help /models /seats /system /skill /context /tools /mcp /memory /mode /gate /goal /megaplan /build /jobs /sidebar /location /think /clear /new /footer · exit/^D quits · Esc aborts · ^C copies code)")
     print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}   (Shift+Tab: {' → '.join(MODES)}){RESET}")
     print(f"{DIM}  Fn one-shot: " + " · ".join(
         f"{k.upper()}→{v}" for k, v in sorted(seat_hotkeys().items(), key=lambda kv: int(kv[0][1:])))
@@ -5081,7 +5082,7 @@ def repl():
                     _PREFILL = f"/build {pick[1]} "; continue
                 pid = pick
             if not pid:
-                print(f"{DIM}usage: /build <id> [bg] [rerun|reset]  (or /plan load one first){RESET}"); continue
+                print(f"{DIM}usage: /build <id> [bg] [rerun|reset]  (or /megaplan load one first){RESET}"); continue
             if reset:                                    # mark undone but DON'T execute
                 ok, msg = _reopen_plan(pid)
                 print(f"{DIM}↻ {msg if ok else 'reopen failed: ' + msg} — not built (/build {pid} to run){RESET}")
@@ -5332,8 +5333,10 @@ def repl():
                 print(f"location: {cur}{env}" if cur else
                       "(no location set — /location <city, state zip>, or /location clear)")
             continue
-        if user == "/plan" or user.startswith("/plan "):
-            arg = user[len("/plan"):].strip()
+        if user == "/plan" or user.startswith("/plan "):          # alias
+            user = "/megaplan" + user[len("/plan"):]
+        if user == "/megaplan" or user.startswith("/megaplan "):
+            arg = user[len("/megaplan"):].strip()
             sub, _, rest = arg.partition(" ")
             sub, rest = sub.lower(), rest.strip()
 
@@ -5342,7 +5345,7 @@ def repl():
                 PERM_MODE, PLAN_GOAL, PLAN_ID, BUILD_ID = "plan", goal, "", ""
                 if not TOOLS_ON or "megaplan" not in TOOLS or not TOOLS["megaplan"].enabled:
                     print(f"{DIM}note: enable the `megaplan` tool (/tools) so the plan can be saved{RESET}")
-                print(f"{DIM}● MegaPlan mode — planning: {goal}   (/plan off or Shift+Tab to exit){RESET}")
+                print(f"{DIM}● MegaPlan mode — planning: {goal}   (/megaplan off or Shift+Tab to exit){RESET}")
                 _turn(history, thinks, f"Let's plan: {goal}", stats)
                 print(_status_line(stats))
 
@@ -5350,15 +5353,15 @@ def repl():
                 on = f"on · {PLAN_GOAL or PLAN_ID}" if PERM_MODE == "plan" else "off"
                 loaded = f" · loaded {PLAN_ID}" if PLAN_ID else ""
                 print(f"{DIM}plan mode {on}{loaded}\n"
-                      f"  /plan <goal>              start a new plan (ground → discuss → save)\n"
-                      f"  /plan browse              list all plans\n"
-                      f"  /plan load [id]           open a plan to continue it (picker if no id)\n"
-                      f"  /plan show [id]           print a plan (picker if no id)\n"
-                      f"  /plan save                persist the current plan now\n"
+                      f"  /megaplan <goal>              start a new plan (ground → discuss → save)\n"
+                      f"  /megaplan browse              list all plans\n"
+                      f"  /megaplan load [id]           open a plan to continue it (picker if no id)\n"
+                      f"  /megaplan show [id]           print a plan (picker if no id)\n"
+                      f"  /megaplan save                persist the current plan now\n"
                       f"  /build [id]               execute a ready plan task-by-task (picker if no id)\n"
-                      f"  /plan close               leave plan mode\n"
-                      f"  /plan rename [id] [title] rename a plan (picker + prompt if omitted)\n"
-                      f"  /plan remove [id]         archive a plan (picker if no id){RESET}")
+                      f"  /megaplan close               leave plan mode\n"
+                      f"  /megaplan rename [id] [title] rename a plan (picker + prompt if omitted)\n"
+                      f"  /megaplan remove [id]         archive a plan (picker if no id){RESET}")
             elif sub in ("browse", "list"):
                 plan_browse(rest)
             elif sub in ("show", "view"):
@@ -5381,7 +5384,7 @@ def repl():
                 print(_status_line(stats))
             elif sub == "save":
                 if PERM_MODE != "plan" and not PLAN_ID:
-                    print(f"{DIM}nothing to save — /plan <goal> or /plan load <id> first{RESET}")
+                    print(f"{DIM}nothing to save — /megaplan <goal> or /megaplan load <id> first{RESET}")
                 else:
                     idarg = f', id="{PLAN_ID}"' if PLAN_ID else ""
                     _turn(history, thinks,
@@ -5421,10 +5424,10 @@ def repl():
                 print(f"{DIM}{'megaplan: ' + r['error'] if err else 'renamed ' + nid + ' → ' + ntitle + ' (id unchanged)'}{RESET}")
             elif sub == "new":
                 if not rest:
-                    print(f"{DIM}usage: /plan new <goal>{RESET}"); continue
+                    print(f"{DIM}usage: /megaplan new <goal>{RESET}"); continue
                 _start_plan(rest)
             else:
-                _start_plan(arg)                          # bare "/plan <free text>" → new plan
+                _start_plan(arg)                          # bare "/megaplan <free text>" → new plan
             continue
         if user in ("/help", "/?", "help") or user.startswith("/help "):
             print_help(user.split(None, 1)[1] if " " in user else ""); continue
