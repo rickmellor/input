@@ -41,9 +41,9 @@ Seats are displayed in one unit — **$/Mtok of output** — so local (electrici
   destructive step, a decision only you can make) and asks, or when it stalls.
 - **`/jobs`** — detached background work with a status table. A job is defined by a **goal
   string**, or by a **MegaPlan id** (which generates one), plus presets that write the goal for
-  you: `run <goal>`, `build <plan>`, `aco-review <target>`, `status <plan>` (a read-only brief:
-  intent, what's done, what's left). `status <job-id>` still shows that job. Then `log`, `stop`,
-  and `answer` for a job that parked to ask you something.
+  you: `run <goal>`, `build <plan>`, `aco-review <target>`, `summary <plan>` (a read-only brief:
+  intent, what's done, what's left and blocked). Then `show`/`status`, `log`, `stop`, and
+  `answer` for a job that parked to ask you something.
 - **Sub-agents** — the agent delegates self-contained units of work to other seats, waiting for
   the result. With `background: true` it detaches the work as a job instead, so the conversation
   carries on and you read the outcome through `/jobs`. See below.

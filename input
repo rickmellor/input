@@ -196,7 +196,7 @@ def _route_hint_lines():
 # Per-command usage shown on Ctrl+R when the entry field holds a slash command.
 _CMD_HINTS = {
     "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
-    "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · aco-review <target> · status <plan>",
+    "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · aco-review <target> · summary <plan>",
     "/loop":    "<interval> <what to check> · <what to check> (self-paced) · (bare) list · show|log|run|pause|resume|stop|rm <id> · harden|unharden <id> · daemon",
     "/megaplan":    "<goal> · new · browse · load · show · save · work · complete · uncomplete · block · add · rename · remove · close   (alias: /plan)",
     "/plan":        "alias of /megaplan",
@@ -6135,21 +6135,6 @@ def repl():
                     prog = f" {pct}% ({dn}/{tot})" if pct is not None else ""
                     toks = f" · {m.get('tokens_out', 0)}out" if m.get("tokens_out") else ""
                     print(f"{DIM}  {m['id']}  {col}{st:<8}{RESET}{DIM} {dur:>6}{prog}{toks}  {m.get('title', '')[:44]}{RESET}")
-            elif sub == "status" and rest and not _read_meta(rest.split()[0]):
-                # `status` means "how is X doing" for both kinds of X: an existing job id falls
-                # through to the viewer below; anything else is read as a MegaPlan and briefed.
-                pid = rest.split()[0]
-                goal = (f"Report where MegaPlan {pid!r} stands. Read it (megaplan get / review), then "
-                        "write a short brief with three parts: (1) INTENT — what this plan is for, in "
-                        "a sentence or two, from its goal/context prose rather than its task list; "
-                        "(2) DONE — what has actually been completed, grouped so it reads as progress "
-                        "rather than a checklist dump; (3) REMAINING — what is left, what is blocked "
-                        "and by what, and what you would pick up next and why. Read only: do NOT "
-                        "complete tasks, edit the plan, or change any state. You are done when the "
-                        "brief is written.")
-                jid = submit_job("goal", f"status {pid}", goal, cwd=os.getcwd())
-                _JOBS_SEEN[jid] = "queued"
-                print(f"{DIM}● job {jid} — summarising plan {pid} in the background · /jobs show {jid}{RESET}")
             elif sub in ("show", "status", "log", "tail") and rest:
                 jid = rest.split()[0]
                 m = _read_meta(jid)
@@ -6220,6 +6205,19 @@ def repl():
                 jid = submit_job("goal", rest[:60], rest, cwd=os.getcwd())
                 _JOBS_SEEN[jid] = "queued"
                 print(f"{DIM}● job {jid} — {rest[:50]} · /jobs show {jid}{RESET}")
+            elif sub == "summary" and rest:     # where does a plan stand? — a read-only brief
+                pid = rest.split()[0]
+                goal = (f"Report where MegaPlan {pid!r} stands. Read it (megaplan get / review), then "
+                        "write a short brief with three parts: (1) INTENT — what this plan is for, in "
+                        "a sentence or two, from its goal/context prose rather than its task list; "
+                        "(2) DONE — what has actually been completed, grouped so it reads as progress "
+                        "rather than a checklist dump; (3) REMAINING — what is left, what is blocked "
+                        "and by what, and what you would pick up next and why. Read only: do NOT "
+                        "complete tasks, edit the plan, or change any state. You are done when the "
+                        "brief is written.")
+                jid = submit_job("goal", f"summary {pid}", goal, cwd=os.getcwd())
+                _JOBS_SEEN[jid] = "queued"
+                print(f"{DIM}● job {jid} — summarising plan {pid} in the background · /jobs show {jid}{RESET}")
             elif sub in ("aco-review", "review") and rest:   # 'review' kept: old muscle memory
                 tgt = rest.split()[0]
                 goal = (f"Use the aco_review tool to run an adversarial review of {tgt!r}, then "
