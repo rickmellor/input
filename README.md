@@ -46,6 +46,25 @@ Seats are displayed in one unit — **$/Mtok of output** — so local (electrici
 - **`/sidebar`** — fork an aside without polluting the main thread; `/merge` folds its
   conclusion back, `/return` parks it.
 
+### Which one?
+
+Three ways to hand off work, distinguished by what decides when they stop:
+
+| | ends when | can ask you a question | use it for |
+|---|---|---|---|
+| `/goal` | the criteria are met | yes — parks as `BLOCKED:` | one outcome, worked in this session |
+| `/jobs` | the goal is met, or it fails | yes — `/jobs answer <id>` resumes it | one outcome, worked in the background |
+| `/loop` | you stop it (or it stops itself) | **no** — nobody is watching an iteration | a standing instruction, on a cadence |
+
+Jobs and loops look alike — both are detached processes running the same engine, and a loop
+iteration is literally a trimmed job runner — but the control model is opposite. **A job is
+condition-driven: "am I done yet?"** It persists, retries, and parks to ask you when it hits an
+ambiguity, because someone asked for that specific outcome. **A loop is time-driven: "is it time
+yet?"** Completion is incidental; an iteration is a bounded errand that reports and exits.
+
+That difference is why a loop iteration is told outright that nobody can answer it. A loop firing
+at 6am has no one to ask, so blocking would be a silent hang rather than a useful pause.
+
 ## Loops — durable scheduled work
 
 `/loop` runs a prompt repeatedly. Unlike an in-session timer, a loop **outlives the terminal**:

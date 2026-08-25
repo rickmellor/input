@@ -247,8 +247,8 @@ _HELP = [
     ]),
     ("Agents & autonomy", [
         ("/goal", "work autonomously toward exit criteria until met or hard-blocked"),
-        ("/jobs", "detached background jobs (build / run / review) + a status table"),
-        ("/loop", "durable scheduled work — repeats on a cadence, or paces itself, and survives exit"),
+        ("/jobs", "background work toward one outcome — ends when done; can park and ask you"),
+        ("/loop", "standing work on a cadence — survives exit, never asks; runs till you stop it"),
         ("/gate", "risk tolerance — how much auto-runs before review, live vs. dark"),
         ("mini-5s", "the agent delegates self-contained sub-tasks via sub-agents"),
     ]),
@@ -5482,7 +5482,10 @@ register(Tool(
     "loops",
     "Durable scheduled work. A loop is a prompt plus a cadence that keeps running after this "
     "conversation ends — use it for anything the user wants checked repeatedly or at a set time "
-    "('every morning', 'keep an eye on', 'check every 10 minutes'). Loops created in ANY session "
+    "('every morning', 'keep an eye on', 'check every 10 minutes'). NOT for work to do NOW — that "
+    "is `spawn_agent`. The test is WHEN, not how big: a loop is a standing instruction on a clock, "
+    "and one iteration cannot ask the user anything, so never put work needing a decision in one. "
+    "Loops created in ANY session "
     "are visible here, so you can report on and tend ones you did not create. Actions: "
     "list · show(id) · create(prompt[, every, seat, cwd]) · pause(id) · resume(id) · stop(id). "
     "In `create`, a cadence written into the prompt is understood ('10m check the build', "
