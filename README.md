@@ -39,10 +39,14 @@ Seats are displayed in one unit — **$/Mtok of output** — so local (electrici
 - **`/goal <criteria>`** — the agent works toward an exit criterion across as many tool
   rounds as it takes. It stops when the goal is met, when it hits a hard block (a secret, a
   destructive step, a decision only you can make) and asks, or when it stalls.
-- **`/jobs`** — detached background work with a status table: `run`, `build`, `review`,
-  plus `log`, `stop`, and `answer` for a job that got blocked.
-- **Sub-agents** — the agent delegates self-contained units of work to other seats. See
-  below.
+- **`/jobs`** — detached background work with a status table. A job is defined by a **goal
+  string**, or by a **MegaPlan id** (which generates one), plus presets that write the goal for
+  you: `run <goal>`, `build <plan>`, `aco-review <target>`, `status <plan>` (a read-only brief:
+  intent, what's done, what's left). `status <job-id>` still shows that job. Then `log`, `stop`,
+  and `answer` for a job that parked to ask you something.
+- **Sub-agents** — the agent delegates self-contained units of work to other seats, waiting for
+  the result. With `background: true` it detaches the work as a job instead, so the conversation
+  carries on and you read the outcome through `/jobs`. See below.
 - **`/sidebar`** — fork an aside without polluting the main thread; `/merge` folds its
   conclusion back, `/return` parks it.
 

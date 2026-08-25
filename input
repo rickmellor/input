@@ -196,7 +196,7 @@ def _route_hint_lines():
 # Per-command usage shown on Ctrl+R when the entry field holds a slash command.
 _CMD_HINTS = {
     "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
-    "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
+    "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · aco-review <target> · status <plan>",
     "/loop":    "<interval> <what to check> · <what to check> (self-paced) · (bare) list · show|log|run|pause|resume|stop|rm <id> · harden|unharden <id> · daemon",
     "/megaplan":    "<goal> · new · browse · load · show · save · work · complete · uncomplete · block · add · rename · remove · close   (alias: /plan)",
     "/plan":        "alias of /megaplan",
@@ -1665,6 +1665,21 @@ def _tool_spawn_agent(args):
         return f"Error: no such skill {skill!r}. Available: {', '.join(SKILLS) or '(none)'}"
     cwd = os.path.abspath(os.path.expanduser(a.get("cwd") or os.getcwd()))
     write = bool(a.get("write"))
+    if a.get("background"):
+        # Detach instead of blocking this turn: a background sub-agent IS a job, so hand it to the
+        # jobs machinery rather than growing a second one. The result never comes back to this turn
+        # — the user is notified at their next prompt, and /jobs is how they read it.
+        if not os.path.isdir(cwd):
+            return f"Error: cwd {cwd!r} does not exist — create it before backgrounding work there."
+        seat = (a.get("model") or "").strip() or (SKILLS.get(skill, {}).get("seat") or "") or "saint"
+        jid = submit_job("goal", task[:60], task, cwd=cwd, model=seat)
+        _JOBS_SEEN[jid] = "queued"
+        print(f"{DIM}  ● job {jid} — {task[:56]} (background){RESET}")
+        return (f"Started background job {jid}. It runs detached and its result will NOT come back "
+                f"to you in this turn — tell the user it is running and that `/jobs show {jid}` "
+                "reads it; they are also notified at their next prompt when it finishes. It has "
+                "write tools (risky commands park for `/jobs answer`), so do not background "
+                "anything you intended to keep read-only.")
     budget = int(a.get("budget_tokens") or 200_000)
     max_rounds = max(2, int(a.get("max_rounds") or SUBAGENT_MAX_ROUNDS))
     # model: explicit pin > skill's declared seat > (classify the brief) hard→reasoning_seat, else saint-auto
@@ -1731,7 +1746,11 @@ register(Tool(
     "sub-agent's final deliverable. A local seat may be a weak planner (johnny declares "
     "`guidance: roadmap` on it): for those, write `task` as an explicit ordered plan — name the "
     "files, give the steps in sequence, state the success condition — rather than posing an "
-    "open-ended question. Cloud seats take open briefs fine. NOTE the sub-agent's `bash` is "
+    "open-ended question. Cloud seats take open briefs fine. Set `background: true` for work the "
+    "user wants to continue WITHOUT waiting ('kick this off', 'in the background', 'while we carry "
+    "on') — it becomes a detached job, so you get a job id instead of a deliverable and must not "
+    "pretend to know its outcome. Background work always gets write tools, so keep read-only "
+    "investigation in the foreground. NOTE the sub-agent's `bash` is "
     "SHELL-LESS (one command per call; no pipes, redirects, globs, loops, `&&`/`;`; only a "
     "write=true agent gets `bash -c '…'`) — a brief that pastes a multi-command shell block "
     "cannot be run as written, so give commands one per step.",
@@ -1742,6 +1761,7 @@ register(Tool(
          "model": {"type": "string", "description": "optional seat/model pin (default saint-auto); e.g. cloud-flagship, cloud-large, coder"},
          "cwd": {"type": "string", "description": "working directory (default: current)"},
          "write": {"type": "boolean", "description": "grant write/edit + build tools (default: read-only)"},
+         "background": {"type": "boolean", "description": "detach as a job instead of waiting — the result does NOT return to this turn"},
          "budget_tokens": {"type": "integer", "description": "token guardrail (default 200000)"},
          "max_rounds": {"type": "integer", "description": "tool-round budget (default 24); raise for long source digs / multi-page research"}},
      "required": ["task"]},
@@ -6115,6 +6135,21 @@ def repl():
                     prog = f" {pct}% ({dn}/{tot})" if pct is not None else ""
                     toks = f" · {m.get('tokens_out', 0)}out" if m.get("tokens_out") else ""
                     print(f"{DIM}  {m['id']}  {col}{st:<8}{RESET}{DIM} {dur:>6}{prog}{toks}  {m.get('title', '')[:44]}{RESET}")
+            elif sub == "status" and rest and not _read_meta(rest.split()[0]):
+                # `status` means "how is X doing" for both kinds of X: an existing job id falls
+                # through to the viewer below; anything else is read as a MegaPlan and briefed.
+                pid = rest.split()[0]
+                goal = (f"Report where MegaPlan {pid!r} stands. Read it (megaplan get / review), then "
+                        "write a short brief with three parts: (1) INTENT — what this plan is for, in "
+                        "a sentence or two, from its goal/context prose rather than its task list; "
+                        "(2) DONE — what has actually been completed, grouped so it reads as progress "
+                        "rather than a checklist dump; (3) REMAINING — what is left, what is blocked "
+                        "and by what, and what you would pick up next and why. Read only: do NOT "
+                        "complete tasks, edit the plan, or change any state. You are done when the "
+                        "brief is written.")
+                jid = submit_job("goal", f"status {pid}", goal, cwd=os.getcwd())
+                _JOBS_SEEN[jid] = "queued"
+                print(f"{DIM}● job {jid} — summarising plan {pid} in the background · /jobs show {jid}{RESET}")
             elif sub in ("show", "status", "log", "tail") and rest:
                 jid = rest.split()[0]
                 m = _read_meta(jid)
@@ -6185,7 +6220,7 @@ def repl():
                 jid = submit_job("goal", rest[:60], rest, cwd=os.getcwd())
                 _JOBS_SEEN[jid] = "queued"
                 print(f"{DIM}● job {jid} — {rest[:50]} · /jobs show {jid}{RESET}")
-            elif sub == "review" and rest:      # ACO adversarial review as a background job
+            elif sub in ("aco-review", "review") and rest:   # 'review' kept: old muscle memory
                 tgt = rest.split()[0]
                 goal = (f"Use the aco_review tool to run an adversarial review of {tgt!r}, then "
                         "synthesize per the aco-review skill (accepted/refuted findings, verdict, "
