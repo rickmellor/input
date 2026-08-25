@@ -46,7 +46,8 @@ Seats are displayed in one unit — **$/Mtok of output** — so local (electrici
   `answer` for a job that parked to ask you something.
 - **Sub-agents** — the agent delegates self-contained units of work to other seats, waiting for
   the result. With `background: true` it detaches the work as a job instead, so the conversation
-  carries on and you read the outcome through `/jobs`. See below.
+  carries on; it can then read that job back with the `jobs` tool (list/show/log, read-only) to
+  collect the outcome or tell you a job has parked needing an answer. See below.
 - **`/sidebar`** — fork an aside without polluting the main thread; `/merge` folds its
   conclusion back, `/return` parks it.
 

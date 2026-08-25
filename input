@@ -1676,10 +1676,11 @@ def _tool_spawn_agent(args):
         _JOBS_SEEN[jid] = "queued"
         print(f"{DIM}  ● job {jid} — {task[:56]} (background){RESET}")
         return (f"Started background job {jid}. It runs detached and its result will NOT come back "
-                f"to you in this turn — tell the user it is running and that `/jobs show {jid}` "
-                "reads it; they are also notified at their next prompt when it finishes. It has "
-                "write tools (risky commands park for `/jobs answer`), so do not background "
-                "anything you intended to keep read-only.")
+                f"to you in this turn — tell the user it is running. Read it later with the `jobs` "
+                f"tool (`jobs(action='show', id='{jid}')`); they can also use `/jobs show {jid}` "
+                "and are notified at their next prompt when it finishes. It has write tools (risky "
+                "commands park for `/jobs answer`), so do not background anything you intended to "
+                "keep read-only.")
     budget = int(a.get("budget_tokens") or 200_000)
     max_rounds = max(2, int(a.get("max_rounds") or SUBAGENT_MAX_ROUNDS))
     # model: explicit pin > skill's declared seat > (classify the brief) hard→reasoning_seat, else saint-auto
@@ -5522,6 +5523,88 @@ register(Tool(
         "include_stopped": {"type": "boolean", "description": "list: include stopped loops"}},
      "required": ["action"]},
     _tool_loops))
+
+
+def _tool_jobs(args):
+    a = args or {}
+    action = (a.get("action") or "list").strip().lower()
+    jid = (a.get("id") or "").strip()
+
+    if action == "list":
+        js = list_jobs(include_done=bool(a.get("include_done", True)))
+        if not js:
+            return "no jobs."
+        out = []
+        for m in js:
+            st = job_state(m)
+            dur = _fmt_dur((m.get("ended") or time.time())
+                           - (m.get("started") or m.get("created") or time.time()))
+            dn, tot, pct = _job_progress(m)
+            prog = f" · {pct}% ({dn}/{tot})" if pct is not None else ""
+            out.append(f"{m['id']} · {st} · {dur}{prog} · {m.get('title', '')[:60]}"
+                       + (f"\n    BLOCKED, needs the user: {m.get('need', '')[:160]}"
+                          if st == "blocked" else ""))
+        return "\n".join(out)
+
+    if not jid:
+        return f"Error: '{action}' needs an `id`. Use action='list' to see them."
+    m = _read_meta(jid)
+    if not m:
+        return f"Error: no job {jid}."
+    st = job_state(m)
+
+    if action == "show":
+        dn, tot, pct = _job_progress(m)
+        head = (f"{jid} · {m.get('kind')} · {st} · {m.get('title', '')}\n"
+                f"  goal: {(m.get('goal') or '')[:300]}\n"
+                f"  cwd {m.get('cwd')} · model {m.get('model')} · "
+                f"{m.get('rounds', 0)} rounds · {m.get('tool_calls', 0)} tool calls"
+                + (f" · {pct}% ({dn}/{tot})" if pct is not None else ""))
+        if st == "blocked":
+            return head + (f"\n  BLOCKED — needs the user: {m.get('need', '')}\n"
+                           "  You cannot answer this; only the user can, with "
+                           f"`/jobs answer {jid} <text>`. Tell them what it needs.")
+        if st in ("failed", "dead"):
+            return head + f"\n  {st}: {str(m.get('error') or 'the process died without a result')[:300]}"
+        if st in ("queued", "running", "stalled"):
+            return head + f"\n  still {st} — no result yet; check again later rather than guessing."
+        try:
+            res = open(m["result_path"]).read()
+        except Exception:
+            res = ""
+        return head + (f"\n\n--- result ---\n{res[:4000]}" if res else "\n  (finished with no text)")
+
+    if action == "log":
+        p = os.path.join(_job_dir(jid), "log.jsonl")
+        rows = [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+        if not rows:
+            return f"{jid}: no log yet."
+        out = []
+        for r in rows[-int(a.get("limit") or 20):]:
+            when = datetime.fromtimestamp(r.get("t", 0)).strftime("%m-%d %H:%M:%S")
+            extra = {k: v for k, v in r.items() if k not in ("t", "kind") and v not in (None, "")}
+            out.append(f"{when}  {r.get('kind', ''):16} {json.dumps(extra)[:160]}")
+        return f"{jid} · {st}\n" + "\n".join(out)
+
+    return f"Error: unknown action {action!r}. Valid: list, show, log."
+
+
+register(Tool(
+    "jobs",
+    "Read back the background jobs on this machine — including ones you started with "
+    "`spawn_agent(background=true)` and ones from earlier sessions. Actions: list · show(id) · "
+    "log(id). Use it when the user asks how background work is going, or to collect the result of "
+    "something you kicked off. States: queued/running mean no result yet — say so rather than "
+    "guessing at the outcome; done carries the result text; failed/dead carry the error; BLOCKED "
+    "means the job stopped to ask a question that only the USER can answer (`/jobs answer <id>`), "
+    "so surface what it needs. This tool is READ-ONLY: it cannot start, stop or answer a job.",
+    {"type": "object", "properties": {
+        "action": {"type": "string", "description": "list | show | log"},
+        "id": {"type": "string", "description": "job id — required for show/log"},
+        "include_done": {"type": "boolean", "description": "list: include finished jobs (default true)"},
+        "limit": {"type": "integer", "description": "log: how many recent lines (default 20)"}},
+     "required": ["action"]},
+    _tool_jobs))
 
 
 # ---------------------------------------------------------------------------------------------
