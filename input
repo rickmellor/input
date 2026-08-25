@@ -1533,6 +1533,23 @@ def _agents_ticker(agents, stop):
         sys.stdout.write(f"\033[{drawn}A\r\033[J"); sys.stdout.flush()
 
 
+def seat_key(name):
+    """The SEATS/johnny name behind any spelling of a seat.
+
+    SAINT only honours a pin written as the full `saint-<backend>` id, so that is what callers
+    pass — but SEATS is keyed by the friendly name and johnny by the role ('coder', 'chat'), so
+    the full id matches neither and a seat looks unknown. Strip back to the common key:
+    'saint-local-coder' → 'local-coder' → 'coder'; 'saint-cloud-large' → 'cloud-large'."""
+    n = (name or "").strip()
+    if n in SEATS:
+        return n
+    n = n.removeprefix("saint-")
+    if n in SEATS:
+        return n
+    stripped = n.removeprefix("local-")     # SAINT calls it local-coder; johnny's role is 'coder'
+    return stripped if stripped in SEATS else n
+
+
 _SEAT_GUIDANCE_CACHE = {}      # (target) -> (expiry_ts, guidance|None); johnny resolve is a subprocess
 
 def seat_guidance(target, ttl=60.0):
@@ -1545,6 +1562,7 @@ def seat_guidance(target, ttl=60.0):
     8/8 bare, 2026-08-24). Correctness was unchanged at short horizons — this buys efficiency and
     margin, so it's an optimization, not a crutch. Best-effort: any failure returns None and the
     caller falls back to a bare brief."""
+    target = seat_key(target)
     now = time.monotonic()
     hit = _SEAT_GUIDANCE_CACHE.get(target)
     if hit and hit[0] > now:
@@ -1630,8 +1648,9 @@ def _tool_spawn_agent(args):
     if not model:
         model = agentic_seat(task)
     m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
-    guidance = seat_guidance(model if model in SEATS else m)
-    system = _subagent_system(cwd, skill, seat=(model if model in SEATS else None), model_id=m,
+    key = seat_key(model)
+    guidance = seat_guidance(key if key in SEATS else m)
+    system = _subagent_system(cwd, skill, seat=(key if key in SEATS else None), model_id=m,
                               write=write, max_rounds=max_rounds, guidance=guidance)
     if not os.path.isdir(cwd):
         # The orchestrator names the directory the work happens in; making it a precondition
