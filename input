@@ -35,7 +35,7 @@ Shell integration (! / !! prefixes, Ctrl-G): source input-shell.bash.
 """
 import json, math, os, platform, re, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.request, urllib.parse
 import io, concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DIM, BOLD, RED, YEL, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[33m", "\033[0m"
 ITAL, ULINE, CODE_FG = "\033[3m", "\033[4m", "\033[36m"
@@ -197,6 +197,7 @@ def _route_hint_lines():
 _CMD_HINTS = {
     "/build":   "<id> · bg (detached) · rerun (reopen+build) · reset (reopen only) · <model>",
     "/jobs":    "list · show <id> · log <id> · stop <id> · answer <id> <text> · build <plan> [rerun] · run <goal> · review",
+    "/loop":    "<interval> <what to check> · <what to check> (self-paced) · (bare) list · show|log|run|pause|resume|stop|rm <id> · harden|unharden <id> · daemon",
     "/megaplan":    "<goal> · new · browse · load · show · save · work · complete · uncomplete · block · add · rename · remove · close   (alias: /plan)",
     "/plan":        "alias of /megaplan",
     "/work":        "[tN] [go] focus a task of the loaded plan (picker if no id; go = build just it) · off",
@@ -247,6 +248,7 @@ _HELP = [
     ("Agents & autonomy", [
         ("/goal", "work autonomously toward exit criteria until met or hard-blocked"),
         ("/jobs", "detached background jobs (build / run / review) + a status table"),
+        ("/loop", "durable scheduled work — repeats on a cadence, or paces itself, and survives exit"),
         ("/gate", "risk tolerance — how much auto-runs before review, live vs. dark"),
         ("mini-5s", "the agent delegates self-contained sub-tasks via sub-agents"),
     ]),
@@ -4703,6 +4705,803 @@ def poll_jobs_notify():
 
 
 # ---------------------------------------------------------------------------------------------
+# Loops — durable scheduled work. A loop is a prompt plus a cadence. As with jobs, the FILESYSTEM
+# is the process table (~/.config/input/loops/<id>/), so any session — or the model, via the
+# `loops` tool — can inspect and manage a loop it did not create. Three moving parts:
+#   `input --loop <id>`  runs ONE iteration in a detached process (a trimmed sibling of run_job)
+#   `input --loopd`      the scheduler: sleeps until the next loop is due, then fires it
+#   /loop + `loops`      the manager surfaces (REPL and model-facing)
+# spec.json is the user's intent and changes rarely; state.json is rewritten every iteration —
+# separate files so a running loop can never clobber a spec edited by hand.
+_LOOPS_DIR = os.path.expanduser("~/.config/input/loops")
+_LOOP_MIN_DELAY = 60           # dynamic-pacing band, matching Claude Code's 1 min … 1 h
+_LOOP_MAX_DELAY = 3600
+_LOOP_HISTORY_TURNS = 10       # bounded rolling context — a week-long loop must not grow forever
+_LOOP_MAX_ROUNDS = 60          # one iteration is a bounded errand, not an open-ended goal
+_LOOP_STAGGER_S = 45           # catch-up fires spread this far apart (stampede control)
+_LOOP_MAX_CONCURRENT = 2       # iterations in flight at once — these are real model turns
+_LOOP_DEFAULT_CATCHUP = 12 * 3600
+
+
+# --- cadence parsing ---------------------------------------------------------------------------
+_LOOP_UNIT_S = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+                "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+                "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+                "d": 86400, "day": 86400, "days": 86400}
+_LOOP_DOW = {"monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
+             "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4, "fri": 4,
+             "saturday": 5, "sat": 5, "sunday": 6, "sun": 6}
+_LOOP_DAYSETS = {"day": None, "days": None, "daily": None,          # None = every day
+                 "weekday": [0, 1, 2, 3, 4], "weekdays": [0, 1, 2, 3, 4],
+                 "weekend": [5, 6], "weekends": [5, 6]}
+# "<dayspec> at <time>" — the dayspec is optional ("at 6am" = every day at 6am)
+_LOOP_CAL_RE = re.compile(
+    r"\b(?:(?:every|each)\s+)?(?:(?P<days>day|days|daily|weekday|weekdays|weekend|weekends|"
+    + "|".join(sorted(_LOOP_DOW, key=len, reverse=True)) + r")\s+)?"
+    r"at\s+(?P<h>\d{1,2})(?::(?P<mi>\d{2}))?\s*(?P<ap>am|pm)?\b", re.I)
+_LOOP_EVERY_RE = re.compile(r"\b(?:every|each)\s+(?P<n>\d+(?:\.\d+)?)?\s*(?P<u>[a-z]+)\b", re.I)
+_LOOP_LEAD_RE = re.compile(r"^(?P<n>\d+(?:\.\d+)?)\s*(?P<u>[a-z]+)\b", re.I)
+
+
+def _loop_hhmm(m):
+    """(hour, minute) from a parsed clock-time match, honouring am/pm. None if out of range."""
+    h, mi, ap = int(m.group("h")), int(m.group("mi") or 0), (m.group("ap") or "").lower()
+    if ap == "pm" and h != 12:
+        h += 12
+    elif ap == "am" and h == 12:
+        h = 0
+    return (h, mi) if 0 <= h < 24 and 0 <= mi < 60 else None
+
+
+def parse_schedule(text):
+    """(schedule, prompt) — lift a cadence out of `text`, returning the rest as the prompt.
+
+      '5m check the deploy'          -> {'kind':'interval','seconds':300}
+      'check the deploy every 2h'    -> {'kind':'interval','seconds':7200}
+      'weekdays at 9am, standup'     -> {'kind':'calendar','at':(9,0),'days':[0,1,2,3,4]}
+      'check the deploy'             -> {'kind':'dynamic'}   (the model paces itself)
+
+    Nothing recognised is dynamic rather than an error: an unparsed cadence should self-pace,
+    not refuse. Only ONE cadence is lifted — the first that matches, longest form first."""
+    t = (text or "").strip()
+    if not t:
+        return {"kind": "dynamic"}, ""
+
+    m = _LOOP_CAL_RE.search(t)                      # calendar wins: it is the most specific form
+    if m:
+        hm = _loop_hhmm(m)
+        if hm:
+            d = (m.group("days") or "day").lower()
+            days = _LOOP_DAYSETS[d] if d in _LOOP_DAYSETS else [_LOOP_DOW[d]]
+            rest = (t[:m.start()] + " " + t[m.end():]).strip(" ,.:;-")
+            return {"kind": "calendar", "at": list(hm), "days": days}, " ".join(rest.split())
+
+    for rx in (_LOOP_LEAD_RE, _LOOP_EVERY_RE):      # a bare leading '5m', then '… every 2 hours'
+        m = rx.search(t)
+        if m and m.group("u").lower() in _LOOP_UNIT_S:
+            n = float(m.group("n") or 1)
+            secs = int(n * _LOOP_UNIT_S[m.group("u").lower()])
+            if secs >= 1:
+                rest = (t[:m.start()] + " " + t[m.end():]).strip(" ,.:;-")
+                return {"kind": "interval", "seconds": max(_LOOP_MIN_DELAY, secs)}, " ".join(rest.split())
+
+    return {"kind": "dynamic"}, t
+
+
+def loop_next_fire(sched, after=None):
+    """Next epoch second for `sched`, strictly after `after` (default now). None for dynamic —
+    a dynamic loop's next fire is whatever its last iteration asked for via schedule_wakeup."""
+    now = after if after is not None else time.time()
+    kind = (sched or {}).get("kind")
+    if kind == "interval":
+        return now + max(_LOOP_MIN_DELAY, int(sched.get("seconds") or _LOOP_MIN_DELAY))
+    if kind == "calendar":
+        h, mi = (sched.get("at") or [9, 0])[:2]
+        days = sched.get("days")            # None = every day
+        base = datetime.fromtimestamp(now)
+        for step in range(8):               # today, then the next 7 days
+            cand = (base + timedelta(days=step)).replace(hour=h, minute=mi, second=0, microsecond=0)
+            # .timestamp() resolves via the local zone, so DST shifts are handled for us
+            if cand.timestamp() > now and (days is None or cand.weekday() in days):
+                return cand.timestamp()
+        return now + 86400
+    return None
+
+
+def describe_schedule(sched):
+    """One short human phrase for a cadence — used in listings and the prompt notice."""
+    kind = (sched or {}).get("kind")
+    if kind == "interval":
+        s = int(sched.get("seconds") or 0)
+        for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+            if s >= n and s % n == 0:
+                return f"every {s // n}{unit}"
+        return f"every {s}s"
+    if kind == "calendar":
+        h, mi = (sched.get("at") or [9, 0])[:2]
+        days, names = sched.get("days"), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        when = ("daily" if days is None else
+                "weekdays" if days == [0, 1, 2, 3, 4] else
+                "weekends" if days == [5, 6] else
+                ",".join(names[d] for d in days))
+        return f"{when} at {h:02d}:{mi:02d}"
+    return "self-paced"
+
+
+# --- the loop process table --------------------------------------------------------------------
+_LOOP_LOCK = threading.Lock()      # spec/state are read-modify-written from daemon + REPL + runner
+
+
+def _loop_dir(lid):
+    return os.path.join(_LOOPS_DIR, lid)
+
+
+def _loop_json(path, default=None):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return default
+
+
+def _loop_patch(path, patch):
+    """Atomic read-modify-write of one loop json (same tmp+rename discipline as _write_meta)."""
+    with _LOOP_LOCK:
+        d = _loop_json(path, {}) or {}
+        d.update(patch)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, path)
+        return d
+
+
+def loop_read(lid):
+    """{'id','spec','state'} for one loop, or None. Tolerates a half-written/absent state."""
+    d = _loop_dir(lid)
+    spec = _loop_json(os.path.join(d, "spec.json"))
+    if not spec:
+        return None
+    return {"id": lid, "spec": spec, "state": _loop_json(os.path.join(d, "state.json"), {}) or {}}
+
+
+def loop_write_spec(lid, **patch):
+    return _loop_patch(os.path.join(_loop_dir(lid), "spec.json"), patch)
+
+
+def loop_write_state(lid, **patch):
+    return _loop_patch(os.path.join(_loop_dir(lid), "state.json"), patch)
+
+
+def loop_log(lid, kind, **kw):
+    """Append one iteration event. Never raises — logging must not break a loop."""
+    try:
+        with open(os.path.join(_loop_dir(lid), "log.jsonl"), "a") as f:
+            f.write(json.dumps({"t": time.time(), "kind": kind, **kw}) + "\n")
+    except Exception:
+        pass
+
+
+def list_loops(include_stopped=True):
+    """Every loop on this host, oldest first. Skips unreadable dirs rather than failing."""
+    if not os.path.isdir(_LOOPS_DIR):
+        return []
+    out = []
+    for lid in os.listdir(_LOOPS_DIR):
+        rec = loop_read(lid)
+        if rec and (include_stopped or rec["spec"].get("state") != "stopped"):
+            out.append(rec)
+    return sorted(out, key=lambda r: r["spec"].get("created", 0))
+
+
+def loop_host():
+    """This machine's name — recorded on every loop so the process table says WHERE it runs.
+    Today every loop is local; the field exists so distributing loops across johnny-managed
+    nodes later is a join on this value, not a schema migration."""
+    try:
+        return os.uname().nodename
+    except Exception:
+        return "local"
+
+
+def create_loop(prompt, sched, seat=None, cwd=None, node=None, catchup_s=None):
+    """Write a new loop's spec + initial state. Returns its id. Does NOT fire it — the daemon
+    (or a hardened systemd timer) owns firing."""
+    lid = datetime.now().strftime("%H%M%S") + "-" + os.urandom(2).hex()
+    os.makedirs(os.path.join(_loop_dir(lid), "runs"), exist_ok=True)
+    if catchup_s is None:                    # a missed fire older than this is skipped, not run
+        catchup_s = (max(2 * int(sched.get("seconds") or 0), _LOOP_DEFAULT_CATCHUP)
+                     if sched.get("kind") == "interval" else _LOOP_DEFAULT_CATCHUP)
+    loop_write_spec(lid, id=lid, prompt=prompt, schedule=sched, seat=seat,
+                    cwd=os.path.abspath(cwd or os.getcwd()), node=node or loop_host(),
+                    state="armed", catchup_s=int(catchup_s), hardened=False,
+                    created=time.time())
+    loop_write_state(lid, next_fire=loop_next_fire(sched) or (time.time() + _LOOP_MIN_DELAY),
+                     runs=0, noop_streak=0, last_fire=None, last_result=None, reason=None)
+    loop_log(lid, "created", prompt=prompt[:200], schedule=describe_schedule(sched))
+    return lid
+
+
+def loop_status(rec):
+    """Live label for a loop: its recorded state, refined by what the clock says."""
+    spec, st = rec["spec"], rec["state"]
+    s = spec.get("state", "armed")
+    if s != "armed":
+        return s                                   # paused / stopped are absolute
+    nf = st.get("next_fire")
+    if not nf:
+        return "waiting"                           # dynamic loop that has not been paced yet
+    return "due" if nf <= time.time() else "armed"
+
+
+# --- one iteration -----------------------------------------------------------------------------
+_LOOP_DIRECTIVE = (
+    "You are ONE ITERATION of a recurring loop, running unattended — nobody is watching this turn "
+    "and nobody can answer a question. Do the work described below, then report ONLY what changed "
+    "or what needs a person. Be brief: a quiet iteration should be a single line.\n"
+    "Finish by calling `schedule_wakeup` exactly once — pass `noop: true` when nothing changed (so "
+    "a quiet loop stays quiet instead of nagging), `stop: true` when the loop's purpose is "
+    "permanently served, and on a self-paced loop set `delay_seconds` to when it is next worth "
+    "looking, with a one-line reason.\n"
+    "If you are blocked, say so in one line and stop — do NOT ask a question, and do NOT take a "
+    "destructive or irreversible action to get unblocked."
+)
+
+
+# A weaker seat sometimes WRITES the call instead of making it ("schedule_wakeup(noop=true)").
+# The cadence never depends on the tool — but noop/stop do, so accept the written form too, the
+# same way /goal accepts a `GOAL MET:` line. Markers are stripped from the reported text.
+_MARK = r"[ \t>*`_\-]*"        # models wrap the written form in backticks, bullets or emphasis
+_LOOP_NOOP_RE = re.compile(
+    _MARK + r"(?:schedule_wakeup\s*\([^)]*\bnoop\s*[=:]\s*true[^)]*\)|NOOP)" + _MARK + r"[.]?\s*$",
+    re.M | re.I)
+_LOOP_STOP_RE = re.compile(
+    _MARK + r"(?:schedule_wakeup\s*\([^)]*\bstop\s*[=:]\s*true[^)]*\)|STOP)" + _MARK + r"[.]?\s*$",
+    re.M | re.I)
+_LOOP_CALL_RE = re.compile(
+    r"^" + _MARK + r"(?:schedule_wakeup\s*\([^)]*\)|NOOP|STOP)" + _MARK + r"[.]?[ \t]*$", re.M)
+
+
+def _loop_markers(text):
+    """(clean_text, noop, stop) — read a written-out schedule_wakeup and drop it from the text."""
+    t = text or ""
+    noop, stop = bool(_LOOP_NOOP_RE.search(t)), bool(_LOOP_STOP_RE.search(t))
+    return _LOOP_CALL_RE.sub("", t).strip(), noop, stop
+
+
+def _loop_wakeup_tool(lid, dynamic):
+    """A `schedule_wakeup` bound to ONE loop. Registered only inside that loop's runner process,
+    so there is no cross-talk between concurrent iterations."""
+    band = (f"How long to wait before the next iteration ({_LOOP_MIN_DELAY}-{_LOOP_MAX_DELAY}s). "
+            if dynamic else
+            "Ignored — this loop runs on a fixed cadence; use noop/stop instead. ")
+
+    def run(args):
+        a = args or {}
+        patch = {"reason": (str(a.get("reason") or "")).strip()[:200] or None}
+        if a.get("stop"):
+            loop_write_spec(lid, state="stopped")
+            loop_log(lid, "stopped_by_model", reason=patch["reason"])
+            patch["stopped"] = True
+            loop_write_state(lid, **patch)
+            return "loop stopped — it will not fire again."
+        patch["noop"] = bool(a.get("noop"))
+        if dynamic and a.get("delay_seconds") is not None:
+            try:
+                d = int(float(a["delay_seconds"]))
+            except (TypeError, ValueError):
+                return "Error: delay_seconds must be a number of seconds."
+            d = max(_LOOP_MIN_DELAY, min(_LOOP_MAX_DELAY, d))
+            patch["next_fire"] = time.time() + d
+            loop_write_state(lid, **patch)
+            return f"next iteration in {d}s."
+        loop_write_state(lid, **patch)
+        return "noted." if patch["noop"] else "ok."
+
+    return Tool("schedule_wakeup",
+                "Set when this loop should next run, or end it. Call exactly once per iteration.",
+                {"type": "object", "properties": {
+                    "delay_seconds": {"type": "integer", "description": band},
+                    "reason": {"type": "string", "description": "one line on why this cadence / what you saw"},
+                    "noop": {"type": "boolean", "description": "nothing changed this iteration — stay quiet"},
+                    "stop": {"type": "boolean", "description": "the loop's purpose is served; do not run again"}},
+                 "required": []},
+                run)
+
+
+def _loop_history(lid, keep=_LOOP_HISTORY_TURNS):
+    """The loop's rolling context, trimmed. A loop can run for weeks; unbounded history would
+    eventually blow the seat's window, and old iterations carry little signal."""
+    h = _loop_json(os.path.join(_loop_dir(lid), "history.json"), []) or []
+    return h[-keep * 2:] if keep else []
+
+
+def run_loop_once(lid):
+    """Entry for `input --loop <id>` — run ONE iteration in this (detached) process."""
+    rec = loop_read(lid)
+    if not rec:
+        print(f"no such loop: {lid}", file=sys.stderr)
+        return 2
+    spec = rec["spec"]                     # state is re-read after the run (schedule_wakeup writes it)
+    if spec.get("state") != "armed":
+        loop_log(lid, "skipped_not_armed", state=spec.get("state"))
+        return 0
+
+    sched = spec.get("schedule") or {"kind": "dynamic"}
+    dynamic = sched.get("kind") == "dynamic"
+    cwd = spec.get("cwd") or os.getcwd()
+    if not os.path.isdir(cwd):                       # the directory may have been removed
+        loop_log(lid, "failed", error=f"cwd is gone: {cwd}")
+        loop_write_state(lid, last_result=f"cwd is gone: {cwd}",
+                         next_fire=loop_next_fire(sched) or (time.time() + _LOOP_MAX_DELAY))
+        return 1
+
+    load_user_tools(); load_mcp_tools(); apply_tools_state(); discover_skills(cwd)
+    sb = Sandbox(root=cwd, allow=SANDBOX_DEV)
+    register(_loop_wakeup_tool(lid, dynamic))
+    tools = [t for t in TOOLS.values() if t.enabled] + sandbox_tools(sb, write=True)
+
+    # Iterations default to a CHEAP LOCAL seat: polling is mechanical, and the local fleet costs
+    # only electricity. A loop that needs more can pin `seat` when it is created.
+    seat = spec.get("seat") or _pick_seat("chat", "coder", "saint")
+    mo, bo = _resolve_seat(seat) or SEATS.get("saint") or (MODEL, BASE)
+
+    started = time.time()
+    loop_write_state(lid, last_fire=started, pid=os.getpid(), reason=None, noop=False, stopped=False)
+    loop_log(lid, "fired", seat=seat, model=mo)
+
+    system = stable_context() + "\n\n" + _LOOP_DIRECTIVE
+    res = run_thread(spec["prompt"], history=_loop_history(lid), system=system, model=mo, base=bo,
+                     tools=tools, quiet=True, gate=False,
+                     dark={"tol": gate_tolerance(dark=True), "approved": None},
+                     max_rounds=_LOOP_MAX_ROUNDS, session="loop-" + lid)
+
+    text, said_noop, said_stop = _loop_markers(res.get("text") or "")
+    after = loop_read(lid) or rec                     # schedule_wakeup may have moved state/spec
+    sd, ss = after["spec"], after["state"]
+    noop = bool(ss.get("noop")) or said_noop
+    if said_stop and not ss.get("stopped"):           # it asked to stop, in prose
+        loop_write_spec(lid, state="stopped")
+        loop_log(lid, "stopped_by_model", reason="written schedule_wakeup(stop=true)")
+        sd = (loop_read(lid) or after)["spec"]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if text:
+        try:
+            open(os.path.join(_loop_dir(lid), "runs", stamp + ".md"), "w").write(text)
+        except Exception:
+            pass
+    try:                                              # keep the rolling context bounded
+        hist = (res.get("history") or [])[-_LOOP_HISTORY_TURNS * 2:]
+        json.dump(hist, open(os.path.join(_loop_dir(lid), "history.json"), "w"))
+    except Exception:
+        pass
+
+    patch = {"runs": int(ss.get("runs") or 0) + 1, "pid": None,
+             "last_result": text[:2000] or None, "last_run_file": stamp + ".md",
+             "noop_streak": (int(ss.get("noop_streak") or 0) + 1) if noop else 0,
+             "last_error": res.get("error") or None}
+    if sd.get("state") == "armed":                    # the model may have stopped the loop
+        if not dynamic:
+            patch["next_fire"] = loop_next_fire(sched)          # fixed cadence: from the clock
+        elif not ss.get("next_fire") or ss["next_fire"] <= started:
+            patch["next_fire"] = time.time() + _LOOP_MAX_DELAY  # self-paced but silent → fall back
+            patch["reason"] = ss.get("reason") or "no pace set — falling back to 1h"
+    loop_write_state(lid, **patch)
+    loop_log(lid, "error" if res.get("error") else ("noop" if noop else "result"),
+             error=res.get("error"), text=text[:400], secs=round(time.time() - started, 1))
+    return 0
+
+
+# --- the scheduler daemon ----------------------------------------------------------------------
+_LOOPD_TICK = 20            # also wake this often, so a loop created mid-sleep is picked up
+
+
+def loop_is_ours(rec):
+    """Does THIS daemon own the firing of this loop? Not if it is stopped/paused, hardened into
+    its own systemd timer, or (future, t34) placed on another node."""
+    spec = rec["spec"]
+    return (spec.get("state") == "armed" and not spec.get("hardened")
+            and (spec.get("node") or loop_host()) == loop_host())
+
+
+def loop_fire(lid):
+    """Spawn one detached iteration. Provisionally advances next_fire first so a long-running
+    iteration can never be double-fired by the next tick; the runner writes the real value."""
+    rec = loop_read(lid)
+    if not rec:
+        return None
+    sched = rec["spec"].get("schedule") or {"kind": "dynamic"}
+    loop_write_state(lid, next_fire=(loop_next_fire(sched) or time.time() + _LOOP_MAX_DELAY))
+    out = open(os.path.join(_loop_dir(lid), "runner.out"), "a")
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--loop", lid],
+                         stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+    return p
+
+
+def loopd_catchup(now=None):
+    """Guarded catch-up for fires missed while the box was off. Three guards, because one is not
+    enough: COALESCE (next_fire is a single timestamp, so a week of missed fires is one fire, not
+    a week of them), STALENESS (a fire older than the loop's catchup_s is worthless — skip it and
+    say so rather than running a week-late 'did the deploy finish'), and STAGGER (spread the
+    survivors so a morning boot doesn't start ten model turns at once)."""
+    now = now or time.time()
+    due = []
+    for rec in list_loops(include_stopped=False):
+        if not loop_is_ours(rec):
+            continue
+        nf = rec["state"].get("next_fire")
+        if not nf or nf > now:
+            continue
+        lid, sched = rec["id"], (rec["spec"].get("schedule") or {"kind": "dynamic"})
+        age = now - nf
+        if age > int(rec["spec"].get("catchup_s") or _LOOP_DEFAULT_CATCHUP):
+            loop_write_state(lid, next_fire=(loop_next_fire(sched) or now + _LOOP_MAX_DELAY))
+            loop_log(lid, "skipped_stale", late_s=int(age),
+                     catchup_s=int(rec["spec"].get("catchup_s") or _LOOP_DEFAULT_CATCHUP))
+            continue
+        due.append((nf, lid, int(age)))
+    for i, (_, lid, age) in enumerate(sorted(due)):        # oldest first, then staggered
+        loop_write_state(lid, next_fire=now + i * _LOOP_STAGGER_S)
+        loop_log(lid, "catchup_scheduled", late_s=age, in_s=i * _LOOP_STAGGER_S)
+    return len(due)
+
+
+def run_loopd():
+    """Entry for `input --loopd`. Sleeps until the next loop is due and fires it. One process for
+    every non-hardened loop; supervised by a single systemd unit."""
+    os.makedirs(_LOOPS_DIR, exist_ok=True)
+    n = loopd_catchup()
+    print(f"loopd: started (pid {os.getpid()}); {n} loop(s) scheduled for catch-up", flush=True)
+    live = {}                                          # lid -> Popen of an in-flight iteration
+    while True:
+        for lid, p in list(live.items()):              # reap finished iterations
+            if p.poll() is not None:
+                live.pop(lid, None)
+        now = time.time()
+        recs = [r for r in list_loops(include_stopped=False) if loop_is_ours(r)]
+        for rec in sorted(recs, key=lambda r: r["state"].get("next_fire") or 0):
+            if len(live) >= _LOOP_MAX_CONCURRENT:
+                break                                  # concurrency cap — these are model turns
+            lid, nf = rec["id"], rec["state"].get("next_fire")
+            if lid in live or not nf or nf > now:
+                continue
+            p = loop_fire(lid)
+            if p:
+                live[lid] = p
+                print(f"loopd: fired {lid} ({rec['spec'].get('prompt','')[:60]})", flush=True)
+        nxt = [r["state"].get("next_fire") for r in recs if r["state"].get("next_fire")]
+        sleep_s = max(1.0, min(_LOOPD_TICK, (min(nxt) - time.time()) if nxt else _LOOPD_TICK))
+        time.sleep(sleep_s)
+
+
+# --- hardening: promote one loop to its own systemd timer ---------------------------------------
+_LOOP_UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
+
+
+def _loop_oncalendar(sched):
+    """A systemd OnCalendar= expression for a calendar cadence, else None."""
+    if (sched or {}).get("kind") != "calendar":
+        return None
+    h, mi = (sched.get("at") or [9, 0])[:2]
+    days, names = sched.get("days"), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    when = ("" if days is None else
+            "Mon..Fri " if days == [0, 1, 2, 3, 4] else
+            "Sat,Sun " if days == [5, 6] else
+            ",".join(names[d] for d in days) + " ")
+    return f"{when}*-*-* {h:02d}:{mi:02d}:00"
+
+
+def loop_harden(lid):
+    """Give a loop its own systemd timer so it survives the daemon dying. (ok, message)."""
+    rec = loop_read(lid)
+    if not rec:
+        return False, f"no loop {lid}"
+    sched = rec["spec"].get("schedule") or {}
+    if sched.get("kind") == "dynamic":
+        return False, "a self-paced loop has no fixed cadence to hand systemd — give it an interval first"
+    if sched.get("kind") == "interval":
+        timing = f"OnBootSec=2min\nOnUnitActiveSec={int(sched['seconds'])}s"
+    else:
+        timing = f"OnCalendar={_loop_oncalendar(sched)}\nPersistent=true"
+    os.makedirs(_LOOP_UNIT_DIR, exist_ok=True)
+    svc = os.path.join(_LOOP_UNIT_DIR, f"input-loop@{lid}.service")
+    tmr = os.path.join(_LOOP_UNIT_DIR, f"input-loop@{lid}.timer")
+    open(svc, "w").write(
+        f"[Unit]\nDescription=input loop {lid}\n\n[Service]\nType=oneshot\n"
+        f"ExecStart={sys.executable} {os.path.abspath(__file__)} --loop {lid}\n")
+    open(tmr, "w").write(
+        f"[Unit]\nDescription=input loop {lid} ({describe_schedule(sched)})\n\n"
+        f"[Timer]\n{timing}\n\n[Install]\nWantedBy=timers.target\n")
+    for cmd in (["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "enable", "--now", f"input-loop@{lid}.timer"]):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            return False, f"{' '.join(cmd[-2:])}: {(r.stderr or '').strip()[:160]}"
+    loop_write_spec(lid, hardened=True)
+    loop_log(lid, "hardened", unit=f"input-loop@{lid}.timer")
+    return True, f"hardened — systemd now fires it ({describe_schedule(sched)}); the daemon will skip it"
+
+
+def loop_unharden(lid):
+    """Hand a loop back to the daemon and remove its units. (ok, message)."""
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"input-loop@{lid}.timer"],
+                   capture_output=True, text=True)
+    for suf in (".service", ".timer"):
+        try:
+            os.remove(os.path.join(_LOOP_UNIT_DIR, f"input-loop@{lid}{suf}"))
+        except FileNotFoundError:
+            pass
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+    loop_write_spec(lid, hardened=False)
+    loop_log(lid, "unhardened")
+    return True, "back under the loop daemon"
+
+
+# --- prompt-time notifier ------------------------------------------------------------------------
+_LOOPS_SEEN = {}    # lid -> runs count we have already surfaced
+
+
+def poll_loops_notify():
+    """Surface a loop iteration that produced something. A quiet loop stays quiet: consecutive
+    no-op iterations are counted, never printed."""
+    for rec in list_loops():
+        lid, st, spec = rec["id"], rec["state"], rec["spec"]
+        runs = int(st.get("runs") or 0)
+        prev = _LOOPS_SEEN.get(lid)
+        _LOOPS_SEEN[lid] = runs
+        if prev is None or runs <= prev:
+            continue                                   # first sight, or nothing new
+        if st.get("last_error"):
+            print(f"\n{RED_VIVID}⟲ loop {lid} errored{RESET}{DIM} — {str(st['last_error'])[:70]}  (/loop show {lid}){RESET}")
+        elif spec.get("state") == "stopped":
+            print(f"\n{GREEN_BUILD}⟲ loop {lid} finished{RESET}{DIM} and stopped itself — {(st.get('last_result') or '')[:60]}{RESET}")
+        elif not st.get("noop"):
+            head = " ".join((st.get("last_result") or "").split())[:88]
+            print(f"\n{CODE_FG}⟲ loop {lid}{RESET}{DIM} · run {runs} — {head}  (/loop show {lid}){RESET}")
+
+
+# --- the /loop command ---------------------------------------------------------------------------
+_LOOP_SUBS = ("list", "ls", "show", "log", "pause", "resume", "stop", "rm", "delete",
+              "harden", "unharden", "run", "daemon")
+
+
+def _loop_fmt_in(ts):
+    """'in 4m' / '2h ago' / '—' for a next-fire timestamp."""
+    if not ts:
+        return "—"
+    d = ts - time.time()
+    return ("in " + _fmt_dur(d)) if d >= 0 else (_fmt_dur(-d) + " ago")
+
+
+def _loop_command(rest):
+    """/loop — create, list and manage durable scheduled work."""
+    parts = (rest or "").split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    _ST = {"armed": CODE_FG, "due": YEL, "waiting": DIM, "paused": DIM, "stopped": DIM}
+
+    if sub and sub not in _LOOP_SUBS:                    # not a subcommand → it's a new loop
+        sched, prompt = parse_schedule(rest)
+        if not prompt:
+            print(f"{DIM}/loop needs something to do — e.g. /loop 10m check if the bench finished{RESET}"); return
+        lid = create_loop(prompt, sched)
+        _LOOPS_SEEN[lid] = 0
+        rec = loop_read(lid)
+        print(f"{CODE_FG}⟲ loop {lid}{RESET}{DIM} · {describe_schedule(sched)} · "
+              f"next {_loop_fmt_in(rec['state'].get('next_fire'))} · seat {rec['spec'].get('seat') or 'local'}{RESET}")
+        print(f"{DIM}  {prompt[:96]}{RESET}")
+        if not _loopd_alive():
+            print(f"{DIM}  ⚠ the loop daemon is not running — start it with /loop daemon{RESET}")
+        return
+
+    if sub in ("", "list", "ls"):
+        loops = list_loops()
+        if not loops:
+            print(f"{DIM}no loops — /loop 10m <what to check> · /loop <what to check> self-paces{RESET}"); return
+        print(f"{DIM}{'id':14}{'state':9}{'cadence':20}{'next':12}{'runs':6}what{RESET}")
+        for rec in loops:
+            lid, spec, st = rec["id"], rec["spec"], rec["state"]
+            s = loop_status(rec)
+            hard = "⚓" if spec.get("hardened") else " "
+            print(f"{DIM}{lid:14}{_ST.get(s, DIM)}{s:<9}{RESET}{DIM}{describe_schedule(spec.get('schedule')):20}"
+                  f"{_loop_fmt_in(st.get('next_fire')):12}{str(st.get('runs') or 0):6}{hard}{spec.get('prompt','')[:40]}{RESET}")
+        if not _loopd_alive():
+            print(f"{DIM}  ⚠ loop daemon not running — /loop daemon{RESET}")
+        return
+
+    if sub == "daemon":
+        ok, msg = _loopd_start()
+        print(f"{DIM}{msg}{RESET}"); return
+
+    if not arg and sub in ("show", "log", "pause", "resume", "stop", "rm", "delete", "harden",
+                           "unharden", "run"):
+        print(f"{DIM}/loop {sub} needs a loop id — /loop to list them{RESET}"); return
+    lid = arg.split()[0] if arg else ""
+    rec = loop_read(lid)
+    if not rec:
+        print(f"{DIM}no loop {lid}{RESET}"); return
+    spec, st = rec["spec"], rec["state"]
+
+    if sub == "show":
+        print(f"{DIM}{lid} · {_ST.get(loop_status(rec), DIM)}{loop_status(rec)}{RESET}"
+              f"{DIM} · {describe_schedule(spec.get('schedule'))}"
+              f"{' · ⚓ hardened (own systemd timer)' if spec.get('hardened') else ''}{RESET}")
+        print(f"{DIM}  {spec.get('prompt','')}{RESET}")
+        print(f"{DIM}  cwd {spec.get('cwd')} · seat {spec.get('seat') or 'local (default)'} · "
+              f"node {spec.get('node')} · runs {st.get('runs') or 0} · next {_loop_fmt_in(st.get('next_fire'))}{RESET}")
+        if st.get("reason"):
+            print(f"{DIM}  pace: {st['reason']}{RESET}")
+        if st.get("noop_streak"):
+            print(f"{DIM}  {st['noop_streak']} quiet iteration(s) in a row{RESET}")
+        if st.get("last_error"):
+            print(f"{RED_VIVID}  error: {str(st['last_error'])[:160]}{RESET}")
+        if st.get("last_result"):
+            print(f"\n{st['last_result'][:1500]}")
+        return
+
+    if sub == "log":
+        p = os.path.join(_loop_dir(lid), "log.jsonl")
+        rows = [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+        for r in rows[-25:]:
+            when = datetime.fromtimestamp(r.get("t", 0)).strftime("%m-%d %H:%M")
+            extra = {k: v for k, v in r.items() if k not in ("t", "kind") and v not in (None, "")}
+            print(f"{DIM}  {when}  {r.get('kind',''):18} {json.dumps(extra)[:96]}{RESET}")
+        if not rows:
+            print(f"{DIM}  (no log yet){RESET}")
+        return
+
+    if sub in ("pause", "resume"):
+        loop_write_spec(lid, state="paused" if sub == "pause" else "armed")
+        if sub == "resume" and not st.get("next_fire"):
+            loop_write_state(lid, next_fire=loop_next_fire(spec.get("schedule")) or time.time() + _LOOP_MIN_DELAY)
+        print(f"{DIM}loop {lid} {'paused' if sub == 'pause' else 'resumed'}{RESET}"); return
+
+    if sub == "stop":
+        loop_write_spec(lid, state="stopped")
+        loop_log(lid, "stopped_by_user")
+        print(f"{DIM}loop {lid} stopped — /loop rm {lid} to delete it{RESET}"); return
+
+    if sub in ("rm", "delete"):
+        if spec.get("hardened"):
+            loop_unharden(lid)
+        shutil.rmtree(_loop_dir(lid), ignore_errors=True)
+        _LOOPS_SEEN.pop(lid, None)
+        print(f"{DIM}loop {lid} deleted{RESET}"); return
+
+    if sub in ("harden", "unharden"):
+        ok, msg = (loop_harden if sub == "harden" else loop_unharden)(lid)
+        print(f"{DIM if ok else RED_VIVID}{msg}{RESET}"); return
+
+    if sub == "run":                                     # fire one iteration right now
+        loop_write_state(lid, next_fire=time.time())
+        p = loop_fire(lid)
+        print(f"{DIM}loop {lid} fired now (pid {p.pid if p else '?'}) — /loop show {lid}{RESET}"); return
+
+
+def _loopd_alive():
+    """Is a loop daemon running for this user? systemd is asked first — it is authoritative and
+    can't be fooled. The pgrep fallback (for a hand-started daemon) uses a bracketed pattern so
+    it cannot match the shell that is running the check itself."""
+    r = subprocess.run(["systemctl", "--user", "is-active", "input-loopd.service"],
+                       capture_output=True, text=True)
+    if (r.stdout or "").strip() == "active":
+        return True
+    try:
+        r = subprocess.run(["pgrep", "-f", "-u", str(os.getuid()), r"[-]-loopd"],
+                           capture_output=True, text=True, timeout=4)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _loopd_start():
+    """Install (if needed) and start the loop daemon's systemd unit. (ok, message)."""
+    if _loopd_alive():
+        return True, "loop daemon already running"
+    os.makedirs(_LOOP_UNIT_DIR, exist_ok=True)
+    unit = os.path.join(_LOOP_UNIT_DIR, "input-loopd.service")
+    if not os.path.exists(unit):
+        open(unit, "w").write(
+            "[Unit]\nDescription=input loop scheduler\nAfter=network-online.target\n\n"
+            "[Service]\nType=simple\n"
+            f"ExecStart={sys.executable} {os.path.abspath(__file__)} --loopd\n"
+            "Restart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+    r = subprocess.run(["systemctl", "--user", "enable", "--now", "input-loopd.service"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        return False, f"could not start the loop daemon: {(r.stderr or '').strip()[:160]}"
+    return True, "loop daemon started (systemd user unit input-loopd.service)"
+
+
+def _tool_loops(args):
+    a = args or {}
+    action = (a.get("action") or "list").strip().lower()
+    lid = (a.get("id") or "").strip()
+
+    if action == "list":
+        loops = list_loops(include_stopped=bool(a.get("include_stopped")))
+        if not loops:
+            return "no loops."
+        out = []
+        for rec in loops:
+            spec, st = rec["spec"], rec["state"]
+            out.append(f"{rec['id']} · {loop_status(rec)} · {describe_schedule(spec.get('schedule'))} · "
+                       f"next {_loop_fmt_in(st.get('next_fire'))} · runs {st.get('runs') or 0}"
+                       f"{' · hardened' if spec.get('hardened') else ''} · node {spec.get('node')}"
+                       f"\n    {spec.get('prompt', '')[:150]}")
+        return "\n".join(out)
+
+    if action == "create":
+        text = (a.get("prompt") or "").strip()
+        if not text:
+            return "Error: create needs a `prompt` (optionally with a cadence, e.g. '10m check the build')."
+        sched, prompt = parse_schedule(f"{a.get('every', '')} {text}".strip())
+        if not prompt:
+            return "Error: nothing to do — the prompt was only a cadence."
+        new = create_loop(prompt, sched, seat=(a.get("seat") or None), cwd=a.get("cwd"))
+        rec = loop_read(new)
+        warn = "" if _loopd_alive() else "  NOTE: the loop daemon is not running; tell the user to run /loop daemon."
+        return (f"created loop {new} · {describe_schedule(sched)} · "
+                f"next {_loop_fmt_in(rec['state'].get('next_fire'))}{warn}")
+
+    if not lid:
+        return f"Error: '{action}' needs an `id`. Use action='list' to see them."
+    rec = loop_read(lid)
+    if not rec:
+        return f"Error: no loop {lid}."
+    spec, st = rec["spec"], rec["state"]
+
+    if action == "show":
+        p = os.path.join(_loop_dir(lid), "log.jsonl")
+        rows = [json.loads(l) for l in open(p)][-8:] if os.path.exists(p) else []
+        log = "\n".join(f"    {datetime.fromtimestamp(r.get('t', 0)):%m-%d %H:%M} {r.get('kind')}"
+                        for r in rows)
+        return (f"{lid} · {loop_status(rec)} · {describe_schedule(spec.get('schedule'))}\n"
+                f"  prompt: {spec.get('prompt', '')}\n"
+                f"  cwd {spec.get('cwd')} · seat {spec.get('seat') or 'local (default)'} · node {spec.get('node')}\n"
+                f"  runs {st.get('runs') or 0} · quiet streak {st.get('noop_streak') or 0} · "
+                f"next {_loop_fmt_in(st.get('next_fire'))}"
+                + (f"\n  pace: {st['reason']}" if st.get("reason") else "")
+                + (f"\n  error: {st['last_error']}" if st.get("last_error") else "")
+                + (f"\n  last result: {(st.get('last_result') or '')[:800]}" if st.get("last_result") else "")
+                + (f"\n  recent:\n{log}" if log else ""))
+
+    if action in ("pause", "resume", "stop"):
+        was = {"pause": "paused", "resume": "resumed", "stop": "stopped"}[action]
+        loop_write_spec(lid, state={"pause": "paused", "resume": "armed", "stop": "stopped"}[action])
+        if action == "resume" and not st.get("next_fire"):
+            loop_write_state(lid, next_fire=loop_next_fire(spec.get("schedule")) or time.time() + _LOOP_MIN_DELAY)
+        loop_log(lid, was + "_by_model")
+        return f"loop {lid} {was}."
+
+    return f"Error: unknown action {action!r}. Valid: list, show, create, pause, resume, stop."
+
+
+register(Tool(
+    "loops",
+    "Durable scheduled work. A loop is a prompt plus a cadence that keeps running after this "
+    "conversation ends — use it for anything the user wants checked repeatedly or at a set time "
+    "('every morning', 'keep an eye on', 'check every 10 minutes'). Loops created in ANY session "
+    "are visible here, so you can report on and tend ones you did not create. Actions: "
+    "list · show(id) · create(prompt[, every, seat, cwd]) · pause(id) · resume(id) · stop(id). "
+    "In `create`, a cadence written into the prompt is understood ('10m check the build', "
+    "'every day at 6am …'); with no cadence the loop paces itself between 1 minute and 1 hour. "
+    "Iterations run on a cheap local seat unless `seat` says otherwise. Prefer ONE loop that does "
+    "several checks over several near-identical loops.",
+    {"type": "object", "properties": {
+        "action": {"type": "string", "description": "list | show | create | pause | resume | stop"},
+        "id": {"type": "string", "description": "loop id — required for show/pause/resume/stop"},
+        "prompt": {"type": "string", "description": "create: what each iteration should do"},
+        "every": {"type": "string", "description": "create: optional cadence ('15m', 'every day at 6am')"},
+        "seat": {"type": "string", "description": "create: optional seat pin; omit for the cheap local default"},
+        "cwd": {"type": "string", "description": "create: working directory (default: current)"},
+        "include_stopped": {"type": "boolean", "description": "list: include stopped loops"}},
+     "required": ["action"]},
+    _tool_loops))
+
+
+# ---------------------------------------------------------------------------------------------
 # Session persistence — the conversation thread survives exit/restart.
 #   snapshot: ~/.config/input/sessions/<SESSION>.json (after every turn, on /goal changes, at exit)
 #   resume:   `input --resume [id|last]`, `input --sessions`, in-REPL /sessions [list|resume <id>|save]
@@ -5132,6 +5931,8 @@ def repl():
         print(f"{DIM}{mem_status}{RESET}")
     for _m in list_jobs():                     # don't shout about pre-existing jobs on startup
         _JOBS_SEEN[_m["id"]] = job_state(_m)
+    for _r in list_loops():                    # …nor about iterations that ran before this session
+        _LOOPS_SEEN[_r["id"]] = int(_r["state"].get("runs") or 0)
     import atexit
     atexit.register(footer_disable)            # always reset the scroll region, even on crash
     if load_settings().get("footer"):
@@ -5141,6 +5942,7 @@ def repl():
         print(f"{DIM}  tip: /footer on for a live status line (mode · gate · job alerts){RESET}")
     while True:
         poll_jobs_notify()                     # surface background jobs that finished / blocked
+        poll_loops_notify()                    # …and loop iterations that produced something
         render_footer()                        # keep the footer fresh at each prompt
         print()  # blank line before each prompt
         global _PREFILL
@@ -5288,6 +6090,8 @@ def repl():
             print(f"{DIM}● sidebar {depth} {label}  (branch of the current thread; /merge folds back · "
                   f"/drop discards · /return parks it){RESET}")
             continue
+        if user == "/loop" or user.startswith("/loop "):
+            _loop_command(user[len("/loop"):].strip()); continue
         if user == "/jobs" or user.startswith("/jobs "):
             parts = user.split(None, 2)
             sub = parts[1].lower() if len(parts) > 1 else ""
@@ -5946,7 +6750,7 @@ def repl():
 
 # --- arg parsing ----------------------------------------------------------------
 argv = sys.argv[1:]
-MODE, task_words, JOB_ID = None, None, None
+MODE, task_words, JOB_ID, LOOP_ID = None, None, None, None
 if "--sessions" in argv:                       # list saved sessions and exit
     for r in _session_list(40):
         print(f"{r['session']}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['updated'] or 0))}  {r['turns']:>3}t  {r['seat'] or '':<8} {r['title'][:80]}")
@@ -5959,6 +6763,11 @@ if "--resume" in argv:                         # input --resume [id|last]
 if "--job" in argv:                            # detached job runner: input --job <id>
     i = argv.index("--job")
     MODE, JOB_ID, argv = "--job", (argv[i + 1] if len(argv) > i + 1 else ""), argv[:i]
+if "--loop" in argv:                           # one loop iteration: input --loop <id>
+    i = argv.index("--loop")
+    MODE, LOOP_ID, argv = "--loop", (argv[i + 1] if len(argv) > i + 1 else ""), argv[:i]
+if "--loopd" in argv:                          # the loop scheduler daemon
+    MODE, argv = "--loopd", argv[:argv.index("--loopd")]
 for flag in ("-e", "-x", "--goal", "--auto", "--gen"):
     if MODE:
         break
@@ -5967,7 +6776,7 @@ for flag in ("-e", "-x", "--goal", "--auto", "--gen"):
         MODE, task_words, argv = flag, argv[i + 1:], argv[:i]
         break
 
-if MODE == "--job":
+if MODE in ("--job", "--loop", "--loopd"):
     MODEL, BASE = SEATS.get("saint", (list(SEATS.values())[0] if SEATS else ("saint-auto", SAINT_BASE)))
 elif argv and argv[0] in SEATS:
     MODEL, BASE = SEATS[argv[0]]
@@ -5995,6 +6804,10 @@ def _main():
     _install_stdout_router()   # transparent passthrough until parallel dispatch buffers output
     if MODE == "--job":
         sys.exit(run_job(JOB_ID))
+    if MODE == "--loop":
+        sys.exit(run_loop_once(LOOP_ID))
+    if MODE == "--loopd":
+        sys.exit(run_loopd() or 0)
     if MODE == "--gen":
         sys.stdout.write(generate(_task()))
     elif MODE in ("-e", "-x"):

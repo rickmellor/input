@@ -46,6 +46,48 @@ Seats are displayed in one unit — **$/Mtok of output** — so local (electrici
 - **`/sidebar`** — fork an aside without polluting the main thread; `/merge` folds its
   conclusion back, `/return` parks it.
 
+## Loops — durable scheduled work
+
+`/loop` runs a prompt repeatedly. Unlike an in-session timer, a loop **outlives the terminal**:
+it lives in `~/.config/input/loops/<id>/` and is fired by a small scheduler daemon, so it keeps
+running after you exit and comes back after a reboot.
+
+```
+/loop 10m check whether the bench finished      # fixed cadence
+/loop every day at 6am summarise overnight CI   # calendar
+/loop check CI and address review comments      # self-paced: the model picks 1min–1h each time
+/loop                                           # list
+/loop show|log|run|pause|resume|stop|rm <id>
+/loop daemon                                    # install + start the scheduler
+```
+
+Iterations run on a **cheap local seat** by default — polling is mechanical, and a cloud seat on
+a short cadence bills continuously. Each iteration reports only what changed; a quiet one is
+suppressed rather than printed, so a loop that finds nothing stays silent.
+
+A self-paced loop ends itself when its purpose is served. Any loop can be stopped with
+`/loop stop <id>`.
+
+### Durability
+
+Loops are owned by a scheduler daemon (`input --loopd`, one systemd user unit). `/loop harden
+<id>` promotes a single loop to **its own systemd timer**, so it fires even if the daemon is
+down; `/loop unharden <id>` hands it back.
+
+Missed fires — the machine was asleep, or off for a week — are guarded three ways, because a
+scheduler that catches up naively floods you on the next boot:
+
+- **coalesced** — a week of missed fires is one fire, not a week of them
+- **skipped when stale** — a fire older than the loop's catch-up window is dropped and logged as
+  `skipped_stale` rather than run days late
+- **staggered** — survivors are spread out, with a cap on concurrent iterations
+
+A loop that must run at an exact time needs a machine that is on at that time; catch-up makes it
+fire *late*, not on time.
+
+The model can manage loops too, through a `loops` tool — including ones created in an earlier
+session, since the process table is on disk rather than in the conversation.
+
 ## Safety model
 
 Two independent controls:
