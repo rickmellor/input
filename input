@@ -46,6 +46,28 @@ SHELL = os.environ.get("SHELL", "/bin/bash")
 SESSION = None  # per-REPL x-session-id: scopes SAINT conversation affinity to this run
                 # (else it keys on a hash of the first message — "hello" collides across chats)
 
+# GNU readline history is line-oriented: an entry containing a newline is written to the
+# history file as several lines and read back as several entries, so up-arrow would walk a
+# pasted multi-line prompt one line at a time. Escape on the way in, unescape on recall.
+def hist_encode(s):
+    return (s or "").replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def hist_decode(s):
+    out, esc = [], False
+    for c in (s or ""):
+        if esc:
+            out.append("\n" if c == "n" else c)     # \n → newline, \\ → backslash
+            esc = False
+        elif c == "\\":
+            esc = True
+        else:
+            out.append(c)
+    if esc:
+        out.append("\\")
+    return "".join(out)
+
+
 # readline gives the prompt up/down input-history recall; persist it across sessions.
 try:
     import readline as _rl
@@ -3929,9 +3951,10 @@ def read_line(prompt, preset=""):
                     elif seq == b"[A" and _rl and hidx > 0:
                         if hidx == hlen:
                             saved = "".join(buf)
-                        hidx -= 1; load(_rl.get_history_item(hidx + 1) or "")
+                        hidx -= 1; load(hist_decode(_rl.get_history_item(hidx + 1) or ""))
                     elif seq == b"[B" and _rl and hidx < hlen:
-                        hidx += 1; load(saved if hidx == hlen else (_rl.get_history_item(hidx + 1) or ""))
+                        hidx += 1; load(saved if hidx == hlen
+                                       else hist_decode(_rl.get_history_item(hidx + 1) or ""))
                     elif seq == b"[C" and pos < len(buf):
                         pos += 1; redraw()
                     elif seq == b"[D" and pos > 0:
@@ -5141,7 +5164,7 @@ def repl():
             break
         user = user.strip()
         if user and _rl:                       # every submitted line joins input history
-            _safe(lambda: _rl.add_history(user))
+            _safe(lambda: _rl.add_history(hist_encode(user)))
         if mode == "pick" and not user.startswith("/"):   # Ctrl+Enter one-shot only for messages,
             if not user:                                   # never a slash-command (run it normally)
                 continue
@@ -5174,7 +5197,7 @@ def repl():
             else:
                 print(f"{DIM}▸ {PERM_MODE} — {_mode_hint(PERM_MODE)}{RESET}")
             if user and _rl:                   # don't lose text typed before the toggle
-                _safe(lambda: _rl.add_history(user))
+                _safe(lambda: _rl.add_history(hist_encode(user)))
                 print(f"{DIM}  (your text is in history — ↑ to recover){RESET}")
             continue
         if not user:                           # blank line → just re-prompt (Ctrl-D / /quit to exit)
