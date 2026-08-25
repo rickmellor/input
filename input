@@ -1633,6 +1633,16 @@ def _tool_spawn_agent(args):
     guidance = seat_guidance(model if model in SEATS else m)
     system = _subagent_system(cwd, skill, seat=(model if model in SEATS else None), model_id=m,
                               write=write, max_rounds=max_rounds, guidance=guidance)
+    if not os.path.isdir(cwd):
+        # The orchestrator names the directory the work happens in; making it a precondition
+        # just strands the agent (every bash call fails before it can mkdir its own root).
+        if not write:
+            return (f"Error: cwd {cwd!r} does not exist, and a read-only agent cannot create it. "
+                    "Create it first, or pass write=true.")
+        try:
+            os.makedirs(cwd, exist_ok=True)
+        except OSError as e:
+            return f"Error: could not create cwd {cwd!r}: {e}"
     sb = Sandbox(root=cwd, allow=(SANDBOX_DEV if write else SANDBOX_READONLY))
     tools = sandbox_tools(sb, write=write)
     label = skill or (m.split("-")[-1] if "-" in m else m)
@@ -4098,6 +4108,12 @@ class Sandbox:
         except subprocess.TimeoutExpired:
             return f"exit=-1\n(bash timed out after {self.timeout_s}s)"
         except FileNotFoundError:
+            # subprocess raises this for BOTH a missing executable and a missing cwd. Reporting
+            # the latter as "command not found" sends an agent into retrying a fine command.
+            if not os.path.isdir(workdir):
+                return (f"exit=-1\n(bash error: the working directory does not exist: {workdir} "
+                        "— create it before running commands in it; the write tool creates parent "
+                        "directories, or run mkdir from a directory that does exist)")
             return "exit=-1\n(bash error: command not found)"
         except Exception as e:
             return f"exit=-1\n(bash error: {e})"
