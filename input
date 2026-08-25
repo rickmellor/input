@@ -3739,19 +3739,35 @@ def read_line(prompt, preset=""):
         # Wrapping-aware: the prompt+buffer may span several terminal rows. Go up to the
         # block's start, clear to end of screen, rewrite, then reposition the cursor —
         # otherwise a line past the screen width cascades one copy per keystroke.
+        # The buffer may also hold literal newlines (a bracketed paste), so rows come from
+        # walking the text, not from dividing its length by the width.
         nonlocal crow
         w = max(1, shutil.get_terminal_size((80, 24)).columns)
         plen = _vlen(prompt)
+
+        def rowcol(idx):
+            """(row, col) the cursor sits at with `idx` buffer chars written after the prompt."""
+            row, col = 0, plen
+            for cc in buf[:idx]:
+                if cc == "\n":
+                    row, col = row + 1, 0
+                else:
+                    col += 1
+                    if col == w:
+                        row, col = row + 1, 0
+            return row, col
+
         if crow:
             sys.stdout.write(f"\033[{crow}A")
-        sys.stdout.write("\r\033[J" + prompt + "".join(buf))
-        total = plen + len(buf)
-        endrow = (total - 1) // w if total else 0
+        # raw mode: a bare \n drops a row without returning to col 0
+        sys.stdout.write("\r\033[J" + prompt + "".join(buf).replace("\n", "\r\n"))
+        endrow, endcol = rowcol(len(buf))
+        if endcol == 0 and (buf or plen) and not (buf and buf[-1] == "\n"):
+            endrow -= 1                        # exact-fit row: the terminal holds a pending wrap
         if pos == len(buf):                    # cursor already at the natural end
             crow = endrow
-        else:                                  # editing mid-line: move back to `pos`
-            tgt = plen + pos
-            trow, tcol = divmod(tgt, w)
+        else:                                  # editing mid-buffer: move back to `pos`
+            trow, tcol = rowcol(pos)
             sys.stdout.write("\r")             # col 0 of the bottom row (clears pending wrap)
             if endrow - trow > 0:
                 sys.stdout.write(f"\033[{endrow - trow}A")
@@ -3766,6 +3782,12 @@ def read_line(prompt, preset=""):
 
     try:
         termios.tcsetattr(fd, termios.TCSANOW, new)
+        # Bracketed paste: without it the terminal sends a pasted block as raw bytes, and the
+        # CR between its lines is indistinguishable from Enter — so a multi-line paste submits
+        # its FIRST LINE and the rest is lost. With it on, the block arrives wrapped in
+        # \033[200~ … \033[201~ and lands in the buffer whole, newlines included.
+        sys.stdout.write("\033[?2004h")
+        sys.stdout.flush()
         # Pull any type-ahead entered during the prior (cooked-mode) output. A buffered Enter
         # arrives as '\n', which the loop would misread as Ctrl+Enter → seat/id picker; mark
         # these bytes (from_ta) so their newlines SEND. Leftover persists in _TA_BUF so multiple
@@ -3859,7 +3881,23 @@ def read_line(prompt, preset=""):
                             seq += c
                             if c.isalpha() or c == b"~":
                                 break
-                    if seq == b"[A" and _rl and hidx > 0:
+                    if seq == b"[200~":            # bracketed paste — take it verbatim
+                        data, end = bytearray(), b"\x1b[201~"
+                        while not data.endswith(end):
+                            c = bytes([_TA_BUF.pop(0)]) if _TA_BUF else os.read(fd, 1)
+                            if not c:
+                                break
+                            data += c
+                        if data.endswith(end):
+                            del data[-len(end):]
+                        # A paste carries CR, CRLF or LF depending on the source; normalise so
+                        # the buffer holds one \n per line and the text survives round-tripping.
+                        text = (data.decode("utf-8", "replace")
+                                .replace("\r\n", "\n").replace("\r", "\n"))
+                        for cc in text:
+                            buf.insert(pos, cc); pos += 1
+                        redraw()
+                    elif seq == b"[A" and _rl and hidx > 0:
                         if hidx == hlen:
                             saved = "".join(buf)
                         hidx -= 1; load(_rl.get_history_item(hidx + 1) or "")
@@ -3891,6 +3929,8 @@ def read_line(prompt, preset=""):
                 except Exception:
                     pass
     finally:
+        sys.stdout.write("\033[?2004l")
+        sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
