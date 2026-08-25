@@ -1,21 +1,85 @@
 # input
 
-> Formerly **qchat**. The command, config dir (`~/.config/input`), and repo were renamed to `input`; a `qchat` symlink is kept as a back-compat alias.
+> Formerly **qchat**. The command, config dir (`~/.config/input`), and repo were renamed to
+> `input`; a `qchat` symlink is kept as a back-compat alias.
 
-Zero-overhead chat REPL + shell-command generator for local OpenAI-compatible seats
-(johnny fleet). Stdlib-only Python, single file.
+A terminal agent client for local + cloud model fleets. Single-file, stdlib-only Python.
+It started as a chat REPL and grew into the thing that actually does the work: it runs
+tools, delegates to sub-agents, works autonomously toward a goal, executes stored plans,
+and carries memory between sessions.
 
-- `input` — chat REPL on the gemma seat; thinking models stream reasoning dimmed
-- `input coder` / `input gemma` / `input qwen38` — seat shortcuts (or `input <model> <base_url>`)
-- `/models` — toggle seats mid-conversation (live up/down status, history carries)
-- `input -e <task>` — NL → shell command via the coder seat (thinking off), then
-  `execute | revise | describe | copy | quit`
-- `input -x <task>` — same, but executes immediately
-- bare `input -e` / `-x` — prompts for the task (no shell quoting hazards)
+```
+input                      # chat
+input -e "<task>"          # natural language → shell command, then execute/revise/copy
+input -x "<task>"          # same, run it immediately
+input --goal "<criteria>"  # work autonomously until the criteria are met
+input --resume [id|last]   # reopen a saved session   (--sessions lists them)
+```
 
-Install: symlink `input` onto your PATH (`ln -s ~/repos/input/input ~/.local/bin/input`).
+Install: symlink onto your PATH — `ln -s ~/repos/input/input ~/.local/bin/input`.
 
-Planned: butterfish-style `!` / `!!` goal mode via bash `command_not_found_handle`.
+## Routing
+
+input has **no static seat list**. It reads a [SAINT](https://github.com/rickmellor/saint-router)
+router's `/status` on startup and reflects whatever is actually there — local seats managed by
+[johnny](https://github.com/rickmellor/johnny), cloud tiers, and the classifier that picks
+between them. Everything goes through the router; dormant seats simply don't appear.
+
+- **Enter** sends to the active seat (`saint-auto` — the router classifies each message)
+- **Ctrl+Enter** picks a seat for one message
+- **F7–F12** one-shot to a specific seat, bound in ascending cost order
+- **Ctrl+R** peeks the routing shortcuts, or per-flag help for a staged `/command`
+- `/models`, `/seats` — switch the active seat, or show the discovered fleet
+
+Seats are displayed in one unit — **$/Mtok of output** — so local (electricity) and cloud
+(list price) are directly comparable.
+
+## Agents and autonomy
+
+- **`/goal <criteria>`** — the agent works toward an exit criterion across as many tool
+  rounds as it takes. It stops when the goal is met, when it hits a hard block (a secret, a
+  destructive step, a decision only you can make) and asks, or when it stalls.
+- **`/jobs`** — detached background work with a status table: `run`, `build`, `review`,
+  plus `log`, `stop`, and `answer` for a job that got blocked.
+- **Sub-agents** — the agent delegates self-contained units of work to other seats. See
+  below.
+- **`/sidebar`** — fork an aside without polluting the main thread; `/merge` folds its
+  conclusion back, `/return` parks it.
+
+## Safety model
+
+Two independent controls:
+
+- **`/mode`** (Shift+Tab cycles) — `cautious` reviews risky actions, `unrestricted` doesn't,
+  `plan` authors without building.
+- **`/gate`** — a fast local model rates every shell command `none < low < medium < high <
+  critical`. The gate is the highest level that auto-runs; anything above it stops for review.
+  A hardcoded catastrophic denylist always blocks, regardless of mode or gate.
+
+## Plans
+
+`/megaplan` (alias `/plan`) authors a plan against a shared [MegaPlan](https://github.com/rickmellor/megaplan)
+store — research, discuss, then persist — and `/build` executes one. `/work`, `/complete` and
+`/uncomplete` operate on individual tasks of the loaded plan, with a picker when you don't
+name an id. The prompt shows the loaded plan.
+
+## Context and memory
+
+- **AGENTS.md stack** — folder-scoped instructions for the working directory, always on.
+  `/context` shows what's active; `/cd` re-keys the stack, skills and sandbox.
+- **Skills** — `/skill <name>` loads a `SKILL.md` playbook into the prompt.
+- **Ambient memory** — recall and capture against an [Astoria](https://github.com/rickmellor/astoria)
+  memory service, shared with other clients. `/memory` inspects and corrects it: `facts`,
+  `remember`, `correct`, `forget`, `history`, `as-of`, `why`.
+- **Sessions** — every turn is snapshotted; `/sessions` lists and resumes.
+- **MCP** — `/mcp add <name> <url>` (or `-- <cmd>` for stdio). Servers auto-register from
+  settings, disabled by default; enable their tools in `/tools`.
+
+## Entry field
+
+A cbreak line reader with bracketed paste, so a pasted multi-line prompt arrives whole and
+recalls from history as one entry. Up/down walk history, Tab cycles valid ids at an `<id>`
+argument, and the display is wrap- and newline-aware.
 
 ## Sub-agents and seat guidance
 
