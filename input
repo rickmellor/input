@@ -1565,7 +1565,9 @@ _ROADMAP_BRIEF = (
     "This seat executes reliably but plans weakly: work the brief in the order given and do not "
     "re-plan it. If the brief lacks an explicit sequence, derive the shortest one, state it in a "
     "line or two, then follow it. When a step is ambiguous (e.g. two files could hold the fix), "
-    "pick one, say why in a sentence, and proceed instead of exploring alternatives."
+    "pick one, say why in a sentence, and proceed instead of exploring alternatives. Run ONE step at a "
+    "time and read its output before starting the next — never fire off a batch of steps and assume "
+    "they all worked."
 )
 
 def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_rounds=None, guidance=None):
@@ -1591,7 +1593,10 @@ def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_roun
         "You are a SUB-AGENT working autonomously toward the task below. Use your tools to do "
         "the work; do NOT ask the user questions — make reasonable assumptions and note them. "
         "Your FINAL message is your entire deliverable back to the orchestrator: make it "
-        "complete and self-contained (findings, what you did, any caveats).")
+        "complete and self-contained (findings, what you did, any caveats). Report ONLY what you "
+        "actually observed: if a command fails, returns nothing, or is unavailable to you, say so "
+        "and show the failure — never fill the gap with a plausible-looking result. A short report "
+        "of real findings beats a complete-looking one you partly invented.")
     allowed = SANDBOX_DEV if write else SANDBOX_READONLY
     parts.append(
         "## Tool rules (sandbox)\n"
@@ -1673,7 +1678,10 @@ register(Tool(
     "sub-agent's final deliverable. A local seat may be a weak planner (johnny declares "
     "`guidance: roadmap` on it): for those, write `task` as an explicit ordered plan — name the "
     "files, give the steps in sequence, state the success condition — rather than posing an "
-    "open-ended question. Cloud seats take open briefs fine.",
+    "open-ended question. Cloud seats take open briefs fine. NOTE the sub-agent's `bash` is "
+    "SHELL-LESS (one command per call; no pipes, redirects, globs, loops, `&&`/`;`; only a "
+    "write=true agent gets `bash -c '…'`) — a brief that pastes a multi-command shell block "
+    "cannot be run as written, so give commands one per step.",
     {"type": "object",
      "properties": {
          "task": {"type": "string", "description": "the sub-agent's brief — what to do and what to return"},
