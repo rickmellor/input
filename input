@@ -1533,7 +1533,42 @@ def _agents_ticker(agents, stop):
         sys.stdout.write(f"\033[{drawn}A\r\033[J"); sys.stdout.flush()
 
 
-def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_rounds=None):
+_SEAT_GUIDANCE_CACHE = {}      # (target) -> (expiry_ts, guidance|None); johnny resolve is a subprocess
+
+def seat_guidance(target, ttl=60.0):
+    """What agent-guidance does the seat backing `target` want? (johnny `resolve --json` → `guidance`)
+
+    johnny profiles can declare `guidance: roadmap` on a seat whose model executes delegated work
+    well but plans it poorly — measured on gemma-4-26B (PlanBench 34%, AutomationBench 0-6.7% on
+    30-50-step loops, yet 5/5 on short delegate tasks). With an explicit ordered brief it needed
+    5.1 tool steps instead of 6.4 and stayed off the step ceiling on the ambiguous task (5-6 vs
+    8/8 bare, 2026-08-24). Correctness was unchanged at short horizons — this buys efficiency and
+    margin, so it's an optimization, not a crutch. Best-effort: any failure returns None and the
+    caller falls back to a bare brief."""
+    now = time.monotonic()
+    hit = _SEAT_GUIDANCE_CACHE.get(target)
+    if hit and hit[0] > now:
+        return hit[1]
+    g = None
+    try:
+        out = subprocess.run(["johnny", "resolve", target, "--json"], capture_output=True,
+                             text=True, timeout=8)
+        if out.returncode == 0:
+            g = (json.loads(out.stdout) or {}).get("guidance") or None
+    except Exception:
+        g = None
+    _SEAT_GUIDANCE_CACHE[target] = (now + ttl, g)
+    return g
+
+
+_ROADMAP_BRIEF = (
+    "This seat executes reliably but plans weakly: work the brief in the order given and do not "
+    "re-plan it. If the brief lacks an explicit sequence, derive the shortest one, state it in a "
+    "line or two, then follow it. When a step is ambiguous (e.g. two files could hold the fix), "
+    "pick one, say why in a sentence, and proceed instead of exploring alternatives."
+)
+
+def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_rounds=None, guidance=None):
     """A sub-agent's system prompt: grounding + the cwd's folder context + one skill brief +
     autonomy framing. Deliberately WITHOUT the parent's mode directives / loaded skills.
     `seat`/`model_id` name the seat this agent runs on so it can self-report / a skill can
@@ -1543,6 +1578,8 @@ def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_roun
         which = f"the {seat} seat" if seat else "the assigned seat"
         mid = f" (model {model_id})" if model_id else ""
         parts.append(f"You are running on {which}{mid}.")
+    if guidance == "roadmap":       # johnny profile says this seat wants an explicit plan
+        parts.append(_ROADMAP_BRIEF)
     fc = folder_context(cwd)
     if fc:
         parts.append(fc)
@@ -1588,8 +1625,9 @@ def _tool_spawn_agent(args):
     if not model:
         model = agentic_seat(task)
     m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
+    guidance = seat_guidance(model if model in SEATS else m)
     system = _subagent_system(cwd, skill, seat=(model if model in SEATS else None), model_id=m,
-                              write=write, max_rounds=max_rounds)
+                              write=write, max_rounds=max_rounds, guidance=guidance)
     sb = Sandbox(root=cwd, allow=(SANDBOX_DEV if write else SANDBOX_READONLY))
     tools = sandbox_tools(sb, write=write)
     label = skill or (m.split("-")[-1] if "-" in m else m)
@@ -1632,7 +1670,10 @@ register(Tool(
     "subsystem, review a file, draft a component) — especially several in a row to parallelize "
     "investigation. Routes via saint-auto unless you pin `model` ('cloud-flagship'/'cloud-large' "
     "for a design or hard-reasoning agent) or the chosen `skill` declares a seat. Returns the "
-    "sub-agent's final deliverable.",
+    "sub-agent's final deliverable. A local seat may be a weak planner (johnny declares "
+    "`guidance: roadmap` on it): for those, write `task` as an explicit ordered plan — name the "
+    "files, give the steps in sequence, state the success condition — rather than posing an "
+    "open-ended question. Cloud seats take open briefs fine.",
     {"type": "object",
      "properties": {
          "task": {"type": "string", "description": "the sub-agent's brief — what to do and what to return"},
