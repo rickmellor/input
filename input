@@ -1408,6 +1408,11 @@ class _StdoutRouter:
     def release(self):
         self._loc.buf = None
 
+    def current(self):
+        """The buffer this thread is captured into (None = the real terminal) — handed to
+        worker threads so a sub-agent's nested tool calls stay inside its buffer."""
+        return getattr(self._loc, "buf", None)
+
     def __getattr__(self, n):
         return getattr(self._real, n)
 
@@ -1746,10 +1751,14 @@ def _tool_spawn_agent(args):
                 "keep read-only.")
     budget = int(a.get("budget_tokens") or 200_000)
     max_rounds = max(2, int(a.get("max_rounds") or SUBAGENT_MAX_ROUNDS))
-    # model: explicit pin > skill's declared seat > (classify the brief) hard→reasoning_seat, else saint-auto
+    # model: explicit pin > skill's declared seat > settings `subagent_seat` (default "chat" — the
+    # LOCAL chat seat; "auto" = classify the brief, hard→reasoning_seat, else saint-auto). The old
+    # default was the classifier, which rated every research brief "hard" and sent the sub-agents
+    # to cloud-large behind the user's back ("use local subagents", 2026-08-27).
     model = (a.get("model") or "").strip() or (SKILLS.get(skill, {}).get("seat") or "")
     if not model:
-        model = agentic_seat(task)
+        pref = str(load_settings().get("subagent_seat") or "chat").strip()
+        model = agentic_seat(task) if pref == "auto" else pref
     m, b = _resolve_seat(model) or SEATS.get("saint") or (MODEL, BASE)
     key = seat_key(model)
     guidance = seat_guidance(key if key in SEATS else m)
@@ -1810,8 +1819,9 @@ register(Tool(
     "any of these, they mean CALL THIS TOOL: hand the work to a sub-agent, don't just do it "
     "yourself in this thread. Use it to delegate a self-contained unit of work (research a "
     "subsystem, review a file, draft a component) — especially several in a row to parallelize "
-    "investigation. Routes via saint-auto unless you pin `model` ('cloud-flagship'/'cloud-large' "
-    "for a design or hard-reasoning agent) or the chosen `skill` declares a seat. Returns the "
+    "investigation. Runs on the LOCAL chat seat by default (cheap, private); pin `model` "
+    "('cloud-flagship'/'cloud-large') only for a design or frontier-hard reasoning agent — never "
+    "when the user asked for local sub-agents — or let the chosen `skill` declare a seat. Returns the "
     "sub-agent's final deliverable. A local seat may be a weak planner (johnny declares "
     "`guidance: roadmap` on it): for those, write `task` as an explicit ordered plan — name the "
     "files, give the steps in sequence, state the success condition — rather than posing an "
@@ -1827,7 +1837,7 @@ register(Tool(
      "properties": {
          "task": {"type": "string", "description": "the sub-agent's brief — what to do and what to return"},
          "skill": {"type": "string", "description": "optional skill name to load as its playbook"},
-         "model": {"type": "string", "description": "optional seat/model pin (default saint-auto); e.g. cloud-flagship, cloud-large, coder"},
+         "model": {"type": "string", "description": "optional seat/model pin. Default = the LOCAL chat seat (settings subagent_seat). Pin cloud-large / cloud-flagship ONLY for design or frontier-hard reasoning AND only when the user has not asked for local sub-agents; 'coder' = local coder seat"},
          "cwd": {"type": "string", "description": "working directory (default: current)"},
          "write": {"type": "boolean", "description": "grant write/edit + build tools (default: read-only)"},
          "background": {"type": "boolean", "description": "detach as a job instead of waiting — the result does NOT return to this turn"},
@@ -4447,7 +4457,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 decided.append((tc, name, args, tool, allow, reason))
             res["tool_calls"] += len(decided)
 
-            def _run_one(item, buffered, agents=None, idx=None):
+            def _run_one(item, buffered, agents=None, idx=None, parent=None):
                 tc, name, args, tool, allow, reason = item
                 slot = agents[idx] if agents is not None else None
                 if slot is not None:
@@ -4461,6 +4471,11 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 buf = io.StringIO()
                 if buffered and _STDOUT is not None:
                     _STDOUT.capture(buf)
+                elif parent is not None and _STDOUT is not None:
+                    # a quiet (sub-agent) round in a pool thread: no buffer of its own, so its
+                    # prints would land on the real terminal mid-ticker — route them into the
+                    # buffer the submitting thread is captured into (2026-08-27).
+                    _STDOUT.capture(parent)
                 try:
                     if on_tool:
                         on_tool("call", tc, None)
@@ -4474,7 +4489,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                     shown = on_tool("result", tc, out) if on_tool else None
                 finally:
                     _AGENT_TLS.slot = None
-                    if buffered and _STDOUT is not None:
+                    if (buffered or parent is not None) and _STDOUT is not None:
                         _STDOUT.release()
                     if slot is not None:
                         slot["state"] = "done"
@@ -4498,8 +4513,9 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                                               args=(agents, stop_ticker), daemon=True)
                     ticker.start()
                 try:
+                    parent = _STDOUT.current() if (_STDOUT is not None and not buffered) else None
                     with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(decided))) as ex:
-                        futs = [ex.submit(_run_one, it, buffered, agents, i)
+                        futs = [ex.submit(_run_one, it, buffered, agents, i, parent)
                                 for i, it in enumerate(decided)]
                         results = [f.result() for f in futs]   # submit order == tcs order
                 finally:
