@@ -1539,11 +1539,19 @@ _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 def _call_label(name, args):
-    """Short live-status label for a tool call: the sub-agent's skill/seat, else the tool."""
+    """Short live-status label for a tool call: the sub-agent's skill, else the directory it
+    works in, else its seat tier, else a slug of the task — anything but four rows of "agent"."""
     if name == "spawn_agent" and isinstance(args, dict):
         sk = (args.get("skill") or "").strip()
         if sk:
             return sk
+        cwd = os.path.basename(os.path.expanduser((args.get("cwd") or "").rstrip("/")))
+        if cwd and cwd not in ("", os.path.basename(os.path.expanduser("~")), os.path.basename(os.getcwd())):
+            return cwd[:22]
+        task = re.sub(r"[^A-Za-z0-9 ]+", " ", (args.get("task") or args.get("brief") or ""))
+        words = [w for w in task.split() if w.lower() not in ("the", "a", "an", "of", "in", "at", "to", "and", "for")]
+        if words:
+            return " ".join(words[:3])[:22]
         mdl = (args.get("model") or "").strip()
         if mdl:
             return mdl.split("-")[-1] if "-" in mdl else mdl   # cloud-small → small
@@ -1551,41 +1559,55 @@ def _call_label(name, args):
     return name
 
 
+def _dedupe_labels(agents):
+    """Give identical labels a #n suffix so parallel agents stay tellable-apart."""
+    seen = {}
+    for a in agents:
+        seen[a["label"]] = seen.get(a["label"], 0) + 1
+    counts = {k: 0 for k, v in seen.items() if v > 1}
+    for a in agents:
+        if a["label"] in counts:
+            counts[a["label"]] += 1
+            a["label"] = f"{a['label']}#{counts[a['label']]}"
+
+
 def _agents_ticker(agents, stop):
-    """Live multi-line spinner over parallel agents: a header + one indented line per agent
-    carrying a running elapsed clock (s → Mm SSs → Hh MMm via _fmt_dur), redrawn in place
-    until `stop` is set. Own thread, writes to the real terminal (workers write to their own
-    buffers). Self-clears the whole block on stop, so the caller needn't know its height."""
-    n = len(agents)
-    width = min(40, max((len(a["label"]) for a in agents), default=0))
-    drawn, f = 0, 0
+    """Live ONE-LINE status over parallel agents, redrawn in place with \\r until `stop` is set:
+    `⠼ 4 agents · 1m03s │ saint-router ⠼1m03s · cascade ✓48s · docs ⠼1m01s`. Own thread, writes to
+    the real terminal (workers write to their own buffers). Deliberately never moves the cursor
+    vertically: a multi-row block redrawn with cursor-up leaked a frame into scrollback every time
+    anything else emitted a newline at the bottom of the footer's scroll region (2026-08-27).
+    Self-clears on stop; the per-agent `⟳ done[…]` lines carry the durable record."""
+    _dedupe_labels(agents)
+    t_all = time.monotonic()
+    f = 0
     while not stop.wait(0.1 if f else 0):
         frame = _SPIN[f % len(_SPIN)]
         now = time.monotonic()
         done = sum(1 for a in agents if a["state"] == "done")
         run = sum(1 for a in agents if a["state"] == "running")
         q = sum(1 for a in agents if a["state"] == "queued")
-        head = f"  {frame} {n} agents · {run} running" + (f" · {q} queued" if q else "") + f" · {done} done"
-        out = [f"{DIM}{head}{RESET}"]
+        head = f"{frame} {len(agents)} agents · {run} running" + (f" · {q} queued" if q else "") \
+               + f" · {done} done · {_fmt_dur(now - t_all)}"
+        cells = []
         for a in agents:
-            cell = f"{a['label'][:width]:<{width}}"
+            who = a["label"] + (f"@{a['seat']}" if a.get("seat") else "")
             if a["state"] == "done":
-                out.append(f"{DIM}      {cell}  {RESET}{GREEN_BUILD}✓{RESET}{DIM} done · {_fmt_dur(a['dur'] or 0)}{RESET}")
+                cells.append(f"{who} {GREEN_BUILD}✓{RESET}{DIM}{_fmt_dur(a['dur'] or 0)}"
+                             + (f" {a['tools']}t" if a.get("tools") else ""))
             elif a["state"] == "running":
-                out.append(f"{DIM}      {cell}  {frame} running · {_fmt_dur(now - (a['start'] or now))}{RESET}")
+                act = (f" {a['tools']}t" if a.get("tools") else "") + (f" {a['last']}" if a.get("last") else "")
+                cells.append(f"{who} {frame}{_fmt_dur(now - (a['start'] or now))}{act}")
             else:
-                out.append(f"{DIM}      {cell}  · queued{RESET}")
-        # Redraw in place WITHOUT a trailing newline: the cursor parks at the end of the last row,
-        # so the next frame climbs drawn-1 rows. A trailing "\n" on the bottom row of a scroll
-        # region (the footer reserves one) scrolls instead of moving, and every frame then piles
-        # into scrollback (2026-08-27).
-        up = f"\033[{drawn - 1}A" if drawn > 1 else ""
-        buf = up + "\r" + "\n".join("\033[K" + ln for ln in out)
-        sys.stdout.write(buf); sys.stdout.flush()
-        drawn, f = len(out), f + 1
-    if drawn:                                      # wipe the whole block on stop
-        up = f"\033[{drawn - 1}A" if drawn > 1 else ""
-        sys.stdout.write(f"{up}\r\033[J"); sys.stdout.flush()
+                cells.append(f"{who} ·queued")
+        line = f"  {head} │ " + " · ".join(cells)
+        width = shutil.get_terminal_size((80, 24)).columns - 1
+        plain = re.sub(r"\033\[[0-9;]*m", "", line)
+        if len(plain) > width:                       # clip on the visible text, keep it one row
+            line = plain[:width - 1] + "…"
+        sys.stdout.write(f"\r\033[K{DIM}{line}{RESET}"); sys.stdout.flush()
+        f += 1
+    sys.stdout.write("\r\033[K"); sys.stdout.flush()   # wipe the line on stop
 
 
 def seat_key(name):
@@ -1741,6 +1763,10 @@ def _tool_spawn_agent(args):
         if ev == "call":
             fn = tc.get("function") or {}
             print(f"{DIM}    ⟳ {fn.get('name')}({_fmt_args(fn.get('arguments'))[:56]}){RESET}")
+            sl = getattr(_AGENT_TLS, "slot", None)      # live activity for the agents ticker
+            if sl is not None:
+                sl["tools"] = sl.get("tools", 0) + 1
+                sl["last"] = fn.get("name")
         return None
 
     print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
@@ -1748,6 +1774,7 @@ def _tool_spawn_agent(args):
         slot = getattr(_AGENT_TLS, "slot", None)   # now holding a real slot → mark it running
         if slot is not None:
             slot["state"] = "running"; slot["start"] = time.monotonic()
+            slot["seat"] = (key if key in SEATS else m).removeprefix("saint-")
         t0 = time.monotonic()              # time generation only, not queue wait on the semaphore
         res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
                          budget_tokens=budget, on_tool=on_tool, gate=False,
@@ -4448,7 +4475,8 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                 results = [_run_one(it, False) for it in decided]
             else:
                 buffered = not quiet
-                agents = [{"label": _call_label(nm, ar), "state": "pending", "start": None, "dur": None}
+                agents = [{"label": _call_label(nm, ar), "state": "pending", "start": None, "dur": None,
+                           "seat": None, "tools": 0, "last": None}
                           for (tc, nm, ar, tool, allow, reason) in decided]
                 # A live spinner naming the in-flight agents (with a running elapsed clock) shows
                 # what the UI is waiting on while their output is buffered, instead of dead air.
