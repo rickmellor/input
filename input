@@ -267,6 +267,7 @@ _HELP = [
         ("Ctrl+R", "peek routing shortcuts, or command help for a staged /command"),
         ("/models", "list and switch the active model"),
         ("/seats", "the discovered fleet + Fn seat bindings"),
+        ("/savings", "SAINT cost-savings report (hour|day|week|month|year|all)"),
     ]),
     ("Agents & autonomy", [
         ("/goal", "work autonomously toward exit criteria until met or hard-blocked"),
@@ -6516,6 +6517,16 @@ def repl():
                 else:
                     print(f"{DIM}  {k.upper():<4} → {v}  {RED}[not in fleet]{RESET}")
             print(f"{DIM}  override in settings.json: \"seat_hotkeys\": {{\"f9\": \"cloud-large\", …}}{RESET}")
+            continue
+        if user == "/savings" or user.startswith("/savings "):
+            period = user[len("/savings"):].strip().lower() or "day"
+            m, b = _resolve_seat("saint") or SEATS.get("saint") or (MODEL, BASE)
+            try:
+                report = _post(m, b, [{"role": "user", "content": f"/savings {period}"}],
+                               False, 4096)
+                print(report)                 # raw: SAINT returns a pre-rendered ANSI report
+            except Exception as e:
+                print(f"{YEL}(savings report unavailable: {e}){RESET}")
             continue
         if user in ("/think", "/expand"):
             print(f"{DIM}{thinks[-1]}{RESET}" if thinks else "(no thinking recorded yet)")
