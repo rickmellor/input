@@ -3497,6 +3497,23 @@ def _status_line(stats):
     return f"{DIM}" + "  ·  ".join(parts) + RESET
 
 
+def _repair_json_args(raw):
+    """Tool-call arguments as streamed, made loadable: empty → "{}"; a trailing run of extra
+    closing braces (the same qwen3_xml streaming glitch that yields the phantom call also
+    doubled a `}` on the following call) is trimmed until the JSON parses."""
+    txt = (raw or "").strip() or "{}"
+    for _ in range(4):
+        try:
+            json.loads(txt)
+            return txt
+        except Exception:
+            if txt.endswith("}") and txt.count("}") > txt.count("{"):
+                txt = txt[:-1].rstrip()
+                continue
+            break
+    return txt
+
+
 def stream(messages, think_store, model=None, base=None, tools=None, volatile=None,
            system=None, quiet=False, session=None):
     """Stream one assistant response. Returns (text, tool_calls, usage) — tool_calls is the
@@ -3627,11 +3644,14 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
         print()
     if think_buf and think_store is not None:
         think_store.append("".join(think_buf))
-    tool_calls = [
-        {"id": a["id"] or f"call_{i}", "type": "function",
-         "function": {"name": a["name"], "arguments": a["arguments"] or "{}"}}
-        for i, a in sorted(tool_acc.items())
-    ]
+    tool_calls = []
+    for i, a in sorted(tool_acc.items()):
+        if not (a["name"] or "").strip():
+            continue            # vLLM's qwen3_xml parser streams a phantom call (id, no name) between
+                                # real ones; forwarded, it became a nameless tool_call that every backend
+                                # rejected with 400 → SAINT 502 (2026-08-27). Never emit it.
+        tool_calls.append({"id": a["id"] or f"call_{i}", "type": "function",
+                           "function": {"name": a["name"], "arguments": _repair_json_args(a["arguments"])}})
     prompt = usage.get("prompt_tokens") if usage else None
     completion = usage.get("completion_tokens") if usage else None
     if prompt is None:      # seat didn't report usage — rough char/4 estimates
