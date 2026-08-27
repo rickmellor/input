@@ -6065,8 +6065,9 @@ def repl():
     import atexit
     atexit.register(footer_disable)            # always reset the scroll region, even on crash
     if load_settings().get("footer"):
-        footer_enable()
         print(f"{DIM}  footer on — /footer off to hide{RESET}")
+        footer_enable()                        # last: its cursor-park must land on a fresh line,
+                                               # not overwrite the memory-status line above it
     else:
         print(f"{DIM}  tip: /footer on for a live status line (mode · gate · job alerts){RESET}")
     while True:
