@@ -7,7 +7,7 @@ Command:    input -e <task>   propose → execute|revise|describe|copy|quit
             input -x <task>   propose → execute immediately
             input --gen <buf> print one command to stdout (Ctrl-G binding)
 Goal agent: input --goal <task>   iterate: propose→confirm→run→observe→next
-            input --auto <task>   iterate autonomously; denylist + gemma risk gate
+            input --auto <task>   iterate autonomously; denylist + chat-seat risk gate
 Bare -e/-x/--goal/--auto with no words prompts for the task (no shell quoting).
 
 Seats: gemma (chat default) | coder (command/goal default) | qwen38 (on-demand).
@@ -18,7 +18,7 @@ REPL: reasoning streams live then collapses to one line (/think re-expands);
       A status line under each reply tracks tokens in/out, decode rate, context use, and
       session turns/time.
       Tools: the model can call built-ins (get_current_time; list_files shows an ls -l
-      listing; run_command runs shell commands, gated by a gemma risk-review — none/low
+      listing; run_command runs shell commands, gated by a risk-review on the chat seat — none/low
       auto-run, riskier prompts; web_search + web_fetch browse the web via Brave) plus
       user tools in ~/.config/input/tools/*.py; /tools
       opens an arrow-key per-tool on/off menu (/tools on|off master switch). Tools from
@@ -820,7 +820,7 @@ def instruction_layer(cwd=None):
 # --- permission modes ------------------------------------------------------------
 # Shift+Tab cycles them (also /mode, and /megaplan enters plan). They govern how tool calls
 # that make changes are gated (see _gate):
-#   cautious     — YOU review risky actions (gemma rates; you confirm medium+ / denylist)
+#   cautious     — YOU review risky actions (the chat seat rates; you confirm medium+ / denylist)
 #   unrestricted — a reviewer model gates; you're never prompted (denylist + high/critical
 #                  blocked, everything else auto-runs)
 #   plan         — the MegaPlan planning experience (research → discuss → persist); the
@@ -1154,7 +1154,7 @@ def _confirm():
 
 
 # --- risk gate policy: how much risk auto-runs before review kicks in ------------------
-# gemma rates each command none<low<medium<high<critical. `gate` tolerance = the highest
+# the chat seat (whatever model serves it) rates each command none<low<medium<high<critical. `gate` tolerance = the highest
 # level that auto-runs; anything ABOVE it is gated — a confirm prompt in a live turn, a
 # block-for-/jobs-answer in a dark job. The catastrophic denylist is a separate hard floor.
 _RISK_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -1193,7 +1193,7 @@ def _gate_reviewer(cmd):
 def _gate(policy, cmd):
     """Risk gate for a tool call; prints notes, prompts as needed. Returns True to proceed.
     In `unrestricted` mode a reviewer model decides (no prompts). Otherwise (cautious/plan)
-    'review' rates a shell command via gemma (auto-run none/low, YOU confirm the rest); the
+    'review' rates a shell command via the chat seat (auto-run none/low, YOU confirm the rest); the
     catastrophic denylist always prompts; 'always' confirms every call."""
     if PERM_MODE == "unrestricted":
         return _gate_reviewer(cmd)
@@ -1204,12 +1204,12 @@ def _gate(policy, cmd):
         v = review(cmd)
         tol = gate_tolerance(dark=False)
         if v and not _over_tolerance(v[0], tol):
-            print(f"{DIM}  gemma: {v[0]} risk (≤ {tol}) — auto-run{RESET}")
+            print(f"{DIM}  review[{_LAST_REVIEW['seat']}]: {v[0]} risk (≤ {tol}) — auto-run{RESET}")
             return True
         if v:
-            print(f"{YEL}  gemma: {v[0]} risk (> {tol}) — {v[1]}{RESET}")
+            print(f"{YEL}  review[{_LAST_REVIEW['seat']}]: {v[0]} risk (> {tol}) — {v[1]}{RESET}")
         else:
-            print(f"{YEL}  gemma review unavailable — confirm{RESET}")
+            print(f"{YEL}  review unavailable ({_LAST_REVIEW['seat'] or 'no seat'}: {_LAST_REVIEW['error'] or 'no reply'}) — confirm{RESET}")
         return _confirm()
     return _confirm()   # "always", or "review" with no command to rate
 
@@ -1575,11 +1575,17 @@ def _agents_ticker(agents, stop):
                 out.append(f"{DIM}      {cell}  {frame} running · {_fmt_dur(now - (a['start'] or now))}{RESET}")
             else:
                 out.append(f"{DIM}      {cell}  · queued{RESET}")
-        buf = (f"\033[{drawn}A" if drawn else "") + "".join("\r\033[K" + ln + "\n" for ln in out)
+        # Redraw in place WITHOUT a trailing newline: the cursor parks at the end of the last row,
+        # so the next frame climbs drawn-1 rows. A trailing "\n" on the bottom row of a scroll
+        # region (the footer reserves one) scrolls instead of moving, and every frame then piles
+        # into scrollback (2026-08-27).
+        up = f"\033[{drawn - 1}A" if drawn > 1 else ""
+        buf = up + "\r" + "\n".join("\033[K" + ln for ln in out)
         sys.stdout.write(buf); sys.stdout.flush()
         drawn, f = len(out), f + 1
     if drawn:                                      # wipe the whole block on stop
-        sys.stdout.write(f"\033[{drawn}A\r\033[J"); sys.stdout.flush()
+        up = f"\033[{drawn - 1}A" if drawn > 1 else ""
+        sys.stdout.write(f"{up}\r\033[J"); sys.stdout.flush()
 
 
 def seat_key(name):
@@ -1675,8 +1681,8 @@ def _subagent_system(cwd, skill, seat=None, model_id=None, write=False, max_roun
         "say what you would have run; ask the orchestrator for write=true if the task truly needs it.") + "\n"
         f"- Allowed command prefixes: {', '.join(allowed)}.\n"
         + (f"- Budget: {max_rounds} tool rounds (repeating the exact same calls 4× counts as a stall). Write your final report as TEXT "
-           "(a message with no tool calls) — if the budget runs out you get one last no-tools turn to "
-           "summarize what you have, so keep notes in your own words as you go.\n" if max_rounds else ""))
+           "(a message with no tool calls) — if the round budget or context budget runs out you get one last "
+           "no-tools turn to summarize what you have, so keep notes in your own words as you go.\n" if max_rounds else ""))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -1788,7 +1794,7 @@ register(Tool(
          "cwd": {"type": "string", "description": "working directory (default: current)"},
          "write": {"type": "boolean", "description": "grant write/edit + build tools (default: read-only)"},
          "background": {"type": "boolean", "description": "detach as a job instead of waiting — the result does NOT return to this turn"},
-         "budget_tokens": {"type": "integer", "description": "token guardrail (default 200000)"},
+         "budget_tokens": {"type": "integer", "description": "context guardrail: stop when one round's prompt+reply exceeds this many tokens (default 200000)"},
          "max_rounds": {"type": "integer", "description": "tool-round budget (default 24); raise for long source digs / multi-page research"}},
      "required": ["task"]},
     _tool_spawn_agent))
@@ -2011,9 +2017,15 @@ def clean_cmd(text):
     return "\n".join(lines).strip()
 
 
+_LAST_REVIEW = {"seat": None, "error": None}   # what review() used / why it failed (for the gate's message)
+
+
 def review(cmd):
-    """Ask a fast local seat to risk-rate a command. Returns (risk, reason) or None."""
-    model, base = SEATS[_pick_seat("chat", "coder", "saint")]
+    """Ask a fast local seat to risk-rate a command. Returns (risk, reason) or None
+    (the failure is kept in _LAST_REVIEW so the gate can say which seat and why)."""
+    name = _pick_seat("chat", "coder", "saint")
+    model, base = SEATS[name]
+    _LAST_REVIEW.update(seat=f"{name} ({model})", error=None)
     sysmsg = ("You are a shell-command safety reviewer. Rate the RISK of running the command. "
               'Reply ONLY compact JSON: {"risk":"none|low|medium|high|critical","reason":"short"}. '
               "high/critical = data loss, overwrite, exfiltration, system damage, irreversible.")
@@ -2021,9 +2033,12 @@ def review(cmd):
         raw = _post(model, base, [{"role": "system", "content": sysmsg},
                                   {"role": "user", "content": cmd}], think=False, max_tokens=200)
         m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            raise ValueError(f"no JSON in reply: {raw[:80]!r}")
         v = json.loads(m.group(0))
         return v.get("risk", "unknown"), v.get("reason", "")
-    except Exception:
+    except Exception as e:
+        _LAST_REVIEW["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         return None
 
 
@@ -2127,12 +2142,12 @@ def goal_mode(task, auto=False):
         elif auto:
             v = review(cmd)
             if v and v[0] in ("none", "low"):
-                print(f"{DIM}gemma: {v[0]} risk — auto-proceeding{RESET}")
+                print(f"{DIM}review[{_LAST_REVIEW['seat']}]: {v[0]} risk — auto-proceeding{RESET}")
                 proceed = True
             elif v:
-                print(f"{YEL}gemma: {v[0]} risk — {v[1]}{RESET}")
+                print(f"{YEL}review[{_LAST_REVIEW['seat']}]: {v[0]} risk — {v[1]}{RESET}")
             else:
-                print(f"{YEL}gemma review unavailable — confirm manually{RESET}")
+                print(f"{YEL}review unavailable ({_LAST_REVIEW['seat'] or 'no seat'}: {_LAST_REVIEW['error'] or 'no reply'}) — confirm manually{RESET}")
         if not proceed:
             try:
                 ans = input("> run this? [y]es/[s]kip/[q]uit: ").strip().lower()
@@ -4296,6 +4311,12 @@ class _NeedsApproval(Exception):
         self.cmd, self.risk, self.reason = cmd, risk, reason
 
 
+def tcs_free_text(res):
+    """True only when the agent's last text was a plain answer (no tool calls) — narration that
+    accompanied a tool call is not a deliverable, so a capped agent must still get its finalize turn."""
+    return bool((res.get("text") or "").strip()) and res.get("last_turn_plain", False)
+
+
 def run_thread(task, *, history=None, system=None, model=None, base=None, tools=None,
                max_rounds=MAX_TOOL_ROUNDS, quiet=True, stats=None, thinks=None, volatile=None,
                terminate=None, budget_tokens=None, on_tool=None, session=None, gate=True, dark=None,
@@ -4326,6 +4347,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
             if stats is not None:
                 stats.record(usage["prompt"], usage["completion"], usage["rate"])
             res["text"] = text or res["text"]
+            res["last_turn_plain"] = not tcs
             msg = {"role": "assistant", "content": text}
             if tcs:
                 fp = tuple(sorted(((tc.get("function") or {}).get("name", ""),
@@ -4342,7 +4364,10 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                                                # doesn't pad an empty block with a visible
                                                # "[System: Empty message content sanitised]" line
             messages.append(msg)
-            if budget_tokens and res["tokens_in"] + res["tokens_out"] > budget_tokens:
+            # budget_tokens caps the CONTEXT the agent has grown to (this round's prompt + reply), not
+            # the cumulative bill — summing every round's prompt trips 200K after ~10 rounds of a
+            # 20K context and stranded flagship sub-agents mid-dig (2026-08-27).
+            if budget_tokens and (usage["prompt"] or 0) + (usage["completion"] or 0) > budget_tokens:
                 res["stopped"] = "budget"; break
             if not tcs:                            # plain answer → done, unless the goal says otherwise
                 if terminate is not None:
@@ -4451,7 +4476,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                                  "content": shown if shown is not None else out})
         else:
             res["stopped"] = "rounds"
-        if res["stopped"] in ("rounds", "stalled") and finalize_on_cap and not (res["text"] or "").strip():
+        if res["stopped"] in ("rounds", "stalled", "budget") and finalize_on_cap and not tcs_free_text(res):
             # one last NO-TOOLS turn so a capped agent still hands back what it learned
             messages.append({"role": "user", "content":
                 "Your tool budget is exhausted (or you were looping). Do not call tools. Write your final deliverable NOW "
