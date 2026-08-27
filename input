@@ -1432,6 +1432,7 @@ def _install_stdout_router():
 _FOOTER_ACTIVE = False
 _footer_stop = threading.Event()
 _footer_flash = {"msg": "", "until": 0.0}
+_footer_cache = {"jobs": (0.0, 0, 0), "last": None}   # (when, active, blocked) — the jobs dir is scanned ≤ every 5 s
 _SAINT_RETRAIN = None          # x-saint-retrain reason (classifier drift) from the last SAINT response, or None
 _SAINT_RETRAIN_NOTED = False   # printed the one-time session notice yet?
 
@@ -1452,7 +1453,7 @@ def _footer_clip(s, width):
 def footer_flash(msg, ttl=6.0):
     """Show a transient message in the footer for `ttl` seconds (a background event)."""
     _footer_flash["msg"], _footer_flash["until"] = msg, time.time() + ttl
-    render_footer()
+    render_footer(force=True)
 
 
 def _footer_text():
@@ -1460,12 +1461,15 @@ def _footer_text():
              f"▸ {PERM_MODE}"]
     g = load_settings().get("gate") or {}
     parts.append(f"gate ≤{g.get('interactive', 'low')}/{g.get('autonomous', 'low')}")
-    try:
-        states = [job_state(j) for j in list_jobs()]
-    except Exception:
-        states = []
-    active = sum(1 for s in states if s in ("running", "queued"))
-    blocked = sum(1 for s in states if s == "blocked")
+    when, active, blocked = _footer_cache["jobs"]
+    if time.time() - when > 5.0:                 # the 1 Hz repaint must not scan the jobs dir 1 Hz
+        try:
+            states = [job_state(j) for j in list_jobs()]
+        except Exception:
+            states = []
+        active = sum(1 for s in states if s in ("running", "queued"))
+        blocked = sum(1 for s in states if s == "blocked")
+        _footer_cache["jobs"] = (time.time(), active, blocked)
     if active:
         parts.append(f"{active} job{'s' if active != 1 else ''} running")
     if blocked:
@@ -1477,14 +1481,19 @@ def _footer_text():
     return "  ·  ".join(parts)
 
 
-def render_footer():
-    """Repaint the footer on the reserved bottom row without moving the logical cursor."""
+def render_footer(force=False):
+    """Repaint the footer on the reserved bottom row without moving the logical cursor.
+    Skips the write when nothing changed (the daemon calls this 1 Hz) — every unnecessary
+    save/go/write/restore is one more sequence interleaving with the line editor and tickers."""
     if not _FOOTER_ACTIVE or not sys.stdout.isatty():
         return
     try:
         sz = shutil.get_terminal_size((80, 24))
         h, w = sz.lines, sz.columns
         txt = _footer_clip(_footer_text(), w - 1)
+        if not force and _footer_cache["last"] == (h, w, txt):
+            return
+        _footer_cache["last"] = (h, w, txt)
         sys.stdout.write(f"\0337\033[{h};1H\033[2K{DIM}{txt}{RESET}\0338")  # save·go·clear·write·restore
         sys.stdout.flush()
     except Exception:
@@ -1501,7 +1510,7 @@ def footer_enable():
     sys.stdout.flush()
     _FOOTER_ACTIVE = True
     _footer_stop.clear()
-    render_footer()
+    render_footer(force=True)
     threading.Thread(target=_footer_loop, daemon=True).start()
 
 
@@ -1522,7 +1531,7 @@ def clear_screen():
     sys.stdout.write("\033[3J\033[2J\033[H")   # scrollback + screen + home
     sys.stdout.flush()
     if _FOOTER_ACTIVE:
-        render_footer()
+        render_footer(force=True)
 
 
 def _footer_loop():
@@ -1532,6 +1541,7 @@ def _footer_loop():
             h = shutil.get_terminal_size((80, 24)).lines
             if h != last_h:                                   # terminal resized → re-assert region
                 sys.stdout.write(f"\0337\033[1;{h - 1}r\0338"); last_h = h
+                render_footer(force=True); continue
         render_footer()
 
 
