@@ -1,7 +1,7 @@
 # input
 
-> Formerly **qchat**. The command, config dir (`~/.config/input`), and repo were renamed to
-> `input`; a `qchat` symlink is kept as a back-compat alias.
+> Formerly **qchat**. The command, config dir (`~/.config/input`), and repo were all renamed to
+> `input`.
 
 A terminal agent client for local + cloud model fleets. Single-file, stdlib-only Python.
 It started as a chat REPL and grew into the thing that actually does the work: it runs
@@ -14,6 +14,7 @@ input -e "<task>"          # natural language → shell command, then execute/re
 input -x "<task>"          # same, run it immediately
 input --goal "<criteria>"  # work autonomously until the criteria are met
 input --resume [id|last]   # reopen a saved session   (--sessions lists them)
+input --help               # every flag, including the runner entry points
 ```
 
 Install: symlink onto your PATH — `ln -s ~/repos/input/input ~/.local/bin/input`.

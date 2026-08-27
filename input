@@ -6868,7 +6868,45 @@ def repl():
 
 
 # --- arg parsing ----------------------------------------------------------------
+_TASK_FLAGS = ("-e", "-x", "--goal", "--auto", "--gen")   # everything after these is task text
+
+USAGE = """input — terminal agent client for local + cloud model fleets
+
+usage:
+  input [seat]                chat REPL — saved default seat, or the seat named
+  input <model> [base-url]    chat against an explicit model / OpenAI-compatible endpoint
+  input -e <task>             natural language -> shell command; then execute/revise/copy
+  input -x <task>             same, but run it immediately
+  input --gen <text>          print a generated command to stdout (drives Ctrl-G in the shell)
+  input --goal <criteria>     work toward a goal, confirming each step
+  input --auto <criteria>     same, risk-gated — confirms only when a step looks risky
+  input --resume [id|last]    reopen a saved session (default: last)
+  input --sessions            list saved sessions and exit
+  input -h, --help            this help
+
+runner entry points (input invokes these itself; rarely typed by hand):
+  input --job <id>            run a detached job
+  input --loop <id>           run one iteration of a loop
+  input --loopd               the loop scheduler daemon
+
+Seats are discovered from the SAINT router at startup, so the list is whatever is
+actually up — /seats and /models show it, and F7-F12 one-shot to a seat by cost."""
+
+
+def _wants_help(args):
+    """True for -h/--help before any task flag, so `input -e 'what is --help'` still runs the task."""
+    for w in args:
+        if w in ("-h", "--help"):
+            return True
+        if w in _TASK_FLAGS:
+            return False
+    return False
+
+
 argv = sys.argv[1:]
+if _wants_help(argv):                          # print usage and exit
+    print(USAGE)
+    sys.exit(0)
 MODE, task_words, JOB_ID, LOOP_ID = None, None, None, None
 if "--sessions" in argv:                       # list saved sessions and exit
     for r in _session_list(40):
