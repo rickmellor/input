@@ -19,6 +19,14 @@ input --help               # every flag, including the runner entry points
 
 Install: symlink onto your PATH — `ln -s ~/repos/input/input ~/.local/bin/input`.
 
+SAINT is assumed to be on `localhost:4000`. When input runs on a different box than the
+router, point it at one — `host`, `host:port`, or a full URL:
+
+```
+export INPUT_SAINT=specul8-o-matic                        # or, to persist it:
+echo '{"saint": "specul8-o-matic"}' > ~/.config/input/settings.json
+```
+
 ## Routing
 
 input has **no static seat list**. It reads a [SAINT](https://github.com/rickmellor/saint-router)

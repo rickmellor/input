@@ -94,8 +94,31 @@ def _safe(fn):
 # input carries no static model list — SAINT is the source of truth. It maps out the whole
 # fleet (johnny-resolved local seats for the running profile + auto-configured cloud tiers,
 # each with context window + price + cost rank); input reflects exactly that.
-SAINT_BASE = "http://127.0.0.1:4000/v1"
-SAINT_STATUS_URL = "http://127.0.0.1:4000/status"
+def _saint_root():
+    """Router root URL. Defaults to localhost, but input often runs on a different box than
+    SAINT, so allow $INPUT_SAINT or the 'saint' key in settings.json (same precedence as
+    INPUT_LOCATION). Accepts 'host', 'host:port', or a full URL, with or without a /v1 tail."""
+    v = os.environ.get("INPUT_SAINT")
+    if not v:
+        try:                    # settings.json is read directly: load_settings() is defined later
+            v = json.load(open(os.path.expanduser("~/.config/input/settings.json"))).get("saint")
+        except Exception:
+            v = None
+    v = (v or "").strip().rstrip("/")
+    if not v:
+        return "http://127.0.0.1:4000"
+    if "://" not in v:
+        v = "http://" + v
+    if v.endswith("/v1"):
+        v = v[:-3]
+    if ":" not in urllib.parse.urlsplit(v).netloc:
+        v += ":4000"            # bare host -> the router's default port
+    return v
+
+
+SAINT_ROOT = _saint_root()
+SAINT_BASE = SAINT_ROOT + "/v1"
+SAINT_STATUS_URL = SAINT_ROOT + "/status"
 
 # Fallback used ONLY when SAINT /status is unreachable — direct-to-johnny locals + the
 # router id, so input still works if SAINT is down.
