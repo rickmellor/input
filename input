@@ -1496,8 +1496,9 @@ def render_footer(force=False):
         sz = shutil.get_terminal_size((80, 24))
         h, w = sz.lines, sz.columns
         txt = _footer_clip(_footer_text(), w - 1)
-        if not force and _footer_cache["last"] == (h, w, txt):
-            return
+        # No "skip if unchanged": under ConPTY (Windows Terminal ← WSL ← ssh) the reserved row is
+        # not protected by the scroll region and scrolls away with output — the 1 Hz repaint is
+        # the only thing keeping the footer on screen there (2026-08-27).
         _footer_cache["last"] = (h, w, txt)
         sys.stdout.write(f"\0337\033[{h};1H\033[2K{DIM}{txt}{RESET}\0338")  # save·go·clear·write·restore
         sys.stdout.flush()
@@ -1586,43 +1587,42 @@ def _dedupe_labels(agents):
             a["label"] = f"{a['label']}#{counts[a['label']]}"
 
 
-def _agents_ticker(agents, stop):
-    """Live ONE-LINE status over parallel agents, redrawn in place with \\r until `stop` is set:
-    `⠼ 4 agents · 1m03s │ saint-router ⠼1m03s · cascade ✓48s · docs ⠼1m01s`. Own thread, writes to
-    the real terminal (workers write to their own buffers). Deliberately never moves the cursor
-    vertically: a multi-row block redrawn with cursor-up leaked a frame into scrollback every time
-    anything else emitted a newline at the bottom of the footer's scroll region (2026-08-27).
-    Self-clears on stop; the per-agent `⟳ done[…]` lines carry the durable record."""
+def _agents_ticker(agents, stop, heartbeat=15.0):
+    """Append-only progress log for parallel agents — nothing is ever redrawn in place, so it
+    cannot smear under terminals/relays that don't honour scroll regions (ConPTY: Windows
+    Terminal ← WSL ← ssh, 2026-08-27). Prints one row per agent at launch, a ✓ row the moment
+    each finishes (label@model, elapsed, tool count), and a heartbeat row every `heartbeat`
+    seconds for whatever is still running (elapsed · tools · current tool). Own thread; the
+    workers write to their own buffers, which flush after this returns."""
     _dedupe_labels(agents)
     t_all = time.monotonic()
-    f = 0
-    while not stop.wait(0.1 if f else 0):
-        frame = _SPIN[f % len(_SPIN)]
+    reported = set()
+    def who(a):
+        return a["label"] + (f"@{a['seat']}" if a.get("seat") else "")
+    def out(line):
+        sys.stdout.write(f"{DIM}{line}{RESET}\n"); sys.stdout.flush()
+    out(f"  ▶ {len(agents)} agents: " + " · ".join(a["label"] for a in agents))
+    last_beat = t_all
+    while True:
+        stopped = stop.wait(0.25)
         now = time.monotonic()
-        done = sum(1 for a in agents if a["state"] == "done")
-        run = sum(1 for a in agents if a["state"] == "running")
-        q = sum(1 for a in agents if a["state"] == "queued")
-        head = f"{frame} {len(agents)} agents · {run} running" + (f" · {q} queued" if q else "") \
-               + f" · {done} done · {_fmt_dur(now - t_all)}"
-        cells = []
-        for a in agents:
-            who = a["label"] + (f"@{a['seat']}" if a.get("seat") else "")
-            if a["state"] == "done":
-                cells.append(f"{who} {GREEN_BUILD}✓{RESET}{DIM}{_fmt_dur(a['dur'] or 0)}"
-                             + (f" {a['tools']}t" if a.get("tools") else ""))
-            elif a["state"] == "running":
-                act = (f" {a['tools']}t" if a.get("tools") else "") + (f" {a['last']}" if a.get("last") else "")
-                cells.append(f"{who} {frame}{_fmt_dur(now - (a['start'] or now))}{act}")
-            else:
-                cells.append(f"{who} ·queued")
-        line = f"  {head} │ " + " · ".join(cells)
-        width = shutil.get_terminal_size((80, 24)).columns - 1
-        plain = re.sub(r"\033\[[0-9;]*m", "", line)
-        if len(plain) > width:                       # clip on the visible text, keep it one row
-            line = plain[:width - 1] + "…"
-        sys.stdout.write(f"\r\033[K{DIM}{line}{RESET}"); sys.stdout.flush()
-        f += 1
-    sys.stdout.write("\r\033[K"); sys.stdout.flush()   # wipe the line on stop
+        for i, a in enumerate(agents):                       # completions, as they happen
+            if a["state"] == "done" and i not in reported:
+                reported.add(i)
+                out(f"  {GREEN_BUILD}✓{RESET}{DIM} {who(a)} · {_fmt_dur(a['dur'] or 0)}"
+                    + (f" · {a['tools']} tools" if a.get("tools") else ""))
+        if stopped:
+            break
+        if now - last_beat >= heartbeat:                      # heartbeat for what is still running
+            last_beat = now
+            running = [a for a in agents if a["state"] == "running"]
+            queued = sum(1 for a in agents if a["state"] == "queued")
+            cells = [f"{who(a)} {_fmt_dur(now - (a['start'] or now))}"
+                     + (f" · {a['tools']}t" if a.get("tools") else "") + (f" · {a['last']}" if a.get("last") else "")
+                     for a in running]
+            if cells:
+                out(f"  … {_fmt_dur(now - t_all)} · {len(running)} running" + (f" · {queued} queued" if queued else "")
+                    + " │ " + " │ ".join(cells))
 
 
 def seat_key(name):
@@ -1793,7 +1793,7 @@ def _tool_spawn_agent(args):
         slot = getattr(_AGENT_TLS, "slot", None)   # now holding a real slot → mark it running
         if slot is not None:
             slot["state"] = "running"; slot["start"] = time.monotonic()
-            slot["seat"] = (key if key in SEATS else m).removeprefix("saint-")
+            slot["seat"] = m.removeprefix("saint-")      # the resolved model id, not the seat name
         t0 = time.monotonic()              # time generation only, not queue wait on the semaphore
         res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
                          budget_tokens=budget, on_tool=on_tool, gate=False,
@@ -4520,7 +4520,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                         results = [f.result() for f in futs]   # submit order == tcs order
                 finally:
                     if ticker is not None:
-                        stop_ticker.set(); ticker.join(timeout=1.0)   # ticker self-clears its block
+                        stop_ticker.set(); ticker.join(timeout=1.0)   # flushes any final ✓ rows
 
             for tc, out, shown, printed in results:
                 if printed:
