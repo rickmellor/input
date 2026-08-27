@@ -155,7 +155,7 @@ def discover_seats(timeout=2.5):
         seats[name] = (c.get("id"), SAINT_BASE)     # route every seat through SAINT
         meta[name] = {k: c.get(k) for k in
                       ("kind", "context", "price_in", "price_out", "rank", "state",
-                       "aliases", "elec_per_mtok", "tok_s")}
+                       "aliases", "elec_per_mtok", "tok_s", "model")}   # model: what serves the seat now
     if not seats:
         return False
     SEATS.clear(); SEATS.update(seats)
@@ -1597,17 +1597,20 @@ def _agents_ticker(agents, stop, heartbeat=15.0):
     _dedupe_labels(agents)
     t_all = time.monotonic()
     reported = set()
+    announced = False                                        # sub-second batches print nothing
     def who(a):
         return a["label"] + (f"@{a['seat']}" if a.get("seat") else "")
     def out(line):
         sys.stdout.write(f"{DIM}{line}{RESET}\n"); sys.stdout.flush()
-    out(f"  ▶ {len(agents)} agents: " + " · ".join(a["label"] for a in agents))
     last_beat = t_all
     while True:
         stopped = stop.wait(0.25)
         now = time.monotonic()
+        if not announced and not stopped and now - t_all >= 2.0:
+            announced = True
+            out(f"  ▶ {len(agents)} agents: " + " · ".join(who(a) for a in agents))
         for i, a in enumerate(agents):                       # completions, as they happen
-            if a["state"] == "done" and i not in reported:
+            if a["state"] == "done" and i not in reported and announced:
                 reported.add(i)
                 out(f"  {GREEN_BUILD}✓{RESET}{DIM} {who(a)} · {_fmt_dur(a['dur'] or 0)}"
                     + (f" · {a['tools']} tools" if a.get("tools") else ""))
@@ -1778,22 +1781,28 @@ def _tool_spawn_agent(args):
     tools = sandbox_tools(sb, write=write)
     label = skill or (m.split("-")[-1] if "-" in m else m)
 
+    my_slot = getattr(_AGENT_TLS, "slot", None)   # bound now: nested tool rounds run in pool threads
+                                                  # and rebind the TLS, so re-reading it later loses it
+
     def on_tool(ev, tc, out):
         if ev == "call":
             fn = tc.get("function") or {}
             print(f"{DIM}    ⟳ {fn.get('name')}({_fmt_args(fn.get('arguments'))[:56]}){RESET}")
-            sl = getattr(_AGENT_TLS, "slot", None)      # live activity for the agents ticker
-            if sl is not None:
-                sl["tools"] = sl.get("tools", 0) + 1
-                sl["last"] = fn.get("name")
+            if my_slot is not None:                      # live activity for the agents progress log
+                my_slot["tools"] = my_slot.get("tools", 0) + 1
+                my_slot["last"] = fn.get("name")
         return None
 
     print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
     with _model_sem(m, b):                 # per-model concurrency cap (local=2, cloud=5)
-        slot = getattr(_AGENT_TLS, "slot", None)   # now holding a real slot → mark it running
+        slot = my_slot                     # now holding a real slot → mark it running
         if slot is not None:
             slot["state"] = "running"; slot["start"] = time.monotonic()
-            slot["seat"] = m.removeprefix("saint-")      # the resolved model id, not the seat name
+            # show the model behind the seat: a SAINT pin (saint-local-chat) names a seat, and
+            # /status knows which model currently serves it
+            shown = m.removeprefix("saint-")
+            meta = SEAT_META.get(key) or SEAT_META.get(shown) or {}
+            slot["seat"] = meta.get("model") or shown
         t0 = time.monotonic()              # time generation only, not queue wait on the semaphore
         res = run_thread(task, system=system, model=m, base=b, tools=tools, quiet=True,
                          budget_tokens=budget, on_tool=on_tool, gate=False,
@@ -4467,6 +4476,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                         slot["state"] = "queued"
                     else:
                         slot["state"] = "running"; slot["start"] = time.monotonic()
+                prev_slot = getattr(_AGENT_TLS, "slot", None)
                 _AGENT_TLS.slot = slot          # spawn_agent reports 'running' via this on acquire
                 buf = io.StringIO()
                 if buffered and _STDOUT is not None:
@@ -4488,7 +4498,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
                             out = f"Error running {name}: {e}"
                     shown = on_tool("result", tc, out) if on_tool else None
                 finally:
-                    _AGENT_TLS.slot = None
+                    _AGENT_TLS.slot = prev_slot     # a nested (sub-agent) round hands the slot back
                     if (buffered or parent is not None) and _STDOUT is not None:
                         _STDOUT.release()
                     if slot is not None:
