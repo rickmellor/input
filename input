@@ -1564,10 +1564,22 @@ def _call_label(name, args):
         cwd = os.path.basename(os.path.expanduser((args.get("cwd") or "").rstrip("/")))
         if cwd and cwd not in ("", os.path.basename(os.path.expanduser("~")), os.path.basename(os.getcwd())):
             return cwd[:22]
-        task = re.sub(r"[^A-Za-z0-9 ]+", " ", (args.get("task") or args.get("brief") or ""))
-        words = [w for w in task.split() if w.lower() not in ("the", "a", "an", "of", "in", "at", "to", "and", "for")]
+        raw = (args.get("task") or args.get("brief") or "")
+        m = re.search(r"(?:~|/home/\w+)?/(?:repos|projects|src)/([A-Za-z0-9._-]+)", raw)
+        if m:                                    # a repo named in the brief beats any slug
+            return m.group(1)[:22]
+        stop = {"the", "a", "an", "of", "in", "at", "to", "and", "for", "you", "are", "your", "this", "that",
+                "with", "from", "into", "about", "using", "use", "please", "then", "on", "is", "it",
+                "research", "task", "investigate", "investigating", "investigation", "look", "take",
+                "report", "find", "read", "review", "audit", "auditing", "extract", "extracting", "survey", "surveying"}
+        words = [w for w in re.sub(r"[^A-Za-z0-9 ]+", " ", raw).split() if w.lower() not in stop]
         if words:
-            return " ".join(words[:3])[:22]
+            lab = ""
+            for w in words[:3]:                      # ≤22 chars, whole words only
+                if len(lab) + len(w) + (1 if lab else 0) > 22:
+                    break
+                lab = f"{lab} {w}".strip()
+            return lab or words[0][:22]
         mdl = (args.get("model") or "").strip()
         if mdl:
             return mdl.split("-")[-1] if "-" in mdl else mdl   # cloud-small → small
@@ -1587,7 +1599,7 @@ def _dedupe_labels(agents):
             a["label"] = f"{a['label']}#{counts[a['label']]}"
 
 
-def _agents_ticker(agents, stop, heartbeat=15.0):
+def _agents_ticker(agents, stop, heartbeat=15.0, keepalive=60.0):
     """Append-only progress log for parallel agents — nothing is ever redrawn in place, so it
     cannot smear under terminals/relays that don't honour scroll regions (ConPTY: Windows
     Terminal ← WSL ← ssh, 2026-08-27). Prints one row per agent at launch, a ✓ row the moment
@@ -1603,6 +1615,7 @@ def _agents_ticker(agents, stop, heartbeat=15.0):
     def out(line):
         sys.stdout.write(f"{DIM}{line}{RESET}\n"); sys.stdout.flush()
     last_beat = t_all
+    last_sig = None                                           # what the last heartbeat showed
     while True:
         stopped = stop.wait(0.25)
         now = time.monotonic()
@@ -1616,16 +1629,26 @@ def _agents_ticker(agents, stop, heartbeat=15.0):
                     + (f" · {a['tools']} tools" if a.get("tools") else ""))
         if stopped:
             break
-        if now - last_beat >= heartbeat:                      # heartbeat for what is still running
-            last_beat = now
+        if announced and now - last_beat >= heartbeat:        # heartbeat for what is still running
             running = [a for a in agents if a["state"] == "running"]
             queued = sum(1 for a in agents if a["state"] == "queued")
-            cells = [f"{who(a)} {_fmt_dur(now - (a['start'] or now))}"
-                     + (f" · {a['tools']}t" if a.get("tools") else "") + (f" · {a['last']}" if a.get("last") else "")
-                     for a in running]
-            if cells:
-                out(f"  … {_fmt_dur(now - t_all)} · {len(running)} running" + (f" · {queued} queued" if queued else "")
-                    + " │ " + " │ ".join(cells))
+            sig = tuple((a["label"], a.get("tools"), a.get("last")) for a in running) + (queued,)
+            # print only when the picture changed (tool count / current tool / who is running),
+            # else once per `keepalive` so a long generate/think phase still shows a pulse
+            if sig != last_sig or now - last_beat >= keepalive:
+                last_beat, last_sig = now, sig
+                cells = []
+                for a in running:
+                    cell = f"{who(a)} {_fmt_dur(now - (a['start'] or now))}"
+                    if a.get("tools"):
+                        idle = now - (a.get("last_t") or now)
+                        cell += f" · {a['tools']}t · {a['last']}" + (f" {_fmt_dur(idle)} ago" if idle >= 20 else "")
+                    else:
+                        cell += " · no tools yet"           # still thinking/narrating its first move
+                    cells.append(cell)
+                if cells:
+                    out(f"  … {_fmt_dur(now - t_all)} · {len(running)} running" + (f" · {queued} queued" if queued else "")
+                        + " │ " + " │ ".join(cells))
 
 
 def seat_key(name):
@@ -1791,6 +1814,7 @@ def _tool_spawn_agent(args):
             if my_slot is not None:                      # live activity for the agents progress log
                 my_slot["tools"] = my_slot.get("tools", 0) + 1
                 my_slot["last"] = fn.get("name")
+                my_slot["last_t"] = time.monotonic()
         return None
 
     if os.environ.get("INPUT_DEBUG_SPAWN"):      # dump the exact envelope: INPUT_DEBUG_SPAWN=1 input
