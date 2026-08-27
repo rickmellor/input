@@ -1456,7 +1456,8 @@ def footer_flash(msg, ttl=6.0):
 
 
 def _footer_text():
-    parts = [f"{BOLD}▸ {PERM_MODE}{RESET}{DIM}"]
+    parts = [f"{CODE_FG}{BOLD}{active_name()}{RESET}{DIM}",   # selected seat/model
+             f"▸ {PERM_MODE}"]
     g = load_settings().get("gate") or {}
     parts.append(f"gate ≤{g.get('interactive', 'low')}/{g.get('autonomous', 'low')}")
     try:
@@ -3758,8 +3759,6 @@ def _plan_tag(pid=None, width=28):
 
 
 def _prompt():
-    n = active_name()
-    color = YEL if n == "saint" or n.startswith("cloud") else CODE_FG   # highlight routed/cloud seats
     tag = {"cautious": "",
            "unrestricted": f"{RED_VIVID}{BOLD} unrestricted▸{RESET}",
            "plan": f"{BLUE_ELECTRIC} plan▸{_plan_tag()}{RESET}"}.get(PERM_MODE, "")
@@ -3769,7 +3768,7 @@ def _prompt():
     aside = f"{CODE_FG} aside{'▸' * len(SIDEBARS)}{RESET}" if SIDEBARS else ""
     if _SB_PAUSED:                                  # paused sidebars persist even on the main thread
         aside += f"{DIM} ⏸{len(_SB_PAUSED)}{RESET}"
-    return f"{color}{n}{RESET}{tag}{build}{goal}{aside} > "
+    return f"{CODE_FG}input{RESET}{tag}{build}{goal}{aside} > "
 
 
 def _id_ctx(text):
