@@ -1793,6 +1793,17 @@ def _tool_spawn_agent(args):
                 my_slot["last"] = fn.get("name")
         return None
 
+    if os.environ.get("INPUT_DEBUG_SPAWN"):      # dump the exact envelope: INPUT_DEBUG_SPAWN=1 input
+        try:
+            dbg = os.path.expanduser("~/.config/input/debug"); os.makedirs(dbg, exist_ok=True)
+            fn = os.path.join(dbg, f"spawn-{time.strftime('%Y%m%d-%H%M%S')}-{label}.json")
+            with open(fn, "w") as fh:
+                json.dump({"model": m, "base": b, "system": system, "task": task,
+                           "tools": [t.schema() if hasattr(t, "schema") else str(t) for t in tools]},
+                          fh, indent=1, default=str)
+            print(f"{DIM}  ⟳ spawn envelope → {fn}{RESET}")
+        except Exception as e:
+            print(f"{DIM}  ⟳ spawn envelope dump failed: {e}{RESET}")
     print(f"{DIM}  ⟳ spawn[{label} · {m}{' · write' if write else ''}]: {task[:64]}{RESET}")
     with _model_sem(m, b):                 # per-model concurrency cap (local=2, cloud=5)
         slot = my_slot                     # now holding a real slot → mark it running
@@ -3493,7 +3504,7 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
         headers["x-session-id"] = session or SESSION
     req = urllib.request.Request(f"{base}/chat/completions", body, headers)
     reply, think_buf, phase, t0, tool_acc = [], [], "start", None, {}
-    usage, t_first = None, None
+    usage, t_first, finish = None, None, None
     md = MDRender()
     import select as _sel
     interactive = (not quiet) and sys.stdin.isatty() and sys.stdout.isatty()
@@ -3544,6 +3555,8 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
                         print(f"{DIM}--saint router → {seat}{paren}{RESET}")
                     banner_done = True
                 delta = chunk["choices"][0].get("delta") or {}
+                if chunk["choices"][0].get("finish_reason"):
+                    finish = chunk["choices"][0]["finish_reason"]      # "length" = cut off by max_tokens
                 if t_first is None and (delta.get("reasoning_content") or delta.get("reasoning")
                                         or delta.get("content") or delta.get("tool_calls")):
                     t_first = time.monotonic()   # first output token → decode-rate clock start
@@ -3565,6 +3578,10 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
                     if not quiet:
                         md.feed(c)
                 for tc in delta.get("tool_calls") or []:   # deltas: id/name once, args in pieces
+                    fnd0 = tc.get("function") or {}
+                    if not (tc.get("id") or fnd0.get("name") or fnd0.get("arguments")):
+                        continue        # vLLM's qwen3_xml parser emits an empty phantom index
+                                        # between real calls (2026-08-27) — never open a slot for it
                     acc = tool_acc.setdefault(tc.get("index", 0),
                                               {"id": None, "name": "", "arguments": ""})
                     if tc.get("id"):
@@ -3598,7 +3615,7 @@ def stream(messages, think_store, model=None, base=None, tools=None, volatile=No
     if completion is None:
         completion = max(1, len("".join(reply)) // 4)
     rate = completion / (time.monotonic() - t_first) if t_first and completion else 0.0
-    return "".join(reply), tool_calls, {"prompt": prompt, "completion": completion, "rate": rate}
+    return "".join(reply), tool_calls, {"prompt": prompt, "completion": completion, "rate": rate, "finish": finish}
 
 
 def _pick(labels, start, hint=None, allow_edit=False):
@@ -4392,6 +4409,7 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
     res = {"text": "", "history": messages, "rounds": 0, "tool_calls": 0,
            "tokens_in": 0, "tokens_out": 0, "decode_s": 0.0, "stopped": "done", "error": None}
     _last_fp, _repeat = None, 0      # stall detector: identical tool-call rounds back-to-back
+    _cut_nudged = False              # one nudge for a max_tokens-truncated, tool-less reply
     try:
         for _ in range(max_rounds):
             text, tcs, usage = stream(messages, thinks, model=model, base=base, tools=schemas,
@@ -4425,6 +4443,16 @@ def run_thread(task, *, history=None, system=None, model=None, base=None, tools=
             # 20K context and stranded flagship sub-agents mid-dig (2026-08-27).
             if budget_tokens and (usage["prompt"] or 0) + (usage["completion"] or 0) > budget_tokens:
                 res["stopped"] = "budget"; break
+            if not tcs and usage.get("finish") == "length" and not _cut_nudged:
+                # The model narrated until max_tokens instead of calling tools (seen on the 122B
+                # sub-agents 2026-08-27: 1 round, 0 tools, ↑8192, a 700-line "plan"). That is not
+                # an answer — nudge it back onto the tools once instead of returning the prose.
+                _cut_nudged = True
+                messages.append({"role": "user", "content":
+                    "Your reply was cut off at the output limit and contained no tool calls. Do not "
+                    "narrate steps or paste commands as text — CALL the tools now, one step at a time, "
+                    "and keep prose to a minimum until the final report."})
+                continue
             if not tcs:                            # plain answer → done, unless the goal says otherwise
                 if terminate is not None:
                     done, nudge = terminate(text, res)
