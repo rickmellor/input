@@ -620,7 +620,14 @@ def stable_context():
 def _tokens():
     now = datetime.now().astimezone()
     loc = os.environ.get("INPUT_LOCATION") or load_settings().get("location") or ""
+    # Identity tokens for the system template: what actually serves the local chat/coder
+    # seats right now (from SAINT /status via discover_seats). Session-stable, so cache-safe.
+    # Without an identity line an open-weights seat primed by Claude-Code-flavoured memory
+    # will happily introduce itself as Claude (seen 2026-09-04 on Qwen3.8-Flash-Next).
+    local_chat = (SEAT_META.get("chat") or {}).get("model") or "the locally served model"
+    local_coder = (SEAT_META.get("coder") or {}).get("model") or local_chat
     return {"stable": stable_context(), "grounding": ground_text(),
+            "local_model": local_chat, "local_coder": local_coder,
             "datetime": now.strftime("%A, %Y-%m-%d %H:%M %Z (%z)"),
             "date": now.strftime("%A, %Y-%m-%d"), "time": now.strftime("%H:%M %Z"),
             "tz": now.strftime("%Z"), "location": loc,
